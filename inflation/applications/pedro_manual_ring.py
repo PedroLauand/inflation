@@ -62,7 +62,7 @@ prob.add_symmetries(prob._setting_specific_outcome_relabelling_symmetries)
 ring_SDP = InflationSDP(prob, verbose=2, include_all_outcomes=False)
 
 
-ring_SDP.generate_relaxation("physical2", max_monomial_length=2)
+ring_SDP.generate_relaxation("physical")
 # ring_SDP.generate_relaxation("npa1")
 
 print("Quantum inflation **nonfanout/commuting** factors:")
@@ -72,17 +72,31 @@ print(ring_SDP.physical_atoms)
 # # # print(ring_4_SDP.momentmatrix)
 # # #
 
-# Inputting values
-known_values = {}
-known_values["P[A^{1,2}=0]"] = 1 / 4
-known_values["P[A^{1,2}=0 A^{2,3}=0]"] = 1 / 8
-known_values["P[A^{1,2}=0 A^{2,3}=1]"] = 1 / 24
-known_values["P[A^{1,2}=0 A^{2,3}=0 A^{3,1}=0]"] = 1 / 8
-known_values["P[A^{1,2}=0 A^{2,3}=0 A^{3,1}=1]"] = 1 / 64
-known_values["P[A^{1,2}=0 A^{2,3}=1 A^{3,1}=2]"] = 1 / 48
-print("Known Values:")
-print(known_values)
 
-ring_SDP.update_values(known_values)
-ring_SDP.solve(solve_dual=False)
+# # Inputting values
+# known_values = {"0": 0, "1": 1}
+# known_values["P[A^{1,2}=0]"] = 1 / 4
+# known_values["P[A^{1,2}=0 A^{2,3}=0]"] = 1 / 8
+# known_values["P[A^{1,2}=0 A^{2,3}=1]"] = 1 / 24
+# known_values["P[A^{1,2}=0 A^{2,3}=0 A^{3,1}=0]"] = 1 / 8
+# known_values["P[A^{1,2}=0 A^{2,3}=0 A^{3,1}=1]"] = 1 / 64
+# known_values["P[A^{1,2}=0 A^{2,3}=1 A^{3,1}=2]"] = 1 / 48
+# print("Known Values:")
+# print(known_values)
 #
+# ring_SDP.update_values(known_values)
+# ring_SDP.solve(solve_dual=False)
+
+from inflation import max_within_feasible
+from sympy import Symbol
+
+v = Symbol("v")
+known_values_symbolic = {"0": 0, "1": 1}
+known_values_symbolic["P[A^{1,2}=0]"] = 1 / 4
+known_values_symbolic["P[A^{1,2}=0 A^{2,3}=0]"] = v/8 + (1-v)/16
+known_values_symbolic["P[A^{1,2}=0 A^{2,3}=1]"] = v/24 + (1-v)/16
+known_values_symbolic["P[A^{1,2}=0 A^{2,3}=0 A^{3,1}=0]"] = v/8 + (1-v)/64
+known_values_symbolic["P[A^{1,2}=0 A^{2,3}=0 A^{3,1}=1]"] = 1/64
+known_values_symbolic["P[A^{1,2}=0 A^{2,3}=1 A^{3,1}=2]"] = v/48 + (1-v)/64
+max_vis = max_within_feasible(ring_SDP, known_values_symbolic, "dual")
+print("Maximum visibility: ", max_vis)
