@@ -29,7 +29,7 @@ def ring_problem(n: int) -> InflationProblem:
     inf_prob = InflationProblem(
         dag={"i1": ["A"],
              "i2": ["A"], },
-        outcomes_per_party=(2,),
+        outcomes_per_party=(4,),
         settings_per_party=(1,),
         classical_sources=None,
         inflation_level_per_source=(n,n),
@@ -37,23 +37,16 @@ def ring_problem(n: int) -> InflationProblem:
 
     to_stabilize = np.flatnonzero(inf_prob._lexorder[:, 1] == inf_prob._lexorder[:, 2])
 
-    #Artificially kill all self-loops
-    # inf_prob._default_notcomm[:, to_stabilize] = True
-    # inf_prob._default_notcomm[to_stabilize] = True
-    # inf_prob._default_notcomm[np.ix_(to_stabilize, to_stabilize)] = False
 
     #Fix factorization
     inf_prob._inflation_indices_overlap = overlap_matrix(inf_prob._all_unique_inflation_indices)
 
     # Fix symmetries
-    # print("Never use: ", to_stabilize)
     new_symmetries = np.array([
         perm for perm in inf_prob.symmetries
         if np.array_equal(np.sort(perm[to_stabilize]), to_stabilize)
     ], dtype=int)
     inf_prob.symmetries = new_symmetries
-
-
 
     #Hacks to prevent knowability assumptions
     # inf_prob.is_network = False
@@ -62,43 +55,31 @@ def ring_problem(n: int) -> InflationProblem:
     inf_prob._interpretation_to_name = name_interpret_always_copy_indices
 
     return inf_prob
-# def ring_LP(n: int, **kwargs) -> InflationLP:
-#     inf_lp = InflationLP(ring_problem(n), **kwargs)
-#     inf_lp.all_commuting_q_1d = (lambda x: False)
-#     inf_lp.all_commuting_q_2d = (lambda x: False)
-#     inf_lp.all_operators_commute = False
-#     return inf_lp
 
-prob_4 = ring_problem(4)
-# print(prob_4._compatible_template_measurements.astype(int))
-# cliques = prob_4.all_and_maximal_compatible_templates()[-1]
-# for clique in cliques[:4]:
-#     print(prob_4._compatible_template_measurements.astype(int)[np.ix_(clique,clique)])
-#     print(prob_4._lexorder[prob_4._template_idxs[clique]])
 
-ring_4_LP = InflationLP(prob_4, verbose=2)
-print("Nonfanout inflation atomic factors:")
-print(ring_4_LP.atomic_factors)
+prob = ring_problem(3)
+prob.add_symmetries(prob._setting_specific_outcome_relabelling_symmetries)
+ring_SDP = InflationSDP(prob, verbose=2, include_all_outcomes=False)
 
-ring_4_SDP = InflationSDP(prob_4, verbose=2)
-ring_4_SDP.generate_relaxation("npa2")
+
+ring_SDP.generate_relaxation("npa2")
+# ring_SDP.generate_relaxation("npa1")
 
 print("Quantum inflation **nonfanout/commuting** factors:")
-print(ring_4_SDP.physical_atoms)
-print("Quantum inflation **noncommuting** factors:")
-print(sorted(set(ring_4_SDP.atomic_factors).difference(ring_4_SDP.physical_atoms)))
-# # print(ring_4_SDP.momentmatrix)
-# #
-# known_values = {}
-# E1 = 0
-# # E1 ≥0.1656
-# E2 = -1 / np.sqrt(2)
-# # Inputting values
-# known_values["P[A^{1,2}=0]"] = 1 / 2 * (1 + E1)
-#
-# known_values["P[A^{1,2}=0 A^{2,3}=0]"] = 1 / 4 * (1 + 2*E1 + E2)
-# print(known_values)
-#
-# ring_4_SDP.update_values(known_values)
-# ring_4_SDP.solve(solve_dual=False)
+print(ring_SDP.physical_atoms)
+# print("Quantum inflation **noncommuting** factors:")
+# print(sorted(set(ring_4_SDP.atomic_factors).difference(ring_4_SDP.physical_atoms)))
+# # # print(ring_4_SDP.momentmatrix)
+# # #
+
+# Inputting values
+known_values = {}
+known_values["P[A^{1,2}=0]"] = 1 / 4
+known_values["P[A^{1,2}=0 A^{2,3}=0]"] = 1 / 8
+known_values["P[A^{1,2}=0 A^{2,3}=1]"] = 1 / 24
+print("Known Values:")
+print(known_values)
+
+ring_SDP.update_values(known_values)
+ring_SDP.solve(solve_dual=False)
 #
