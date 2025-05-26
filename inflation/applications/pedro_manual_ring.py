@@ -62,7 +62,7 @@ prob.add_symmetries(prob._setting_specific_outcome_relabelling_symmetries)
 ring_SDP = InflationSDP(prob, verbose=2, include_all_outcomes=False)
 
 
-ring_SDP.generate_relaxation("npa2")
+ring_SDP.generate_relaxation("physical2", max_monomial_length=2)
 # ring_SDP.generate_relaxation("npa1")
 
 print("Quantum inflation **nonfanout/commuting** factors:")
@@ -77,6 +77,9 @@ known_values = {}
 known_values["P[A^{1,2}=0]"] = 1 / 4
 known_values["P[A^{1,2}=0 A^{2,3}=0]"] = 1 / 8
 known_values["P[A^{1,2}=0 A^{2,3}=1]"] = 1 / 24
+known_values["P[A^{1,2}=0 A^{2,3}=0 A^{3,1}=0]"] = 1 / 8
+known_values["P[A^{1,2}=0 A^{2,3}=0 A^{3,1}=1]"] = 1 / 64
+known_values["P[A^{1,2}=0 A^{2,3}=1 A^{3,1}=2]"] = 1 / 48
 print("Known Values:")
 print(known_values)
 
