@@ -1169,10 +1169,10 @@ class InflationProblem:
                               self.inflation_level_per_source[0]), """
                               Only call this with uniform inflation level!"""
         inf_level = max(self.inflation_level_per_source)
+        identity_perm = np.arange(self._nr_operators, dtype=np.intc)
+        symmetries = [identity_perm]
         if inf_level>1:
             permutation_failed = False
-            symmetries = []
-            identity_perm = np.arange(self._nr_operators, dtype=np.intc)
             perms = format_permutations(list(
                 permutations(range(inf_level)))[1:])
             all_sources_simultanous = np.arange(len(self.inflation_level_per_source))
@@ -1192,6 +1192,4 @@ class InflationProblem:
             if permutation_failed and (self.verbose > 0):
                 warn("The generating set is not closed under source swaps."
                      + " Some symmetries will not be implemented.")
-            return np.unique(symmetries, axis=0)
-        return np.arange(self._nr_operators, dtype=np.intc)[np.newaxis]
-
+        return group_elements_from_generators(symmetries)
