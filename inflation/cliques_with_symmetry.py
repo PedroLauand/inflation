@@ -51,7 +51,8 @@ def filter_maximal_cliques_numpy(clique_masks: np.ndarray) -> np.ndarray:
 
 def find_cliques_symmetric(
         adj_matrix: np.ndarray,
-        automorphisms: np.ndarray
+        automorphisms: np.ndarray,
+        max_n: int = 0
 ) -> np.ndarray:
     """
     Finds ALL and MAXIMAL cliques in a graph using a high-performance,
@@ -64,6 +65,8 @@ def find_cliques_symmetric(
       The adjacency matrix of the undirected graph.
     automorphisms : np.ndarray
       The graph's automorphism group as a (k, n) NumPy array.
+    max_n : int
+      An integer for maximal clique length. Zero means unrestricted.
 
     Returns
     -------
@@ -75,8 +78,10 @@ def find_cliques_symmetric(
         return np.empty((0, 0), dtype=bool)
 
     nbrs_masks = adj_matrix.astype(bool)
-    all_found_cliques = []
+    # all_found_cliques = []
     all_found_clique_masks = []
+    # representative_found_cliques = []
+    # representative_found_clique_masks = []
     seen_canonical_subproblems: Set[Tuple[Tuple[int, ...], Tuple[int, ...]]] = set()
     queue = deque()
 
@@ -98,6 +103,7 @@ def find_cliques_symmetric(
     # --- 2. Main search loop using boolean masks ---
     while queue:
         base_mask, cnbrs_mask = queue.popleft()
+        # representative_found_clique_masks.append(base_mask)
         base_indices = np.flatnonzero(base_mask)
         cnbrs_indices = np.flatnonzero(cnbrs_mask)
 
@@ -120,29 +126,64 @@ def find_cliques_symmetric(
         seen_canonical_subproblems.add(canonical_rep)
 
         # --- B. GENERATE CLIQUE ORBIT ---
-        unique_in_orbit, where_unique = np.unique(permuted_bases, axis=0, return_index=True)
-        all_found_cliques.extend(unique_in_orbit)
-        all_found_clique_masks.extend(base_mask[automorphisms[where_unique]])
+        # unique_in_orbit, where_unique = np.unique(permuted_bases, axis=0, return_index=True)
+        # all_found_cliques.extend(unique_in_orbit)
+        all_found_clique_masks.extend(base_mask[automorphisms])
 
 
 
         # --- C. EXPLORE CHILDREN (WITH ORDERED-CANDIDATE PRUNING) ---
         # This is the corrected and optimized loop.
-        for u in cnbrs_indices:
-            # Create a mask for the new vertex u
-            u_mask = np.zeros(num_vertices, dtype=bool)
-            u_mask[u] = True
+        if (not max_n) or len(base_indices)<max_n:
+            for u in cnbrs_indices:
+                # Create a mask for the new vertex u
+                u_mask = np.zeros(num_vertices, dtype=bool)
+                u_mask[u] = True
 
-            # Vectorized extension and intersection
-            new_base_mask = base_mask | u_mask
-            new_cnbrs_mask = cnbrs_mask & nbrs_masks[u]
+                # Vectorized extension and intersection
+                new_base_mask = base_mask | u_mask
+                new_cnbrs_mask = cnbrs_mask & nbrs_masks[u]
 
-            # **CRUCIAL OPTIMIZATION**: Only consider candidates
-            # that appear AFTER u to prevent redundant paths.
-            new_cnbrs_mask[:u + 1] = False
+                # **CRUCIAL OPTIMIZATION**: Only consider candidates
+                # that appear AFTER u to prevent redundant paths.
+                new_cnbrs_mask[:u + 1] = False
 
-            queue.append((new_base_mask, new_cnbrs_mask))
-    return np.array(all_found_clique_masks, dtype=bool)
+                queue.append((new_base_mask, new_cnbrs_mask))
+    all_found_clique_masks = np.unique(all_found_clique_masks, axis=0)
+    return np.unique(all_found_clique_masks, axis=0).astype(bool)
+
+def all_and_maximal_cliques_symmetry(adjmat: np.ndarray,
+                                     symgroup: np.ndarray,
+                                     max_n=0,
+                                     isolate_maximal=True) -> (np.ndarray, np.ndarray):
+    """Based on NetworkX's `enumerate_all_cliques`.
+    This version uses native Python sets instead of numpy arrays.
+    (Performance comparison needed.)
+
+    Parameters
+    ----------
+    adjmat : numpy.ndarray
+      A boolean numpy array representing the adjacency matrix of an undirected graph.
+    symgroup : numpy.ndarray
+      The graph's automorphism group as a (k, n) NumPy array.
+    max_n : int, optional
+      A cutoff for clique size reporting. Default 0, meaning no cutoff.
+    isolate_maximal : bool, optional
+      A flag to disable filtering for maximality, which can increase performance. True by default.
+
+    Returns
+    -------
+    Tuple[List, List]
+      A list of all cliques as well as a list of maximal cliques. The maximal cliques list will be empty if the
+      `isolate_maximal` flag is set to False. Cliques are returned as boolean bitmasks.
+    """
+    all_cliques = find_cliques_symmetric(adjmat, symgroup, max_n=max_n)
+    if isolate_maximal:
+        max_cliques = filter_maximal_cliques_numpy(all_cliques)
+    else:
+        max_cliques = np.empty((0, adjmat.shape[0]), dtype=bool)
+    return (sorted([np.flatnonzero(bm).tolist() for bm in all_cliques], key=len),
+            sorted([np.flatnonzero(bm).tolist() for bm in max_cliques], key=len))
 
 if __name__ == '__main__':
     ### Example Usage

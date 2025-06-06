@@ -454,12 +454,20 @@ class InflationProblem:
     def _compatible_template_measurements(self):
         return np.invert(self._default_notcomm[np.ix_(self._template_idxs, self._template_idxs)])
 
+    @property
+    def compatible_template_symmetries(self):
+        return np.unique(np.argsort(self.symmetries[:, self._template_idxs], axis=1), axis=0)
+
     def all_and_maximal_compatible_templates(self,
                                              max_n=0,
                                              isolate_maximal=True):
-        return all_and_maximal_cliques(self._compatible_template_measurements,
-                                       max_n=max_n,
-                                       isolate_maximal=isolate_maximal)
+        # return all_and_maximal_cliques(self._compatible_template_measurements,
+        #                                max_n=max_n,
+        #                                isolate_maximal=isolate_maximal)
+        return all_and_maximal_cliques_symmetry(self._compatible_template_measurements,
+                                                self.compatible_template_symmetries,
+                                                max_n=max_n,
+                                                isolate_maximal=isolate_maximal)
 
 
     def __repr__(self):
