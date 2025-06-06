@@ -128,7 +128,7 @@ def find_cliques_symmetric(
         # --- B. GENERATE CLIQUE ORBIT ---
         # unique_in_orbit, where_unique = np.unique(permuted_bases, axis=0, return_index=True)
         # all_found_cliques.extend(unique_in_orbit)
-        all_found_clique_masks.extend(base_mask[automorphisms])
+        all_found_clique_masks.extend(np.unique(base_mask[automorphisms], axis=0))
 
 
 
@@ -149,8 +149,9 @@ def find_cliques_symmetric(
                 new_cnbrs_mask[:u + 1] = False
 
                 queue.append((new_base_mask, new_cnbrs_mask))
-    all_found_clique_masks = np.unique(all_found_clique_masks, axis=0)
-    return np.unique(all_found_clique_masks, axis=0).astype(bool)
+    all_found_clique_masks = np.unique(all_found_clique_masks, axis=0).astype(bool)
+    print("Queue complete.")
+    return all_found_clique_masks
 
 def all_and_maximal_cliques_symmetry(adjmat: np.ndarray,
                                      symgroup: np.ndarray,
@@ -184,6 +185,8 @@ def all_and_maximal_cliques_symmetry(adjmat: np.ndarray,
         max_cliques = np.empty((0, adjmat.shape[0]), dtype=bool)
     return (sorted([np.flatnonzero(bm).tolist() for bm in all_cliques], key=len),
             sorted([np.flatnonzero(bm).tolist() for bm in max_cliques], key=len))
+    # return (all_cliques,
+    #         max_cliques)
 
 if __name__ == '__main__':
     ### Example Usage
