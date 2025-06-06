@@ -47,56 +47,50 @@ def ring_problem(n: int) -> InflationProblem:
         if np.array_equal(np.sort(perm[to_stabilize]), to_stabilize)
     ], dtype=int)
     inf_prob.symmetries = new_symmetries
-
-    #Hacks to prevent knowability assumptions
-    # inf_prob.is_network = False
-    # inf_prob._is_knowable_q_non_networks = (lambda x: False)
-
     inf_prob._interpretation_to_name = name_interpret_always_copy_indices
 
     return inf_prob
 
 
-prob = ring_problem(3)
+prob = ring_problem(4)
 prob.add_symmetries(prob._setting_specific_outcome_relabelling_symmetries)
 ring_SDP = InflationSDP(prob, verbose=2, include_all_outcomes=False)
+ring_SDP.generate_relaxation("physical2")
+# ring_SDP = InflationLP(prob, verbose=2)
 
 
-ring_SDP.generate_relaxation("physical")
-# ring_SDP.generate_relaxation("npa1")
-
-print("Quantum inflation **nonfanout/commuting** factors:")
-print(ring_SDP.physical_atoms)
+# print("Quantum inflation **nonfanout/commuting** factors:")
+# print(ring_SDP.physical_atoms)
+# print(ring_SDP.atomic_factors)
 # print("Quantum inflation **noncommuting** factors:")
 # print(sorted(set(ring_4_SDP.atomic_factors).difference(ring_4_SDP.physical_atoms)))
-# # # print(ring_4_SDP.momentmatrix)
-# # #
 
-
-# # Inputting values
-# known_values = {"0": 0, "1": 1}
-# known_values["P[A^{1,2}=0]"] = 1 / 4
-# known_values["P[A^{1,2}=0 A^{2,3}=0]"] = 1 / 8
-# known_values["P[A^{1,2}=0 A^{2,3}=1]"] = 1 / 24
-# known_values["P[A^{1,2}=0 A^{2,3}=0 A^{3,1}=0]"] = 1 / 8
-# known_values["P[A^{1,2}=0 A^{2,3}=0 A^{3,1}=1]"] = 1 / 64
-# known_values["P[A^{1,2}=0 A^{2,3}=1 A^{3,1}=2]"] = 1 / 48
-# print("Known Values:")
-# print(known_values)
-#
-# ring_SDP.update_values(known_values)
-# ring_SDP.solve(solve_dual=False)
 
 from inflation import max_within_feasible
 from sympy import Symbol
 
 v = Symbol("v")
-known_values_symbolic = {"0": 0, "1": 1}
-known_values_symbolic["P[A^{1,2}=0]"] = 1 / 4
-known_values_symbolic["P[A^{1,2}=0 A^{2,3}=0]"] = v/8 + (1-v)/16
-known_values_symbolic["P[A^{1,2}=0 A^{2,3}=1]"] = v/24 + (1-v)/16
-known_values_symbolic["P[A^{1,2}=0 A^{2,3}=0 A^{3,1}=0]"] = v/8 + (1-v)/64
-known_values_symbolic["P[A^{1,2}=0 A^{2,3}=0 A^{3,1}=1]"] = 1/64
-known_values_symbolic["P[A^{1,2}=0 A^{2,3}=1 A^{3,1}=2]"] = v/48 + (1-v)/64
-max_vis = max_within_feasible(ring_SDP, known_values_symbolic, "dual")
+# v = 3/4 # EJM specifically, or 3/7 for local bound.
+# v = 1
+atomic_known_values_symbolic = {"1": 1}
+atomic_known_values_symbolic["P[A^{1,2}=0]"] = 1 / 4
+atomic_known_values_symbolic["P[A^{1,2}=0 A^{2,3}=0]"] = v / 8 + (1 - v) / 16
+atomic_known_values_symbolic["P[A^{1,2}=0 A^{2,3}=1]"] = v / 24 + (1 - v) / 16
+atomic_known_values_symbolic["P[A^{1,2}=0 A^{2,3}=0 A^{3,1}=0]"] = v / 8 + (1 - v) / 64
+atomic_known_values_symbolic["P[A^{1,2}=0 A^{2,3}=0 A^{3,1}=1]"] = (1 - v) / 64
+atomic_known_values_symbolic["P[A^{1,2}=0 A^{2,3}=1 A^{3,1}=2]"] = v / 48 + (1 - v) / 64
+
+# For optimization, we need to add the zero key.
+atomic_known_values_symbolic["0"] = 0
+# atomic_known_values_symbolic2 = {key: 768*val for key, val in atomic_known_values_symbolic.items()}
+print("Atomic known values:", atomic_known_values_symbolic)
+ring_SDP.update_values(atomic_known_values_symbolic)
+known_values_symbolic = ring_SDP.known_moments
+print("All known values:", known_values_symbolic)
+
+# ring_SDP.solve(solve_dual=True)
+max_vis, cert = max_within_feasible(ring_SDP, known_values_symbolic, "dual", precision=1e-8,
+                                    return_last_certificate=True,
+                                    verbose=True)
 print("Maximum visibility: ", max_vis)
+print("Certificate:", cert)
