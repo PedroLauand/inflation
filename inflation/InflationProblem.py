@@ -48,6 +48,7 @@ class InflationProblem:
                  nonclassical_intermediate_latents: Union[Tuple[str,...], List[str]]=tuple(),
                  classical_intermediate_latents: Union[Tuple[str,...], List[str]]=tuple(),
                  order: Union[Tuple[str,...], List[str]]=tuple(),
+                 really_just_one_source: bool=True,
                  verbose=0):
         """Class for encoding relevant details concerning the causal compatibility
         scenario.
@@ -120,6 +121,8 @@ class InflationProblem:
         self.nonclassical_intermediate_latents = set(map(str,nonclassical_intermediate_latents))
         assert self.classical_intermediate_latents.isdisjoint(self.nonclassical_intermediate_latents), "An intermediate latent cannot be both classical and nonclassical."
         self.intermediate_latents = self.classical_intermediate_latents.union(self.nonclassical_intermediate_latents)
+
+        self.really_just_one_source = really_just_one_source
 
         # Assign names to the visible variables
         names_have_been_set_yet = False
@@ -314,7 +317,7 @@ class InflationProblem:
         # Determine if the inflation problem has a factorizing pair of parties.
         shared_sources = [np.all(np.vstack(pair), axis=0) for pair in
                           combinations_with_replacement(self.hypergraph.T, 2)]
-        just_one_copy = (self.inflation_level_per_source == 1)
+        just_one_copy = np.asarray(self.inflation_level_per_source == 1)
         self.ever_factorizes = False
         for sources_are_shared in shared_sources:
             # If for some two parties, the sources that they share in common
@@ -356,7 +359,11 @@ class InflationProblem:
         self._inflation_indices_hash = {op.tobytes(): i for i, op
                                         in enumerate(
                 self._all_unique_inflation_indices)}
-        self._inflation_indices_overlap = nb_overlap_matrix(
+        if really_just_one_source:
+            overlap_matrix = self.one_source_overlap_matrix
+        else:
+            overlap_matrix = nb_overlap_matrix
+        self._inflation_indices_overlap = overlap_matrix(
             np.asarray(self._all_unique_inflation_indices, dtype=self._np_dtype))
 
         # Create the measurements (formerly generate_parties)
@@ -437,7 +444,10 @@ class InflationProblem:
                                               return_inverse=True, axis=0)
 
         # Symmetries implied by the inflation
-        self.symmetries = self.inflation_symmetries
+        if really_just_one_source:
+            self.symmetries = self.inflation_symmetries_one_source
+        else:
+            self.symmetries = self.inflation_symmetries
 
 
     @property
@@ -672,12 +682,12 @@ class InflationProblem:
                 tuple(int(i) for i in op_as_dict["Setting as Tuple"]),
                 int(op_as_dict["Outcome"]))
 
-    @staticmethod
-    def _interpretation_to_name(op: dict, include_copy_indices=True) -> str:
+
+    def _interpretation_to_name(self, op: dict, include_copy_indices=True) -> str:
         op_as_str = op["Party"]
         if not op["Private Setting is Trivial"]:
             op_as_str += '_'+str(op["Private Setting"])
-        if include_copy_indices:
+        if include_copy_indices or self.really_just_one_source:
             if len(op["Relevant Copy Indices"]):
                 copy_index_string = '^{'
                 copy_index_string += ','.join(map(str,op["Relevant Copy Indices"].flat))
@@ -834,7 +844,7 @@ class InflationProblem:
                                  [3, 1, 4, 0, 0, 0],
                                  [3, 6, 6, 0, 0, 0],
                                  [3, 4, 5, 0, 0, 0]])
-        >>> factorised = factorize_monomial(monomial_as_2darray)
+        >>> factorised = InflationProblem.factorize_monomial_2d(monomial_as_2darray)
         [array([[1, 0, 1, 1, 0, 0]]),
          array([[1, 0, 3, 3, 0, 0]]),
          array([[2, 1, 0, 2, 0, 0],
@@ -1118,3 +1128,70 @@ class InflationProblem:
             self._setting_specific_outcome_relabelling_symmetries))
         group_elements = group_elements_from_generators(group_generators)
         return group_elements
+
+    ###########################################################################
+    # FUNCTIONS PERTAINING TO ACTUALLY ONE SOURCE                             #
+    ###########################################################################
+    @staticmethod
+    def exists_shared_source_modified(inf_indices1: np.ndarray,
+                                inf_indices2: np.ndarray) -> bool:
+        common_sources = np.logical_and(inf_indices1, inf_indices2)
+        if not np.any(common_sources):
+            return False
+        return not set(inf_indices1[common_sources]).isdisjoint(set(inf_indices2[common_sources]))
+
+
+    def one_source_overlap_matrix(self, all_inflation_indxs: np.ndarray) -> np.ndarray:
+        n = len(all_inflation_indxs)
+        adj_mat = np.eye(n, dtype=bool)
+        for i in range(1, n):
+            inf_indices_i = all_inflation_indxs[i]
+            for j in range(i):
+                inf_indices_j = all_inflation_indxs[j]
+                if self.exists_shared_source_modified(inf_indices_i, inf_indices_j):
+                    adj_mat[i, j] = True
+        adj_mat = np.logical_or(adj_mat, adj_mat.T)
+        return adj_mat
+
+    @cached_property
+    def inflation_symmetries_one_source(self) -> np.ndarray:
+        """Calculates all the symmetries pertaining to the set of generating
+        monomials due to copy index relabelling. The new set of operators is a
+        permutation of the old. The function outputs a list of all permutations.
+
+        Returns
+        -------
+        numpy.ndarray[int]
+            The permutations of the lexicographic order implied by the inflation
+            symmetries.
+        """
+        assert np.array_equiv(self.inflation_level_per_source,
+                              self.inflation_level_per_source[0]), """
+                              Only call this with uniform inflation level!"""
+        inf_level = max(self.inflation_level_per_source)
+        if inf_level>1:
+            permutation_failed = False
+            symmetries = []
+            identity_perm = np.arange(self._nr_operators, dtype=np.intc)
+            perms = format_permutations(list(
+                permutations(range(inf_level)))[1:])
+            all_sources_simultanous = np.arange(len(self.inflation_level_per_source))
+            for permutation in perms:
+                adjusted_ops = apply_source_perm(self._lexorder,
+                                                 all_sources_simultanous,
+                                                 permutation)
+                try:
+                    new_order = np.fromiter(
+                        (self._lexorder_lookup[op.tobytes()]
+                         for op in adjusted_ops),
+                        dtype=np.intc
+                    )
+                    symmetries.append(new_order)
+                except KeyError:
+                    permutation_failed = True
+            if permutation_failed and (self.verbose > 0):
+                warn("The generating set is not closed under source swaps."
+                     + " Some symmetries will not be implemented.")
+            return np.unique(symmetries, axis=0)
+        return np.arange(self._nr_operators, dtype=np.intc)[np.newaxis]
+
