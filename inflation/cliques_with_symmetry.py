@@ -81,7 +81,7 @@ def all_and_maximal_cliques_symmetry(
         automorphisms: np.ndarray,
         max_n: int = 0,
         isolate_maximal: bool = False,
-) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+) -> Tuple[List[List[int]], List[List[int]]]:
     """
     Finds ALL and MAXIMAL cliques in a graph using a high-performance,
     boolean-mask-based search that is pruned by graph symmetry and
@@ -109,14 +109,18 @@ def all_and_maximal_cliques_symmetry(
         return np.empty((0, 0), dtype=bool)
 
     nbrs_masks = adj_matrix.astype(bool)
-    all_found_cliques = defaultdict(list)
-    maximal_found_cliques = defaultdict(list)
-    seen_canonical_subproblems: Set[Tuple[Tuple[int, ...], Tuple[int, ...]]] = set()
+    all_found_cliques = defaultdict(set)
+    maximal_found_cliques = defaultdict(set)
+    all_found_cliques_list = [[]]
+    maximal_found_cliques_list = []
+    # all_found_cliques_set = set([tuple([])])
+    # maximal_found_cliques_set = set([])
+    seen_canonical_subproblems: Set[Tuple[int,...]] = set()
     queue = deque()
     identity = automorphisms[0]
     assert len(identity) == num_vertices, "Automorphism group wrong size for given adjacency matrix."
     assert np.array_equal(identity, np.sort(identity)), "First element of automorphism group should be the identity."
-    # doubled_automorphisms = np.hstack((automorphisms, automorphisms+num_vertices))
+    doubled_automorphisms = np.hstack((automorphisms, automorphisms+num_vertices))
     # --- 1. Initialize search from one representative vertex per orbit ---
     visited_init = np.zeros(num_vertices, dtype=bool)
     for i in range(num_vertices):
@@ -136,36 +140,29 @@ def all_and_maximal_cliques_symmetry(
     while queue:
         # print("Queue size:", len(queue))
         base_mask, cnbrs_mask = queue.popleft()
-        base_indices = np.flatnonzero(base_mask)
-        cnbrs_indices = np.flatnonzero(cnbrs_mask)
-
-        # --- A. CANONICAL PRUNING ---
-        permuted_bases = np.sort(automorphisms[:, base_indices], axis=1)
-        if cnbrs_indices.size == 0:
-            combined = permuted_bases
-            permuted_cnbrs = None
-        else:
-            permuted_cnbrs = np.sort(automorphisms[:, cnbrs_indices], axis=1)
-            combined = np.hstack([permuted_bases, permuted_cnbrs])
-
-        min_idx = np.lexsort(combined.T[::-1])[0]
-        canonical_base_tuple = tuple(permuted_bases[min_idx])
-        canonical_cnbrs_tuple = () if permuted_cnbrs is None else tuple(permuted_cnbrs[min_idx])
-        canonical_rep = (canonical_base_tuple, canonical_cnbrs_tuple)
-
-        if canonical_rep in seen_canonical_subproblems:
+        combined_mask = np.hstack((base_mask, cnbrs_mask))
+        rep = tuple(combined_mask.flat)
+        if rep in seen_canonical_subproblems:
             # print("Yay, symmetry to the rescue!")
             continue
-        seen_canonical_subproblems.add(canonical_rep)
+
+
+        # --- A. CANONICAL PRUNING ---
+        permuted_combined = combined_mask[doubled_automorphisms]
+        seen_canonical_subproblems.update(map(tuple, permuted_combined))
+
 
         # --- B. GENERATE CLIQUE ORBIT ---
-        clique_size = len(base_indices)
-        newly_discovered_cliques = np.unique(permuted_bases, axis=0)
-        all_found_cliques[clique_size].extend(newly_discovered_cliques)
+        newly_discovered_clique_masks = permuted_combined[:, :num_vertices]
+        newly_discovered_cliques = set(tuple(identity[base_mask_alt].tolist()) for base_mask_alt in newly_discovered_clique_masks)
+        clique_size = len(next(iter(newly_discovered_cliques)))
+        all_found_cliques[clique_size].update(newly_discovered_cliques)
+
 
         # --- C. EXPLORE CHILDREN (WITH ORDERED-CANDIDATE PRUNING) ---
         # This is the corrected and optimized loop.
-        if (not max_n) or len(base_indices)<max_n:
+        if (not max_n) or clique_size<max_n:
+            cnbrs_indices = identity[cnbrs_mask]
             for u in cnbrs_indices:
                 # Create a mask for the new vertex u
                 u_mask = np.zeros(num_vertices, dtype=bool)
@@ -183,56 +180,20 @@ def all_and_maximal_cliques_symmetry(
 
         # --- D. FILTER FOR MAXIMALITY
         if isolate_maximal:
-            # print("Next queue", [(np.flatnonzero(base), np.flatnonzero(cnbrs)) for (base, cnbrs) in queue])
-            newly_discovered_clique_masks = np.unique(base_mask[automorphisms], axis=0)
             if not any(is_any_strict_subset_numba(newly_discovered_clique_masks,
                                                   superbase) for (superbase, _) in queue):
-                # print("YES adding ", newly_discovered_cliques)
-                maximal_found_cliques[clique_size].extend(newly_discovered_cliques)
+                maximal_found_cliques[clique_size].update(newly_discovered_cliques)
 
-    all_found_cliques_list = [[]]
     for v in all_found_cliques.values():
-        all_found_cliques_list.extend(np.unique(v, axis=0).tolist())
-    maximal_found_cliques_list = []
+        all_found_cliques_list.extend(map(list, v))
     for v in maximal_found_cliques.values():
-        maximal_found_cliques_list.extend(np.unique(v, axis=0).tolist())
+        maximal_found_cliques_list.extend(map(list, v))
     # print("Queue complete.")
+    # if not maximal_found_cliques_list:
+    #     maximal_found_cliques_list = [[]]
     return (all_found_cliques_list, maximal_found_cliques_list)
 
-# def all_and_maximal_cliques_symmetry(adjmat: np.ndarray,
-#                                      symgroup: np.ndarray,
-#                                      max_n=0,
-#                                      isolate_maximal=True) -> (np.ndarray, np.ndarray):
-#     """Based on NetworkX's `enumerate_all_cliques`.
-#     This version uses native Python sets instead of numpy arrays.
-#     (Performance comparison needed.)
-#
-#     Parameters
-#     ----------
-#     adjmat : numpy.ndarray
-#       A boolean numpy array representing the adjacency matrix of an undirected graph.
-#     symgroup : numpy.ndarray
-#       The graph's automorphism group as a (k, n) NumPy array.
-#     max_n : int, optional
-#       A cutoff for clique size reporting. Default 0, meaning no cutoff.
-#     isolate_maximal : bool, optional
-#       A flag to disable filtering for maximality, which can increase performance. True by default.
-#
-#     Returns
-#     -------
-#     Tuple[List, List]
-#       A list of all cliques as well as a list of maximal cliques. The maximal cliques list will be empty if the
-#       `isolate_maximal` flag is set to False. Cliques are returned as boolean bitmasks.
-#     """
-#     all_cliques = find_cliques_symmetric(adjmat, symgroup, max_n=max_n)
-#     if isolate_maximal:
-#         max_cliques = filter_maximal_cliques_numpy(all_cliques)
-#     else:
-#         max_cliques = np.empty((0, adjmat.shape[0]), dtype=bool)
-#     return (sorted([np.flatnonzero(bm).tolist() for bm in all_cliques], key=len),
-#             sorted([np.flatnonzero(bm).tolist() for bm in max_cliques], key=len))
-#     # return (all_cliques,
-#     #         max_cliques)
+
 
 if __name__ == '__main__':
     ### Example Usage
