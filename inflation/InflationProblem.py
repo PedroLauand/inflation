@@ -28,6 +28,7 @@ from .utils import (format_permutations,
                     partsextractor,
                     perm_combiner,
                     all_and_maximal_cliques)
+from .cliques_with_symmetry import all_and_maximal_cliques_symmetry
 
 # Force warnings.warn() to omit the source code line in the message
 # https://stackoverflow.com/questions/2187269/print-only-the-message-on-warnings
@@ -217,6 +218,24 @@ class InflationProblem:
                     f"\nIts parents are {this_ils_parents} while the set of nonclassical sources is {self._actual_sources[self._nonclassical_sources]})" +
                     "\nPlease add a nonclassical source parent to the DAG and re-initialize InflationProblem.")
 
+                # if type(inflation_level_per_source) == int:
+                #     old_inflation_level = [inflation_level_per_source] * self.nr_sources
+                # elif len(inflation_level_per_source) == self.nr_sources:
+                #     old_inflation_level = list(inflation_level_per_source)
+                # elif inflation_level_per_source:
+                #     raise ValueError("inflation_level_per_source must be a list with the same length as the number of sources.")
+                # new_inflation_level = old_inflation_level + [1]
+                # new_dag = self.dag.copy()
+                # new_dag[f'rho_single_child_{ncil}'] = [ncil]
+                # return InflationProblem(dag=new_dag,
+                #                         outcomes_per_party=outcomes_per_party,
+                #                         settings_per_party=settings_per_party,
+                #                         inflation_level_per_source=new_inflation_level,
+                #                         classical_sources=classical_sources,
+                #                         nonclassical_intermediate_latents=nonclassical_intermediate_latents,
+                #                         classical_intermediate_latents=classical_intermediate_latents,
+                #                         order=order,
+                #                         verbose=verbose)
 
 
         # Unpacking of visible nodes with children
@@ -289,8 +308,9 @@ class InflationProblem:
                     self.hypergraph[source_idx, desc_idx] = 1
                     for desc2 in observable_descendants_via_this_latent:
                         desc2_idx = names_to_integers[desc2]
+                        not_accounting_for_quantum_bonus = int(self.sources_to_check_for_party_pair_commutation[desc_idx, desc2_idx, source_idx])
                         self.sources_to_check_for_party_pair_commutation[desc_idx, desc2_idx, source_idx] = max(
-                        self.sources_to_check_for_party_pair_commutation[desc_idx, desc2_idx, source_idx],
+                            not_accounting_for_quantum_bonus,
                             1 + quantum_connection_bonus)
 
 
