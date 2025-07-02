@@ -414,11 +414,12 @@ class TestSDPOutput(unittest.TestCase):
         prob = InflationProblem(dag={"U_AB": ["A", "B"],
                                      "U_AC": ["A", "C"],
                                      "U_AD": ["A", "D"],
+                                     "U_CD": ["C", "D"],
                                      "C": ["D"],
                                      "A": ["B", "C", "D"]},
                                 outcomes_per_party=(2, 2, 2, 2),
                                 settings_per_party=(1, 1, 1, 1),
-                                inflation_level_per_source=(1, 1, 1),
+                                inflation_level_per_source=(1, 1, 1, 1),
                                 order=("A", "B", "C", "D"))
         sdp = InflationSDP(prob)
         sdp.generate_relaxation("npa2")
