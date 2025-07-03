@@ -83,7 +83,7 @@ class InflationSDP:
         self.names = inflationproblem.names
         self.names_to_ints = {name: i + 1 for i, name in enumerate(self.names)}
         if self.verbose > 1:
-            print(inflationproblem)
+            eprint(inflationproblem)
 
         self.nr_parties = len(self.names)
         self.nr_sources = inflationproblem.nr_sources
