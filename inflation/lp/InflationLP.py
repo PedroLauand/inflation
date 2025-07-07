@@ -1368,7 +1368,7 @@ class InflationLP(object):
         old_num_columns = self.n_columns
         self.n_columns = len(self.monomials)
         self.first_free_idx = first_free_index
-        self.monomial_names = np.array([mon.name for mon in monomials_as_list])
+        self.monomial_names = np.array([mon.name for mon in monomials_as_list], dtype=object)
         if self.n_columns < old_num_columns:
             if self.verbose > 0:
                 eprint("Further variable reduction has been made possible. Number of variables in the LP:",

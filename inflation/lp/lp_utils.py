@@ -485,16 +485,18 @@ def solveLP_sparse(objective: coo_array = blank_coo_array,
              snx) = task.getsolution(basic)
 
             # Get objective values, solutions x, dual values y
+            xx = np.asarray(xx, dtype=object)
+            yy = np.asarray(yy, dtype=object)
             if solve_dual:
                 primal = task.getdualobj(basic)
                 dual = task.getprimalobj(basic)
                 x_values = dict(zip(variables, yy))
-                y_values = np.asarray(xx)
+                y_values = xx
             else:
                 primal = task.getprimalobj(basic)
                 dual = task.getdualobj(basic)
                 x_values = dict(zip(variables, xx))
-                y_values = np.asarray(yy)
+                y_values = yy
 
             if solutionsta == mosek.solsta.optimal:
                 success = True
