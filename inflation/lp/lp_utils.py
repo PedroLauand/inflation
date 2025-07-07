@@ -210,6 +210,17 @@ def solveLP_sparse(objective: coo_array = blank_coo_array,
     # Since the value of infinity is ignored, define it for symbolic purposes
     inf = 0.0
 
+    nof_primal_variables = inequalities.shape[1]
+    if default_non_negative and solve_dual:
+        merely_lbbounded = np.setdiff1d(np.arange(nof_primal_variables), known_vars.col)
+        lower_bounds = coo_array((lower_bounds.toarray().ravel()[merely_lbbounded], (
+            [0] * len(merely_lbbounded),
+            merely_lbbounded
+        )), shape=(1, nof_primal_variables))
+
+
+
+
     if relax_known_vars or relax_inequalities:
         default_non_negative = False
 
@@ -297,9 +308,6 @@ def solveLP_sparse(objective: coo_array = blank_coo_array,
             if objective.shape[-1] == 0:
                 objective = coo_array((1, nof_primal_variables), dtype=np.int8)
 
-            nof_lb = lower_bounds.nnz
-            nof_ub = upper_bounds.nnz
-
             if verbose > 0:
                 print(f"Size of constraint matrix: {constraints.shape}")
 
@@ -307,26 +315,11 @@ def solveLP_sparse(objective: coo_array = blank_coo_array,
                 if verbose > 1:
                     print("Proceeding with dual initialization...")
 
-                nof_primal_nontriv_bounds = nof_lb + nof_ub
                 nof_dual_constraints = nof_primal_variables
-                nof_dual_variables = nof_primal_constraints + \
-                    nof_primal_nontriv_bounds
+                nof_dual_variables = nof_primal_constraints
 
-                # Add variable bounds as inequality constraints to matrix
-                if nof_primal_nontriv_bounds > 0:
-                    lb_mat = expand_sparse_vec(lower_bounds,
-                                               conversion_style="eq")
-                    ub_mat = expand_sparse_vec(upper_bounds,
-                                               conversion_style="eq")
-                    ub_mat.data[:] = -ub_mat.data # just a list of ones
-                    matrix = vstack((constraints, lb_mat, ub_mat),
-                                    format='csr')
-                    b_extra = np.concatenate(
-                        (lower_bounds.data, -np.asarray(upper_bounds.data)))
-                    objective_vector = np.concatenate((b, b_extra))
-                else:
-                    matrix = constraints.tocsr(copy=False)
-                    objective_vector = b
+                matrix = constraints.tocsr(copy=False)
+                objective_vector = b
 
                 if verbose > 1:
                     print("Sparse matrix reformat complete...")
@@ -338,11 +331,14 @@ def solveLP_sparse(objective: coo_array = blank_coo_array,
                 else:
                     blc = buc = objective.toarray().ravel()
 
-                # Set constraint bounds corresponding to primal variable bounds
-                if default_non_negative:
-                    bkc = np.broadcast_to(mosek.boundkey.lo, nof_dual_constraints)
-                else:
-                    bkc = np.broadcast_to(mosek.boundkey.fx, nof_dual_constraints)
+                bkc = np.array(np.broadcast_to(mosek.boundkey.fx, nof_dual_constraints), copy=True)
+                # Variable bounds are reflected in the dual on the objective!
+                bkc[lower_bounds.col] = mosek.boundkey.up
+                buc[lower_bounds.col] = lower_bounds.data
+                bkc[upper_bounds.col] = mosek.boundkey.lo
+                blc[upper_bounds.col] = upper_bounds.data
+                bkc[np.intersect1d(upper_bounds.col, upper_bounds.col)] = mosek.boundkey.ra
+
 
                 # Set bound keys and values for variables
                 # Non-positivity for y corresponding to inequalities
