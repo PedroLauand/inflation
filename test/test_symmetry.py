@@ -96,19 +96,16 @@ class TestSymmetry(unittest.TestCase):
         self.bellScenario.add_symmetries(self.PRbox_symmetries)
         lp = InflationLP(self.bellScenario, verbose=0)
         lp.set_distribution(self.PR_box)
-        lp.solve()
+        lp.solve(default_non_negative=False, solve_dual=False)
         certificate = lp.desymmetrize_certificate()
-        truth = {
-            'P[A_0=0]': 0.125, 'P[A_0=1]': 0.125, 'P[A_1=0]': 0.125, 'P[A_1=1]': 0.125,
-            'P[B_0=0]': 0.125, 'P[B_0=1]': 0.125, 'P[B_1=0]': 0.125, 'P[B_1=1]': 0.125,
-            'P[A_0=0 B_0=0]': -0.1875, 'P[A_0=0 B_0=1]': 0.0625,
-            'P[A_0=0 B_1=0]': -0.1875, 'P[A_0=0 B_1=1]': 0.0625,
-            'P[A_0=1 B_1=1]': -0.1875, 'P[A_0=1 B_1=0]': 0.0625,
-            'P[A_0=1 B_0=1]': -0.1875, 'P[A_0=1 B_0=0]': 0.0625,
-            'P[A_1=0 B_0=0]': -0.1875, 'P[A_1=0 B_0=1]': 0.0625,
-            'P[A_1=0 B_1=1]': -0.1875, 'P[A_1=0 B_1=0]': 0.0625,
-            'P[A_1=1 B_1=0]': -0.1875, 'P[A_1=1 B_1=1]': 0.0625,
-            'P[A_1=1 B_0=1]': -0.1875, 'P[A_1=1 B_0=0]': 0.0625}
+        print(certificate)
+        truth = {'P[A_0=0]': 0.25, 'P[A_0=1]': 0.25, 'P[A_1=1]': 0.25, 'P[A_1=0]': 0.25,
+                 'P[B_0=0]': 0.25, 'P[B_0=1]': 0.25, 'P[B_1=0]': 0.25, 'P[B_1=1]': 0.25,
+                 'P[A_0=0 B_0=0]': -0.375, 'P[A_0=0 B_1=0]': -0.375, 'P[A_0=1 B_0=1]': -0.375, 'P[A_0=1 B_1=1]': -0.375,
+                 'P[A_1=0 B_0=0]': -0.375, 'P[A_1=0 B_1=1]': -0.375, 'P[A_1=1 B_1=0]': -0.375, 'P[A_1=1 B_0=1]': -0.375,
+                 'P[A_0=0 B_0=1]': 0.125, 'P[A_0=0 B_1=1]': 0.125, 'P[A_0=1 B_0=0]': 0.125, 'P[A_1=0 B_0=1]': 0.125,
+                 'P[A_1=0 B_1=0]': 0.125, 'P[A_1=1 B_1=1]': 0.125, 'P[A_1=1 B_0=0]': 0.125, 'P[A_0=1 B_1=0]': 0.125
+                 }
         self.assertDictEqual(certificate, truth,
                              "Failed to desymmetrize the CHSH inequality.")
 
