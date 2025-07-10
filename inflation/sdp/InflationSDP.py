@@ -2017,7 +2017,7 @@ class InflationSDP:
     ###########################################################################
     # HELPER FUNCTIONS FOR ENSURING CONSISTENCY                               #
     ###########################################################################
-    
+
     def _cleanup_after_set_values(self) -> None:
         """Helper function to reset or make consistent class attributes after
         setting values."""

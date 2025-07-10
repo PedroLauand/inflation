@@ -111,7 +111,7 @@ class TestExtraConstraints(unittest.TestCase):
                           extra_constraints: list,
                           truth: int):
         self.assertEqual(len(problem.moment_equalities), truth,
-                         f"The number of implicit equalities is incorrect.")
+                         "The number of implicit equalities is incorrect.")
         with self.subTest("Test extra equalities"):
             problem.set_extra_equalities(extra_constraints)
             self.assertEqual(len(problem.moment_equalities), truth + 2,
@@ -127,7 +127,7 @@ class TestExtraConstraints(unittest.TestCase):
                             extra_constraints: list,
                             truth: int):
         self.assertEqual(len(problem.moment_inequalities), truth,
-                         f"The number of implicit inequalities is incorrect.")
+                         "The number of implicit inequalities is incorrect.")
         with self.subTest("Test extra inequalities"):
             problem.set_extra_inequalities(extra_constraints)
             self.assertEqual(len(problem.moment_inequalities), truth + 2,

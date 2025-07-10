@@ -610,7 +610,7 @@ class InflationProblem:
     @cached_property
     def _lexrepr_to_symbols(self) -> np.ndarray:
         """For each operator in the lexorder, create a sympy symbol with the 
-        same name as returned by InflationPRoblem._lexrepr_to_names()
+        same name as returned by InflationProblem._lexrepr_to_names()
 
         Returns
         -------
@@ -618,7 +618,8 @@ class InflationProblem:
             List of the same length as lexorder, where the i-th element is the
             string representation of the i-th operator in the lexorder.
         """
-        return np.array([Symbol(name, commutative=False) for name in self._lexrepr_to_names],
+        return np.array([Symbol(name, commutative=False)
+                         for name in self._lexrepr_to_names],
                         dtype=object)
 
     @cached_property
@@ -727,8 +728,6 @@ class InflationProblem:
             op_as_str += "_" + str(op["Composite Setting"])
         op_as_str += "_" + str(op['Outcome'])
         return op_as_str
-
-
 
     def _is_knowable_q_non_networks(self, monomial: np.ndarray) -> bool:
         """Checks if a monomial (written as a sequence of operators in 2d array
