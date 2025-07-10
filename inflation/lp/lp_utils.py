@@ -349,7 +349,6 @@ def solveLP_sparse(objective: coo_array = blank_coo_array,
                 if relax_known_vars:
                     bkx.extend([mosek.boundkey.up] * nof_known_vars +
                                [mosek.boundkey.lo] * nof_known_vars)
-                bkx.extend([mosek.boundkey.up] * nof_primal_nontriv_bounds)
 
                 # Set the objective sense
                 task.putobjsense(mosek.objsense.minimize)
