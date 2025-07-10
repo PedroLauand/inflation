@@ -22,9 +22,9 @@ class TestFunctions(unittest.TestCase):
         self.assertEqual(monom, sdp._sanitise_moment(monom),
                          f"Sanitization of {monom} as a CompoundMonomial is " +
                          f"giving {sdp._sanitise_moment(monom)}.")
-        mon1  = sdp.measurements[0][0][0][0]
-        mon2  = sdp.measurements[0][0][0][1]
-        mon3  = sdp.measurements[0][0][1][0]
+        mon1  = bellScenario.measurements_symbolic[0][0][0][0]
+        mon2  = bellScenario.measurements_symbolic[0][0][0][1]
+        mon3  = bellScenario.measurements_symbolic[0][0][1][0]
         # Tests for symbols and combinations
         mon   = mon1
         truth = sdp.moments[2]
@@ -167,7 +167,7 @@ class TestProblems(TestExtraConstraints):
         sdp = InflationSDP(self.bellScenario)
         sdp.generate_relaxation("npa1")
         compound_mon = sdp.moments[-1]
-        sym_mon = sdp.measurements[0][0][0][0]
+        sym_mon = self.bellScenario.measurements_symbolic[0][0][0][0]
         str_mon = "pA(0|0)"
         int_mon = 1
         sym_eq = Symbol("pA(0|0)") + 2 * Symbol("<A_1_0_0 A_1_1_0>")
