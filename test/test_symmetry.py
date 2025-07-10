@@ -98,7 +98,6 @@ class TestSymmetry(unittest.TestCase):
         lp.set_distribution(self.PR_box)
         lp.solve(default_non_negative=False, solve_dual=False)
         certificate = lp.desymmetrize_certificate()
-        print(certificate)
         truth = {'P[A_0=0]': 0.25, 'P[A_0=1]': 0.25, 'P[A_1=1]': 0.25, 'P[A_1=0]': 0.25,
                  'P[B_0=0]': 0.25, 'P[B_0=1]': 0.25, 'P[B_1=0]': 0.25, 'P[B_1=1]': 0.25,
                  'P[A_0=0 B_0=0]': -0.375, 'P[A_0=0 B_1=0]': -0.375, 'P[A_0=1 B_0=1]': -0.375, 'P[A_0=1 B_1=1]': -0.375,
