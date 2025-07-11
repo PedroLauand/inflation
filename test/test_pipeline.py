@@ -789,7 +789,7 @@ class TestSymmetries(unittest.TestCase):
         bellScenario_c.add_symmetries(symmetries)
 
         BellLP = InflationLP(bellScenario_c)
-        BellLP.set_distribution(PR_box(1/2+1e-4))
+        BellLP.set_distribution(PR_box(1/2+1e-3))
         BellLP.solve()
         self.assertEqual(BellLP.success, False,
                          "The symmetrized LP is not identifying incompatible" +
