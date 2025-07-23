@@ -471,7 +471,7 @@ def solveSDP_MosekFUSION(mask_matrices: Dict = None,
             elif status == ProblemStatus.DualInfeasible:
                 status_str = "dual_infeas_cer"
             elif status == ProblemStatus.PrimalInfeasible:
-                status_str = "primal_infeas_cer",
+                status_str = "primal_infeas_cer"
             elif status == ProblemStatus.Unknown:
                 status_str = "unknown"
                 code, desc = mosek.Env.getcodedesc(
