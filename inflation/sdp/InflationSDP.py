@@ -1614,12 +1614,9 @@ class InflationSDP:
             else:
                 pass
         atoms = tuple(sorted(list_of_atoms))
-        if not self.all_operators_commute:
+        if (not self.all_operators_commute) and (not self.real_qt):
             conjugate = [factor.dagger for factor in atoms]
-            if not self.real_qt:
-                atoms = min(atoms, tuple(sorted(conjugate)))
-            else:
-                atoms = min(tuple(sorted(candidate)) for candidate in product(*zip(atoms, conjugate)))
+            atoms = min(atoms, tuple(sorted(conjugate)))
             del conjugate
         try:
             mon = self.monomial_from_atoms[atoms]
