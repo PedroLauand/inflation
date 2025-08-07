@@ -376,7 +376,7 @@ def solveLP_sparse(objective: coo_array = blank_coo_array,
                            # maxnumvar=
                            numvar,
                            # c=
-                           objective_vector,
+                           array("d", objective_vector),
                            # cfix=
                            0,
                            # aptrb=
@@ -384,7 +384,7 @@ def solveLP_sparse(objective: coo_array = blank_coo_array,
                            # aptre=
                            matrix.indptr[1:],
                            # asub=
-                           array("i",matrix.indices),
+                           array("i", matrix.indices),
                            # aval=
                            matrix.data,
                            bkc,
