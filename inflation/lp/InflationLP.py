@@ -898,7 +898,7 @@ class InflationLP(object):
             raise Exception("For extracting a certificate you need to solve " +
                             "a problem. Call \"InflationSDP.solve()\" first.")
 
-        desymmetrized = {}
+        desymmetrized = defaultdict(int)
         norm = len(self.InflationProblem.symmetries)
         lexmon_names = self.InflationProblem._lexrepr_to_copy_index_free_names
         for symm in self.InflationProblem.symmetries:
@@ -911,11 +911,8 @@ class InflationLP(object):
                         desymm_name = "P[" + " ".join(desymm_mon) + "]"
                     else:
                         desymm_name = "1"
-                    if desymm_name not in desymmetrized:
-                        desymmetrized[desymm_name] = coeff / norm
-                    else:
-                        desymmetrized[desymm_name] += coeff / norm
-        return desymmetrized
+                    desymmetrized[desymm_name] += coeff / norm
+        return {k:v for k,v in desymmetrized.items()}
 
     ###########################################################################
     # OTHER ROUTINES EXPOSED TO THE USER                                      #
