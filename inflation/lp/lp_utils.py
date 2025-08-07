@@ -13,6 +13,7 @@ from scipy.sparse import coo_array, issparse
 from time import perf_counter
 from gc import collect
 from ..utils import partsextractor, expand_sparse_vec, vstack
+from array import array
 
 
 def drop_zero_rows(coo_mat: coo_array):
@@ -383,7 +384,7 @@ def solveLP_sparse(objective: coo_array = blank_coo_array,
                            # aptre=
                            matrix.indptr[1:],
                            # asub=
-                           matrix.indices,
+                           array("i",matrix.indices),
                            # aval=
                            matrix.data,
                            bkc,
