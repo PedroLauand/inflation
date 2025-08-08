@@ -1010,7 +1010,7 @@ class InflationProblem:
         for c, parents in enumerate(self.parents_per_party):
             for p in parents:
                 g1.add_edge(p+self.nr_sources, c + nr_sources)
-        GMgen = isomorphism.GraphMatcher(g1, g1)
+        GMgen = isomorphism.DiGraphMatcher(g1, g1)
         discovered_automorphisms = list()
         for mapping in GMgen.isomorphisms_iter():
             valid_automorphism = True
