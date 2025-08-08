@@ -802,7 +802,7 @@ class TestSymmetries(unittest.TestCase):
 
         BellSDP = InflationSDP(bellScenario)
         BellSDP.generate_relaxation("npa2")
-        BellSDP.set_distribution(PR_box(1/np.sqrt(2)+1e-3))
+        BellSDP.set_distribution(PR_box(1/np.sqrt(2)+5e-3))
         BellSDP.solve()
         self.assertEqual(BellSDP.status, "dual_infeas_cer",
                          "The symmetrized SDP is not identifying incompatible" +
