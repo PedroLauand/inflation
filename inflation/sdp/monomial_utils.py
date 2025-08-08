@@ -47,7 +47,7 @@ def compute_marginal(prob_array: np.ndarray, atom: np.ndarray) -> float:
         outputs = atom[:, -1].astype(int)
         indices_to_sum = list(set(range(n_parties)
                                   ).difference(participating_parties))
-        marginal_dist  = np.sum(prob_array, axis=tuple(indices_to_sum))
+        marginal_dist  = np.sum(prob_array, axis=tuple(indices_to_sum)).astype(object)
         input_list: np.ndarray = np.zeros(n_parties, dtype=int)
         input_list[participating_parties] = inputs
         outputs_inputs = np.concatenate((outputs, input_list))

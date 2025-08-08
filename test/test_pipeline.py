@@ -29,6 +29,15 @@ trivial_c = InflationProblem({"h": ["v"]},
                            classical_sources="all"
                            )
 
+bellScenario = InflationProblem({"Lambda": ["A", "B"]},
+                                outcomes_per_party=[2, 2],
+                                settings_per_party=[2, 2],
+                                inflation_level_per_source=[1])
+bellScenario_c = InflationProblem({"Lambda": ["A", "B"]},
+                                    outcomes_per_party=[2, 2],
+                                    settings_per_party=[2, 2],
+                                    inflation_level_per_source=[1],
+                                    classical_sources='all')
 
 class TestMonomialGeneration(unittest.TestCase):
     bilocalSDP_commuting = InflationSDP(bilocality_c)
@@ -37,7 +46,7 @@ class TestMonomialGeneration(unittest.TestCase):
                      [0], [1], [2],
                      [0, 0], [0, 1], [0, 2], [1, 1], [1, 2], [2, 2]]
     # Monomials for the NPA level 2 in the bilocality scenario
-    meas = bilocalSDP.measurements
+    meas = bilocality_c.measurements_symbolic
     A_1_0_0_0 = meas[0][0][0][0]
     A_2_0_0_0 = meas[0][1][0][0]
     B_1_1_0_0 = meas[1][0][0][0]
@@ -172,8 +181,8 @@ class TestReset(unittest.TestCase):
     del physical_bounds[sdp.One]
 
     def prepare_objects(self, infSDP):
-        var1 = infSDP.measurements[0][0][0][0]
-        var2 = infSDP.measurements[0][0][1][0]
+        var1 = trivial.measurements_symbolic[0][0][0][0]
+        var2 = trivial.measurements_symbolic[0][0][1][0]
         infSDP.set_objective(var1, "max")
         infSDP.set_bounds({var1*var2: 0.9}, "up")
         infSDP.set_bounds({var1*var2: 0.1}, "lo")
@@ -185,11 +194,11 @@ class TestReset(unittest.TestCase):
         self.assertEqual(self.sdp.moment_lowerbounds,
                          self.physical_bounds,
                          "Resetting lower bounds fails.")
-        self.assertEqual(self.sdp.moment_upperbounds, dict(),
+        self.assertEqual(self.sdp.moment_upperbounds, {},
                          "Resetting processed upper bounds fails.")
         self.assertEqual(self.sdp.objective, {self.sdp.One: 0.},
                          "Resetting the objective function fails.")
-        self.assertEqual(self.sdp.semiknown_moments, dict(),
+        self.assertEqual(self.sdp.semiknown_moments, {},
                          "Resetting the known values fails to empty " +
                          "semiknown_moments.")
         self.assertEqual(self.sdp.known_moments, {self.sdp.One: 1.},
@@ -204,7 +213,7 @@ class TestReset(unittest.TestCase):
         self.assertEqual(self.sdp.moment_lowerbounds,
                          correct,
                          "Resetting lower bounds fails.")
-        self.assertEqual(self.sdp.moment_upperbounds, dict(),
+        self.assertEqual(self.sdp.moment_upperbounds, {},
                          "Resetting upper bounds fails.")
         self.assertTrue(len(self.sdp.objective) == 2,
                         "Resetting the bounds resets the objective function.")
@@ -216,7 +225,7 @@ class TestReset(unittest.TestCase):
         self.sdp.reset(["objective", "values"])
         self.assertEqual(self.sdp.objective, {self.sdp.One: 0.},
                          "Resetting the objective function fails.")
-        self.assertEqual(self.sdp.semiknown_moments, dict(),
+        self.assertEqual(self.sdp.semiknown_moments, {},
                         "Resetting the known values fails to empty " +
                         "semiknown_moments.")
         self.assertEqual(self.sdp.known_moments, {self.sdp.One: 1.},
@@ -242,7 +251,7 @@ class TestReset(unittest.TestCase):
     def test_reset_values(self):
         self.prepare_objects(self.sdp)
         self.sdp.reset("values")
-        self.assertEqual(self.sdp.semiknown_moments, dict(),
+        self.assertEqual(self.sdp.semiknown_moments, {},
                          "Resetting the known values fails to empty " +
                          "semiknown_moments.")
         self.assertEqual(self.sdp.known_moments, {self.sdp.One: 1.},
@@ -270,13 +279,13 @@ class TestResetLP(unittest.TestCase):
 
     def test_reset_all(self):
         self.lp.reset("all")
-        self.assertEqual(self.lp.moment_lowerbounds, dict(),
+        self.assertEqual(self.lp.moment_lowerbounds, {},
                          "Resetting lower bounds failed.")
-        self.assertEqual(self.lp.moment_upperbounds, dict(),
+        self.assertEqual(self.lp.moment_upperbounds, {},
                          "Resetting upper bounds failed.")
-        self.assertEqual(self.lp.objective, dict(),
+        self.assertEqual(self.lp.objective, {},
                          "Resetting objective failed.")
-        self.assertEqual(self.lp.semiknown_moments, dict(),
+        self.assertEqual(self.lp.semiknown_moments, {},
                          "Resetting known values failed to empty "
                          "semiknown_moments.")
         self.assertEqual(self.lp.known_moments, {self.lp.One: 1.},
@@ -299,16 +308,6 @@ class TestSDPOutput(unittest.TestCase):
                     else:
                         dist[a, b, c, 0, 0, 0] = (1-v)/8
         return dist
-
-    bellScenario = InflationProblem({"Lambda": ["A", "B"]},
-                                    outcomes_per_party=[2, 2],
-                                    settings_per_party=[2, 2],
-                                    inflation_level_per_source=[1])
-    bellScenario_c = InflationProblem({"Lambda": ["A", "B"]},
-                                      outcomes_per_party=[2, 2],
-                                      settings_per_party=[2, 2],
-                                      inflation_level_per_source=[1],
-                                      classical_sources='all')
 
     cutInflation = InflationProblem({"lambda": ["a", "b"],
                                      "mu": ["b", "c"],
@@ -350,7 +349,7 @@ class TestSDPOutput(unittest.TestCase):
         very_trivial = InflationProblem({"a": ["b"]}, outcomes_per_party=[2])
         sdp          = InflationSDP(very_trivial)
         sdp.generate_relaxation("npa1")
-        operator = np.asarray(sdp.measurements).flatten()[0]
+        operator = np.asarray(very_trivial.measurements_symbolic).flatten()[0]
         sdp.set_objective(operator, "max")
         sdp.set_bounds({operator: ub}, "up")
         sdp.solve()
@@ -367,7 +366,7 @@ class TestSDPOutput(unittest.TestCase):
                         f"{sdp.objective_value}.")
 
     def test_CHSH(self):
-        sdp = InflationSDP(self.bellScenario)
+        sdp = InflationSDP(bellScenario)
         sdp.generate_relaxation("npa1")
         self.assertEqual(sdp.n_columns, 5,
                          "The number of generating columns is not correct.")
@@ -375,7 +374,7 @@ class TestSDPOutput(unittest.TestCase):
                          "The count of knowable moments is wrong.")
         self.assertEqual(sdp.n_unknowable, 2,
                          "The count of unknowable moments is wrong.")
-        meas = sdp.measurements
+        meas = bellScenario.measurements_symbolic
         A0 = 2*meas[0][0][0][0] - 1
         A1 = 2*meas[0][0][1][0] - 1
         B0 = 2*meas[1][0][0][0] - 1
@@ -415,11 +414,12 @@ class TestSDPOutput(unittest.TestCase):
         prob = InflationProblem(dag={"U_AB": ["A", "B"],
                                      "U_AC": ["A", "C"],
                                      "U_AD": ["A", "D"],
+                                     "U_CD": ["C", "D"],
                                      "C": ["D"],
                                      "A": ["B", "C", "D"]},
                                 outcomes_per_party=(2, 2, 2, 2),
                                 settings_per_party=(1, 1, 1, 1),
-                                inflation_level_per_source=(1, 1, 1),
+                                inflation_level_per_source=(1, 1, 1, 1),
                                 order=("A", "B", "C", "D"))
         sdp = InflationSDP(prob)
         sdp.generate_relaxation("npa2")
@@ -453,7 +453,7 @@ class TestSDPOutput(unittest.TestCase):
 
         sdp.set_distribution(self.GHZ(0.5 + 1e-2))
         sdp.solve()
-        self.assertEqual(sdp.status, "infeasible",
+        self.assertEqual(sdp.status, "dual_infeas_cer",
                          "The commuting SDP is not identifying incompatible " +
                          "distributions.")
         lp_fanout = InflationLP(self.cutInflation_c)
@@ -474,7 +474,7 @@ class TestSDPOutput(unittest.TestCase):
                         "is not identifying incompatible distributions.")
         sdp.set_distribution(self.GHZ(0.5 - 1e-2))
         sdp.solve()
-        self.assertEqual(sdp.status, "feasible",
+        self.assertEqual(sdp.status, "optimal",
                          "The commuting SDP is not recognizing compatible " +
                          "distributions.")
         lp_fanout.set_distribution(self.GHZ(0.5 - 1e-2))
@@ -507,7 +507,7 @@ class TestSDPOutput(unittest.TestCase):
                                    (0.5+1e-2) / 2 + (0.5-1e-2) / 8),
                         "Setting the distribution is failing.")
         sdp.solve()
-        self.assertTrue(sdp.status in ["infeasible", "unknown"],
+        self.assertTrue(sdp.status in ["dual_infeas_cer", "unknown"],
                         "The non-commuting SDP is not identifying " +
                         "incompatible distributions.")
         sdp.solve(feas_as_optim=True)
@@ -519,7 +519,7 @@ class TestSDPOutput(unittest.TestCase):
                                    (0.5-1e-2) / 2 + (0.5+1e-2) / 8),
                         "Re-setting the distribution is failing.")
         sdp.solve()
-        self.assertEqual(sdp.status, "feasible",
+        self.assertEqual(sdp.status, "optimal",
                          "The non-commuting SDP is not recognizing " +
                          "compatible distributions.")
         sdp.solve(feas_as_optim=True)
@@ -532,37 +532,37 @@ class TestSDPOutput(unittest.TestCase):
         sdp.generate_relaxation("local1")
         sdp.set_distribution(self.incompatible_dist)
         sdp.solve(feas_as_optim=False)
-        self.assertEqual(sdp.status, "infeasible",
+        self.assertEqual(sdp.status, "dual_infeas_cer",
                          "Failing to detect the infeasibility of the " +
                          "distribution that maximally violates Bonet's " +
                          "inequalty.")
         unnormalized_dist = np.ones((2, 2, 3, 1), dtype=float)
         sdp.set_distribution(unnormalized_dist)
         sdp.solve(feas_as_optim=False)
-        self.assertEqual(sdp.status, "infeasible",
+        self.assertEqual(sdp.status, "dual_infeas_cer",
                          "Failing to detect the infeasibility of an " +
                          "distribution that violates normalization.")
         compat_dist = unnormalized_dist / 4
         sdp.set_distribution(compat_dist)
         sdp.solve(feas_as_optim=False)
-        self.assertEqual(sdp.status, "feasible",
+        self.assertEqual(sdp.status, "optimal",
                          "A feasible distribution for the instrumental " +
                          "scenario is not being recognized as such.")
 
     def test_lpi(self):
         sdp = InflationSDP(trivial)
-        [[[[A10], [A11]], [[A20], [A21]]]] = sdp.measurements
+        [[[[A10,_],[A11,_]],[[A20,_],[A21,_]]]] = trivial.measurements_symbolic
         sdp.generate_relaxation([1,
                                  A10, A11, A20, A21,
                                  A10*A11, A10*A21, A11*A20, A20*A21])
-        sdp.set_distribution(np.array([[0.14873, 0.85168]]))
+        sdp.set_distribution(np.array([[0.14873, 0.85168], [None, None]]))
         sdp.set_objective(A11*A10*A20*A21)
         sdp.solve()
         self.assertTrue(np.isclose(sdp.objective_value, 0.0918999),
                         "Optimization of a simple SDP without LPI-like " +
                         "constraints is not obtaining the correct known value."
                         )
-        sdp.set_distribution(np.array([[0.14873, 0.85168]]),
+        sdp.set_distribution(np.array([[0.14873, 0.85168], [None, None]]),
                              use_lpi_constraints=True
                              )
         sdp.solve()
@@ -575,12 +575,12 @@ class TestSDPOutput(unittest.TestCase):
         sdp  = InflationSDP(trivial)
         cols = [np.array([]),
                 np.array([[1, 2, 0, 0],
-                 [1, 2, 1, 0]]),
+                          [1, 2, 1, 0]]),
                 np.array([[1, 1, 0, 0],
-                 [1, 2, 0, 0],
-                 [1, 2, 1, 0]])]
+                          [1, 2, 0, 0],
+                          [1, 2, 1, 0]])]
         sdp.generate_relaxation(cols)
-        sdp.set_distribution(np.ones((2, 1)) / 2,
+        sdp.set_distribution(np.ones((2, 2)) / 2,
                              use_lpi_constraints=True)
 
         self.assertGreaterEqual(len(sdp.semiknown_moments), 1,
@@ -599,7 +599,7 @@ class TestSDPOutput(unittest.TestCase):
                           [1, 2, 0, 0],
                           [1, 2, 1, 0]])]
         sdp.generate_relaxation(cols)
-        sdp.set_distribution(np.ones((2, 1)) / 2,
+        sdp.set_distribution(np.ones((2, 2)) / 2,
                              use_lpi_constraints=True)
         new_mon_indices = np.array([semi[1][1].idx
                                     for semi in sdp.semiknown_moments.items()])
@@ -608,7 +608,7 @@ class TestSDPOutput(unittest.TestCase):
                         " LPI constraints are not assigned correct indices.")
 
     def test_supports(self):
-        sdp = InflationSDP(self.bellScenario, supports_problem=True)
+        sdp = InflationSDP(bellScenario, supports_problem=True)
         sdp.generate_relaxation("local1")
         pr_support = np.zeros((2, 2, 2, 2))
         for a, b, x, y in np.ndindex(*pr_support.shape):
@@ -616,13 +616,13 @@ class TestSDPOutput(unittest.TestCase):
                 pr_support[a, b, x, y] = np.random.randn()
         sdp.set_distribution(pr_support)
         sdp.solve(feas_as_optim=False)
-        self.assertEqual(sdp.status, "infeasible",
+        self.assertEqual(sdp.status, "dual_infeas_cer",
                          "Failing to detect the infeasibility of a support "
                          + "known to be incompatible.")
         compatible_support = np.ones((2, 2, 2, 2), dtype=float)
         sdp.set_distribution(compatible_support)
         sdp.solve(feas_as_optim=False)
-        self.assertEqual(sdp.status, "feasible",
+        self.assertEqual(sdp.status, "optimal",
                          "A feasible support for the Bell scenario is not " +
                          "being recognized as such.")
 
@@ -680,7 +680,7 @@ class TestLPOutput(unittest.TestCase):
                              "scenario is not being recognized as such.")
 
     def test_supports(self):
-        lp = InflationLP(TestSDPOutput.bellScenario_c, supports_problem=True)
+        lp = InflationLP(bellScenario_c, supports_problem=True)
         with self.subTest(msg="Incompatible support"):
             pr_support = np.zeros((2, 2, 2, 2))
             for a, b, x, y in np.ndindex(*pr_support.shape):
@@ -771,6 +771,50 @@ class TestSymmetries(unittest.TestCase):
                       35, 34, 33, 32, 31, 30, 29)}
         self.assertEqual(syms, syms_good, "The symmetries are not being " +
                                           "detected correctly.")
+
+    def test_symmetrized_PRbox(self):
+
+        from inflation.symmetry_utils import discover_distribution_symmetries
+
+        def PR_box(v):
+            prob = np.zeros((2,2,2,2), dtype=float)
+            for a,b,x,y in np.ndindex(*prob.shape):
+                if np.bitwise_xor(a,b) == np.bitwise_and(x,y):
+                    prob[a,b,x,y] = 0.5
+
+            return v * prob + (1-v) * np.ones_like(prob) / 4
+
+        symmetries = discover_distribution_symmetries(PR_box(1), bellScenario)
+        bellScenario.add_symmetries(symmetries)
+        bellScenario_c.add_symmetries(symmetries)
+
+        BellLP = InflationLP(bellScenario_c)
+        BellLP.set_distribution(PR_box(1/2+1e-4))
+        BellLP.solve()
+        self.assertEqual(BellLP.success, False,
+                         "The symmetrized LP is not identifying incompatible" +
+                         " distributions.")
+        BellLP.set_distribution(PR_box(1/2-1e-4))
+        BellLP.solve()
+        self.assertEqual(BellLP.status, "optimal",
+                         "The symmetrized LP is not identifying compatible" +
+                         " distributions.")
+
+        BellSDP = InflationSDP(bellScenario)
+        BellSDP.generate_relaxation("npa2")
+        BellSDP.set_distribution(PR_box(1/np.sqrt(2)+5e-3))
+        BellSDP.solve()
+        self.assertEqual(BellSDP.status, "dual_infeas_cer",
+                         "The symmetrized SDP is not identifying incompatible" +
+                         " distributions.")
+        BellSDP.set_distribution(PR_box(1/np.sqrt(2)-1e-4))
+        BellSDP.solve()
+        self.assertEqual(BellSDP.status, "optimal",
+                         "The symmetrized SDP is not identifying compatible" +
+                         " distributions.")
+
+        bellScenario.reset_symmetries()
+        bellScenario_c.reset_symmetries()
 
 
 class TestConstraintGeneration(unittest.TestCase):
@@ -954,15 +998,6 @@ class TestInstrumental(TestPipelineLP):
 
 
 class TestBell(TestPipelineLP):
-    bellScenario = InflationProblem({"Lambda": ["A", "B"]},
-                                    outcomes_per_party=[2, 2],
-                                    settings_per_party=[2, 2],
-                                    inflation_level_per_source=[1])
-    bellScenario_c = InflationProblem({"Lambda": ["A", "B"]},
-                                      outcomes_per_party=[2, 2],
-                                      settings_per_party=[2, 2],
-                                      inflation_level_per_source=[1],
-                                      classical_sources='all')
 
     def _CHSH(self, **args):
         lp = args["scenario"]
@@ -986,7 +1021,7 @@ class TestBell(TestPipelineLP):
         return dist
 
     def test_bell_fanout(self):
-        bell = InflationLP(self.bellScenario_c)
+        bell = InflationLP(bellScenario_c)
         args = {"scenario": bell,
                 "truth_columns": 16,
                 "truth_obj": 2,
@@ -997,7 +1032,7 @@ class TestBell(TestPipelineLP):
         self._run(**args)
 
     def test_bell_nonfanout(self):
-        bell = InflationLP(self.bellScenario)
+        bell = InflationLP(bellScenario)
         args = {"scenario": bell,
                 "truth_columns": 9,
                 "truth_obj": 2,

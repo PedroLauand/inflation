@@ -99,7 +99,7 @@ class InflationLP(object):
         self.names_to_ints = inflationproblem.names_to_ints
         self._lexrepr_to_names = inflationproblem._lexrepr_to_names
         self._lexrepr_to_copy_index_free_names = inflationproblem._lexrepr_to_copy_index_free_names
-        self.op_from_name = dict()
+        self.op_from_name = {}
         for i, op_names in enumerate(inflationproblem._lexrepr_to_all_names.tolist()):
             for op_name in op_names:
                 self.op_from_name.setdefault(op_name, i)
@@ -122,7 +122,7 @@ class InflationLP(object):
         self._nr_operators = inflationproblem._nr_operators
         self._lexeye = np.eye(self._nr_operators, dtype=bool)
         self._lexrange = np.arange(self._nr_operators)
-        self.lexorder_symmetries = inflationproblem.lexorder_symmetries
+        self.lexorder_symmetries = inflationproblem.symmetries
         self._from_2dndarray = inflationproblem._from_2dndarray
         self.mon_to_lexrepr = inflationproblem.mon_to_lexrepr
         self.blank_bool_vec = np.zeros(self._nr_operators, dtype=bool)
@@ -159,23 +159,23 @@ class InflationLP(object):
         # them to inequalities when the LHS is non_CG but childless-only.
         if np.any(self.does_not_have_children):
             bad_boolvecs_for_ineqs = [bool_array[-1] for bool_array in self._CG_adjusting_ortho_groups_as_boolarrays]
-            self._boolvec_for_not_being_in_CG_notation = np.bitwise_or.reduce(bad_boolvecs_for_ineqs, axis=0)
+            self._boolvec_for_CG_ineqs = np.bitwise_or.reduce(bad_boolvecs_for_ineqs, axis=0)
         else:
-            self._boolvec_for_not_being_in_CG_notation = self.blank_bool_vec
+            self._boolvec_for_CG_ineqs = self.blank_bool_vec
         if np.any(self.has_children):
-            bad_boolvecs_for_eqs = [bool_array[-1] for bool_array in self._CG_nonadjusting_ortho_groups_as_boolarrays]
-            self._boolvec_to_trigger_equality_generation = np.bitwise_or.reduce(bad_boolvecs_for_eqs, axis=0)
+            bad_boolvecs_for_eqs = [bool_array[0] for bool_array in self._CG_nonadjusting_ortho_groups_as_boolarrays]
+            self._boolvec_for_FR_eqs = np.bitwise_or.reduce(bad_boolvecs_for_eqs, axis=0)
         else:
-            self._boolvec_to_trigger_equality_generation = self.blank_bool_vec
+            self._boolvec_for_FR_eqs = self.blank_bool_vec
 
         if self.verbose > 1:
-            print("Number of single operator measurements per party:", end="")
+            eprint("Number of single operator measurements per party:", end="")
             prefix = " "
             for i, measures in enumerate(inflationproblem.measurements):
                 op_count = np.prod(measures.shape[:2])
-                print(prefix + f"{self.names[i]}={op_count}", end="")
+                eprint(prefix + f"{self.names[i]}={op_count}", end="")
                 prefix = ", "
-            print()
+            eprint()
         self.use_lpi_constraints = False
 
         self.identity_operator = np.empty((0, self._nr_properties),
@@ -187,10 +187,10 @@ class InflationLP(object):
         # init so as to be able to test the Monomial constructor function
         # without generate_lp.
 
-        self._atomic_monomial_from_hash  = dict()
-        self.monomial_from_atoms        = dict()
-        self.monomial_from_name = dict()
-        self.monomial_from_symbol = dict()
+        self._atomic_monomial_from_hash  = {}
+        self.monomial_from_atoms        = {}
+        self.monomial_from_name = {}
+        self.monomial_from_symbol = {}
         self.One  = self.Monomial(self.identity_operator, idx=1)
         self._generate_lp()
 
@@ -250,7 +250,7 @@ class InflationLP(object):
     @cached_property
     def atom_from_name(self):
         """Returns the atomic monomials."""
-        lookup_dict = dict()
+        lookup_dict = {}
         for atom in self.atomic_factors:
             lookup_dict[atom.name] = atom
             lookup_dict[atom.legacy_name] = atom
@@ -270,7 +270,7 @@ class InflationLP(object):
     @cached_property
     def factorization_conditions(self):
         """Returns the factorization conditions."""
-        conds = dict()
+        conds = {}
         for mon in self.monomials:
             if mon.n_factors > 1:
                 conds[mon] = tuple(self.monomial_from_atoms[(fac,)]
@@ -280,7 +280,7 @@ class InflationLP(object):
     @cached_property
     def quadratic_factorization_conditions(self):
         """Returns the quadratic factorization conditions."""
-        conds = dict()
+        conds = {}
         for mon in self.monomials:
             if mon.n_factors > 1:
                 conds[mon] = (self.monomial_from_atoms[mon.factors[:1]],
@@ -316,13 +316,14 @@ class InflationLP(object):
             ``True``), only atomic monomials are assigned numerical values.
         """
         if prob_array is not None:
-            assert prob_array.shape == self.expected_distro_shape, f"Cardinalities mismatch: \n" \
-                                                                   f"expected {self.expected_distro_shape}, \n " \
-                                                                   f"got {prob_array.shape}"
+            assert prob_array.shape == self.expected_distro_shape, \
+                f"Cardinalities mismatch: \n" \
+                f"expected {self.expected_distro_shape}, \n " \
+                f"got {prob_array.shape}"
             knowable_values = {atom: atom.compute_marginal(prob_array)
                                for atom in self.knowable_atoms}
         else:
-            knowable_values = dict()
+            knowable_values = {}
 
         self.set_values(knowable_values,
                         use_lpi_constraints=use_lpi_constraints,
@@ -671,7 +672,7 @@ class InflationLP(object):
                  "polynomial constraints, the certificate is not guaranteed " +
                  "to apply to other distributions.")
         if np.allclose(list(dual.values()), 0.):
-            return dict()
+            return {}
         if clean:
             dual = clean_coefficients(dual, chop_tol, round_decimals)
         return {self.monomial_from_name[k]: v for k, v in dual.items()
@@ -873,6 +874,46 @@ class InflationLP(object):
                  "valid for other distributions.")
         return self.evaluate_polynomial(self.certificate_as_dict(), prob_array)
 
+    def desymmetrize_certificate(self) -> dict:
+        """If the scenario contains symmetries other than the inflation
+        symmetries, this function writes a certificate of infeasibility valid
+        for non-symmetric distributions too.
+
+        Parameters
+        ----------
+        replace : bool, optional
+            Whether to replace the certificate in ``self.solution_object``.
+            By default ``False``.
+
+        Returns
+        -------
+        dict
+            The expression of the un-symmetrized certificate in terms of
+            probabilities and marginals. The certificate of incompatibility is
+            ``cert < 0``.
+        """
+        try:
+            dual = self.solution_object["dual_certificate"]
+        except AttributeError:
+            raise Exception("For extracting a certificate you need to solve " +
+                            "a problem. Call \"InflationSDP.solve()\" first.")
+
+        desymmetrized = defaultdict(int)
+        norm = len(self.InflationProblem.symmetries)
+        lexmon_names = self.InflationProblem._lexrepr_to_copy_index_free_names
+        for symm in self.InflationProblem.symmetries:
+            for mon, coeff in dual.items():
+                mon = self.monomial_from_name[mon]
+                if not mon.is_zero:
+                    desymm_mon = lexmon_names[symm[mon.as_lexmon]]
+                    desymm_mon = sorted(desymm_mon, key=lambda x: x[0])
+                    if not mon.is_one:
+                        desymm_name = "P[" + " ".join(desymm_mon) + "]"
+                    else:
+                        desymm_name = "1"
+                    desymmetrized[desymm_name] += coeff / norm
+        return {k:v for k,v in desymmetrized.items()}
+
     ###########################################################################
     # OTHER ROUTINES EXPOSED TO THE USER                                      #
     ##########################################################################
@@ -928,7 +969,7 @@ class InflationLP(object):
         # Write file according to the extension
         args = self._prepare_solver_arguments(separate_bounds=True)
         if self.verbose > 0:
-            print("Writing the LP program to", filename)
+            eprint("Writing the LP program to", filename)
         if extension == "lp":
             write_to_lp(args, filename)
         elif extension == "mps":
@@ -1098,7 +1139,7 @@ class InflationLP(object):
             try:
                 return self.monomial_from_name[mon]
             except KeyError:
-                print(f"As of now we only recognize \n{list(self.monomial_from_name.keys())}")
+                eprint(f"As of now we only recognize \n{list(self.monomial_from_name.keys())}")
                 return self._sanitise_monomial(self._interpret_name(mon))
         elif isinstance(mon, Real):
             if np.isclose(float(mon), 1):
@@ -1126,7 +1167,7 @@ class InflationLP(object):
             if input_dict.free_symbols:
                 input_dict_copy = {k: float(v) for k, v in sp.expand(input_dict).as_coefficients_dict().items()}
             else:
-                input_dict_copy = dict()
+                input_dict_copy = {}
         else:
             input_dict_copy = input_dict
         output_dict = defaultdict(int)
@@ -1244,14 +1285,14 @@ class InflationLP(object):
         if self.generate_lp_has_been_called:
             return None
 
-        self._atomic_monomial_from_hash = dict()
-        self.monomial_from_atoms = dict()
+        self._atomic_monomial_from_hash = {}
+        self.monomial_from_atoms = {}
         self.Constant_Term = self.One.__copy__()
         self.Constant_Term.name = self.constant_term_name
         self.monomial_from_name[self.constant_term_name] = self.Constant_Term
 
         self.raw_n_columns = len(self._raw_monomials_as_lexboolvecs)
-        self.n_maximal_events = len(self._maximal_event_as_lexboolvecs)
+        self.raw_n_columns_non_CG = len(self._raw_monomials_as_lexboolvecs_non_CG)
 
         self._raw_lookup_dict = {bitvec.tobytes(): i for i, bitvec in
                                  enumerate(self._raw_monomials_as_lexboolvecs)}
@@ -1272,26 +1313,26 @@ class InflationLP(object):
             self.num_CG = len(old_reps_CG)
 
             orbits_non_CG = self._discover_inflation_orbits(
-                self._maximal_event_as_lexboolvecs)
+                self._raw_monomials_as_lexboolvecs_non_CG)
             old_reps_non_CG, unique_indices_non_CG, inverse_non_CG = np.unique(
                 orbits_non_CG, return_index=True, return_inverse=True)
-            self.n_representative_maximal_events = len(old_reps_non_CG)
+            self.num_non_CG = len(old_reps_non_CG)
             if self.verbose > 1:
-                print(f"Orbits discovered! {self.num_CG} unique monomials.")
+                eprint(f"Orbits discovered! {self.num_CG} unique monomials.")
             # Obtain the real generating monomials after accounting for symmetry
         else:
             self.num_CG = self.raw_n_columns
             unique_indices_CG = np.arange(self.num_CG)
             inverse_CG = unique_indices_CG
-            self.n_representative_maximal_events = self.n_maximal_events
-            unique_indices_non_CG = np.arange(self.n_representative_maximal_events)
+            self.num_non_CG = self.raw_n_columns_non_CG
+            unique_indices_non_CG = np.arange(self.num_non_CG)
         self.inverse = inverse_CG
 
         self._monomials_as_lexboolvecs = self._raw_monomials_as_lexboolvecs[unique_indices_CG]
-        self._representative_maximal_events_as_lexboolvecs = self._maximal_event_as_lexboolvecs[unique_indices_non_CG]
+        self._monomials_as_lexboolvecs_non_CG = self._raw_monomials_as_lexboolvecs_non_CG[unique_indices_non_CG]
         self.n_columns = len(self._monomials_as_lexboolvecs)
 
-        self.nof_collins_gisin_inequalities = self.n_representative_maximal_events
+        self.nof_collins_gisin_inequalities = self.num_non_CG
 
         if self.verbose > 0:
             eprint("Number of variables in the LP:",
@@ -1300,36 +1341,44 @@ class InflationLP(object):
                     self.nof_collins_gisin_inequalities)
 
         # Associate Monomials to the remaining entries.
-        _monomials = []
-        _monomial_names = []
-        _compmonomial_from_idx = dict()
         _compmonomial_to_idx = dict()
-        boolvec2mon = dict()
+        self.extra_inverse = np.arange(self.n_columns, dtype=int)
+        first_free_index = 0
         for idx, mon_as_lexboolvec in tqdm(enumerate(self._monomials_as_lexboolvecs),
                              disable=not self.verbose,
                              desc="Initializing monomials   ",
                              total=self.n_columns):
-            mon = self.Monomial(np.flatnonzero(mon_as_lexboolvec), idx)
-            boolvec2mon[tuple(tuple(op)
-                              for op in self._lexorder[mon_as_lexboolvec])] = mon
-            _monomials.append(mon)
-            _monomial_names.append(mon.name)
-            _compmonomial_from_idx[idx] = mon
-            # Commented out line below used for internal debugging only.
-            # assert mon not in _compmonomial_to_idx, f"Critical error: these two monomials {(mon, _compmonomial_from_idx[_compmonomial_to_idx[mon]])} are being assigned the same index."
-            _compmonomial_to_idx[mon] = idx
-        self.first_free_idx = self.n_columns + 1
-        self.monomials = np.array(_monomials, dtype=object)
-        self.monomial_names = np.array(_monomial_names)
-        self.compmonomial_from_idx = _compmonomial_from_idx
-        self.compmonomial_to_idx = _compmonomial_to_idx
-        del _monomials, _compmonomial_from_idx, _compmonomial_to_idx, _monomial_names
+            mon = self.Monomial(np.flatnonzero(mon_as_lexboolvec), first_free_index)
+            try:
+                current_index = _compmonomial_to_idx[mon]
+                mon.idx = current_index
+            except KeyError:
+                current_index = first_free_index
+                _compmonomial_to_idx[mon] = current_index
+                first_free_index += 1
+            self.extra_inverse[idx] = current_index
+        self.inverse = self.extra_inverse[self.inverse] # Hack to allow for powerful symmetries
+
+        monomials_as_list = list(_compmonomial_to_idx.keys())
+        self.monomials = np.array(monomials_as_list, dtype = object)
+        # assert np.array_equal(list(_compmonomial_to_idx.values()), np.arange(len(self.monomials))), "Something went wrong with monomial initialization."
+        old_num_columns = self.n_columns
+        self.n_columns = len(self.monomials)
+        self.first_free_idx = first_free_index
+        self.monomial_names = np.array([mon.name for mon in monomials_as_list], dtype=object)
+        if self.n_columns < old_num_columns:
+            if self.verbose > 0:
+                eprint("Further variable reduction has been made possible. Number of variables in the LP:",
+                       self.n_columns)
+        self.compmonomial_from_idx = dict(zip(range(self.n_columns), monomials_as_list))
+        self.compmonomial_to_idx = dict(zip(monomials_as_list, range(self.n_columns)))
+        del _compmonomial_to_idx, monomials_as_list
         collect(generation=2)
         assert self.monomials[0] == self.One, f"Sparse indexing requires that first column represent one, but got {self.monomials[0]}"
 
-        assert len(self.compmonomial_to_idx.keys()) == self.n_columns, \
-            (f"Multiple indices are being associated to the same monomial. \n" +
-            f"Expected {self.n_columns}, got {len(self.compmonomial_to_idx.keys())}.")
+        # assert len(self.compmonomial_to_idx.keys()) == self.n_columns, \
+        #     (f"Multiple indices are being associated to the same monomial. \n" +
+        #     f"Expected {self.n_columns}, got {len(self.compmonomial_to_idx.keys())}.")
 
 
         _counter = Counter([mon.knowability_status
@@ -1354,7 +1403,7 @@ class InflationLP(object):
 
         self._lp_has_been_generated = True
         if self.verbose > 1:
-            print("LP initialization complete, ready to accept further specifics.")
+            eprint("LP initialization complete, ready to accept further specifics.")
 
     def _template_to_event_boolarray(self, template: List[int], decompressor: List[np.ndarray]) -> np.ndarray:
         if template:
@@ -1384,9 +1433,9 @@ class InflationLP(object):
         ])
 
     @cached_property
-    def _maximal_event_as_lexboolvecs(self) -> np.ndarray:
+    def _raw_monomials_as_lexboolvecs_non_CG(self) -> np.ndarray:
         r"""Creates the generating set of monomials (as boolvecs),
-        of MAXIMAL lengths, NOT limited to Collins-Gisin notation.
+        of ALL lengths, limited to Collins-Gisin notation.
         """
         return np.vstack([
             self._template_to_event_boolarray(clique, self._all_ortho_groups_as_boolarrays)
@@ -1399,10 +1448,10 @@ class InflationLP(object):
         notation."""
         eq_row, eq_col, eq_data = [], [], []
         nof_equalities = 0
-        if np.any(self._boolvec_to_trigger_equality_generation):
-            alternatives_as_boolarrays = {v: np.pad(r[:-1], ((1, 0), (0, 0)))
+        if np.any(self._boolvec_for_FR_eqs):
+            alternatives_as_boolarrays = {v: np.pad(r[1:], ((1, 0), (0, 0)))
                                           for v, r in zip(
-                    np.flatnonzero(self._boolvec_to_trigger_equality_generation).flat,
+                    np.flatnonzero(self._boolvec_for_FR_eqs).flat,
                     self._CG_nonadjusting_ortho_groups_as_boolarrays)}
             alternatives_as_signs = {
                 i: np.count_nonzero(bool_array, axis=1).astype(bool)
@@ -1411,7 +1460,7 @@ class InflationLP(object):
             for bool_vec in tqdm(self._monomials_as_lexboolvecs,
                     disable=not self.verbose,
                     desc="Discovering equalities   "):
-                critical_boolvec_intersection = np.bitwise_and(bool_vec, self._boolvec_to_trigger_equality_generation)
+                critical_boolvec_intersection = np.bitwise_and(bool_vec, self._boolvec_for_FR_eqs)
                 if np.any(critical_boolvec_intersection):
 
                     absent_c_boolvec = bool_vec.copy()
@@ -1472,16 +1521,16 @@ class InflationLP(object):
         nof_inequalities = 0
         alternatives_as_boolarrays = {v: np.pad(r[:-1], ((1, 0), (0, 0)))
                                       for v, r in zip(
-                np.flatnonzero(self._boolvec_for_not_being_in_CG_notation).flat,
+                np.flatnonzero(self._boolvec_for_CG_ineqs).flat,
                 self._CG_adjusting_ortho_groups_as_boolarrays)}
         alternatives_as_signs = {
             i: np.count_nonzero(bool_array, axis=1).astype(bool)
             for i, bool_array in alternatives_as_boolarrays.items()}
-        for bool_vec in tqdm(self._representative_maximal_events_as_lexboolvecs,
+        for bool_vec in tqdm(self._monomials_as_lexboolvecs_non_CG,
                              disable=not self.verbose,
                              desc="Discovering inequalities   "):
             critical_boolvec_intersection = np.bitwise_and(bool_vec,
-                                                           self._boolvec_for_not_being_in_CG_notation)
+                                                           self._boolvec_for_CG_ineqs)
             if critical_boolvec_intersection.any():
                 absent_c_boolvec = bool_vec.copy()
                 absent_c_boolvec[critical_boolvec_intersection] = False
@@ -1673,7 +1722,7 @@ class InflationLP(object):
             for mon in nonzero_known_monomials:
                 self.moment_lowerbounds[mon] = 1.
                 del self.known_moments[mon]
-            self.semiknown_moments = dict()
+            self.semiknown_moments = {}
         num_nontrivial_known = len(self.known_moments)
         if self.verbose > 1 and num_nontrivial_known > 1:
             eprint("Number of variables with fixed numeric value:",
@@ -1694,12 +1743,12 @@ class InflationLP(object):
     def _reset_lowerbounds(self) -> None:
         """Reset the list of lower bounds."""
         self._reset_solution()
-        self.moment_lowerbounds = dict()
+        self.moment_lowerbounds = {}
 
     def _reset_upperbounds(self) -> None:
         """Reset the list of upper bounds."""
         self._reset_solution()
-        self.moment_upperbounds = dict()
+        self.moment_upperbounds = {}
 
     def _reset_objective(self) -> None:
         """Reset the objective function."""
@@ -1710,8 +1759,8 @@ class InflationLP(object):
     def _reset_values(self) -> None:
         """Reset the known values."""
         self._reset_solution()
-        self.known_moments     = dict()
-        self.semiknown_moments = dict()
+        self.known_moments     = {}
+        self.semiknown_moments = {}
         self.known_moments[self.One] = 1.
         self.extra_equalities = []
         self.extra_inequalities = []
@@ -1996,7 +2045,7 @@ class InflationLP(object):
         self._reset_upperbounds()
         if upperbounds is None:
             return
-        sanitized_upperbounds = dict()
+        sanitized_upperbounds = {}
         for mon, upperbound in upperbounds.items():
             mon = self._sanitise_monomial(mon)
             if mon not in sanitized_upperbounds.keys():
@@ -2022,7 +2071,7 @@ class InflationLP(object):
         self._reset_lowerbounds()
         if lowerbounds is None:
             return
-        sanitized_lowerbounds = dict()
+        sanitized_lowerbounds = {}
         for mon, lowerbound in lowerbounds.items():
             mon = self._sanitise_monomial(mon)
             if mon not in sanitized_lowerbounds.keys():

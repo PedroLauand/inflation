@@ -117,7 +117,7 @@ def calculate_momentmatrix_1d_internal(cols: List,
         string representation to integer representation.
     """
     nrcols = len(cols)
-    canonical_mon_to_idx = dict()
+    canonical_mon_to_idx = {}
     momentmatrix = np.zeros((nrcols, nrcols), dtype=np.uint32)
     varidx = 1  # We start from 1 because 0 is reserved for 0
     for (i, mon1), (j, mon2) in tqdm(
@@ -365,38 +365,6 @@ def expand_moment_normalisation(moment: np.ndarray,
                 normalization_mon = np.vstack((prefix, suffix))
                 eqs.append((normalization_mon, moments))
     return eqs
-
-
-def generate_operators(outs_per_input: List[int],
-                       name: str
-                       ) -> List[List[List[sympy.core.symbol.Symbol]]]:
-    """Generates the list of ``sympy.core.symbol.Symbol`` variables
-    representing the measurements for a given party. The variables are treated
-    as non-commuting. This code is adapted from `ncpol2sdpa
-    <https://github.com/peterwittek/ncpol2sdpa/>`_.
-
-    Parameters
-    ----------
-    outs_per_input : List[int]
-        The number of outcomes of each measurement for a given party
-    name : str
-        The name to be associated to the party
-
-    Returns
-    -------
-    list
-        The list of Sympy operators
-    """
-    ops_per_input = []
-    for x, outs in enumerate(outs_per_input):
-        ops_per_output_per_input = []
-        for o in range(outs):
-            ops_per_output_per_input.append(
-                sympy.Symbol(name + "_" + str(x) + "_" + str(o),
-                             commutative=False)
-            )
-        ops_per_input.append(ops_per_output_per_input)
-    return ops_per_input
 
 
 def lexicographic_order(infSDP) -> Dict[str, int]:
