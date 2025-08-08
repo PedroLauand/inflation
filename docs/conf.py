@@ -21,7 +21,7 @@ author = "Emanuel-Cristian Boghiu, Elie Wolfe, Alejandro Pozas-Kerstjens"
 copyright = "2025, " + author
 
 # The full version, including alpha/beta/rc tags
-release = "2.0.2"
+release = "2.0.3"
 
 # -- General configuration ---------------------------------------------------
 
