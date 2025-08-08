@@ -210,6 +210,8 @@ class InflationSDP:
                     + " inflation, \nbut have not specified classical_sources=`all`." \
                     + "\nNote that the `commuting` keyword argument has been deprecated as of release 2.0.0"
         if real_qt:
+            warn("Support for real quantum theory is experimental. " + 
+                 "Use at your own risk.")
             assert not self.all_operators_commute, \
                 "You appear to be requesting inflation assuming real quantum theory," \
                 + " but this is meaningless without noncommuting operators."
