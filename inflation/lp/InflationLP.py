@@ -1437,7 +1437,8 @@ class InflationLP(object):
         """
         return np.vstack([
             self._template_to_event_boolarray(subclique, self._CG_limited_ortho_groups_as_boolarrays)
-            for subclique in self.all_compatible_templates
+            for subclique in tqdm(self.all_compatible_templates, disable=not self.verbose,
+             desc="Converting templates to generating monomials...")
         ])
 
     @cached_property
@@ -1447,7 +1448,8 @@ class InflationLP(object):
         """
         return np.vstack([
             self._template_to_event_boolarray(clique, self._all_ortho_groups_as_boolarrays)
-            for clique in self.maximal_compatible_templates
+            for clique in tqdm(self.maximal_compatible_templates, disable=not self.verbose,
+             desc="Converting templates to global events...")
         ])
 
     @cached_property
