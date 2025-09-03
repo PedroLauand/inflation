@@ -1417,7 +1417,12 @@ class InflationLP(object):
 
     @cached_property
     def all_and_maximal_compatible_templates(self):
-        return self.InflationProblem.all_and_maximal_compatible_templates()
+        if self.verbose > 1:
+            eprint("Beginning extraction of all and maximal compatible templates.")
+        result = self.InflationProblem.all_and_maximal_compatible_templates()
+        if self.verbose > 1:
+            eprint("Template extraction complete!")
+        return result
     @property
     def all_compatible_templates(self):
         return self.all_and_maximal_compatible_templates[0]

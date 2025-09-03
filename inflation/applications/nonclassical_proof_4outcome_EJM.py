@@ -16,9 +16,11 @@ def ring_problem(inflation_level: int, nof_outcomes: int = 2) -> InflationProble
         really_just_one_source=True)
     return inf_prob
 
+print("Initiating InflationProblem instance.")
 prob = ring_problem(4, 4)
+print("Adding symmetries.")
 prob.add_symmetries(prob._setting_specific_outcome_relabelling_symmetries)
-
+print("InflationProblem initiation complete. Now calculating probabilities.")
 
 
 oA=4
@@ -58,24 +60,25 @@ for a1 in range(oA):
 # -> 2-line: P[A^{1,2}=a A{2,3}=a'] 
 # ->3 -loop : P[A^{1,2}=a A{2,3}=a' A^{3,1}=a'']
 # ->3 -line : P[A^{1,2}=a A{2,3}=a' A^{3,4}=a'']
+print("Probability calculations complete, now initiation InflationLP initialization.")
 ring_LP = InflationLP(prob, verbose=2, include_all_outcomes=True)
-
+print("Extracting all atomic monomials from the LP.")
 at=ring_LP.atomic_monomials
 
 actual_values={}
 for k in values:
     for j in at:
         if k == j.name:
+            print(f"{k} : {values[k]}")
             actual_values.update({k:values[k]})
 
-print(actual_values)
 
     
 
 
-
+print("Assigning these values to the LP")
 ring_LP.update_values(values=actual_values, only_specified_values=False)
-
+print("Assignment complete. Beginning solve.")
 
 
 ring_LP.solve(solve_dual=False)
