@@ -1,7 +1,7 @@
 from __future__ import annotations
 from math import ldexp
 import numpy as np
-from functools import cache
+from functools import lru_cache
 from typing import Dict, Tuple
 
 # ---------------------------
@@ -18,7 +18,7 @@ ejm = np.stack([e0_un, e1_un, e2_un, e3_un])  # (4, 2, 2), complex128
 # ---------------------------
 psi = np.array([[0, 1, -1, 0]], dtype=np.complex128).reshape(2, 2)  # (2, 2), complex128
 
-@cache
+@lru_cache(maxsize=None)
 def loop_n(n: int) -> np.ndarray:
     """
     Vectorized probability table P[a0,...,a_{n-1}] for an n-site ring, using UNNORMALIZED psi/ejm.
@@ -63,7 +63,7 @@ def loop_n(n: int) -> np.ndarray:
     P = (A.real * A.real + A.imag * A.imag) * prob_corr
     return P.astype(np.float64, copy=False)
 
-@cache
+@lru_cache(maxsize=None)
 def line_n(n: int) -> np.ndarray:
     """
     Vectorized probability table P[a0,...,a_{n-1}] for an n-site line, using UNNORMALIZED psi/ejm.

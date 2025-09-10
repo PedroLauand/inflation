@@ -1,5 +1,5 @@
 import sys
-sys.path.append('/Users/pedrolauand/My_Code/Distributed_Computing/inflation')
+sys.path.append('/Users/pedrolauand/My_Code/Inflation/inflation')
 from inflation import InflationProblem, InflationLP
 import numpy as np
 from EJM_4outcomes_GPT import build_values
