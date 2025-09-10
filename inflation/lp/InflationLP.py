@@ -4,10 +4,11 @@ or non-fanout inflation instance (see arXiv:1707.06476).
 
 @authors: Emanuel-Cristian Boghiu, Elie Wolfe, Alejandro Pozas-Kerstjens
 """
-
+import gc
 from collections import Counter, defaultdict
 from functools import reduce, cached_property
 from gc import collect
+from itertools import chain
 from operator import neg as op_neg
 from numbers import Real
 from typing import List, Dict, Union, Any
@@ -1410,8 +1411,9 @@ class InflationLP(object):
 
     def _template_to_event_boolarray(self, template: List[int], decompressor: List[np.ndarray]) -> np.ndarray:
         if len(template):
-            to_expand = partsextractor(decompressor, sorted(template, key=op_neg))
-            return reduce(nb_outer_bitwise_or, to_expand)
+            to_return = reduce(nb_outer_bitwise_or, partsextractor(decompressor, template))
+            # gc.collect(generation=0)
+            return to_return
         else:
             return self.blank_bool_array
 
@@ -1422,6 +1424,7 @@ class InflationLP(object):
         result = self.InflationProblem.all_and_maximal_compatible_templates()
         if self.verbose > 1:
             eprint("Template extraction complete!")
+        gc.collect()
         return result
     @property
     def all_compatible_templates(self):
@@ -1435,22 +1438,22 @@ class InflationLP(object):
         r"""Creates the generating set of monomials (as boolvecs),
         of ALL lengths, limited to Collins-Gisin notation.
         """
-        return np.vstack([
-            self._template_to_event_boolarray(subclique, self._CG_limited_ortho_groups_as_boolarrays)
+        return np.fromiter(chain.from_iterable(
+            self._template_to_event_boolarray(subclique, self._CG_limited_ortho_groups_as_boolarrays).flat
             for subclique in tqdm(self.all_compatible_templates, disable=not self.verbose,
-             desc="Converting templates to generating monomials...")
-        ])
+                                  desc="Converting templates to generating monomials...")
+        ), dtype=bool).reshape((-1, self._nr_operators))
 
     @cached_property
     def _raw_monomials_as_lexboolvecs_non_CG(self) -> np.ndarray:
         r"""Creates the generating set of monomials (as boolvecs),
         of ALL lengths, limited to Collins-Gisin notation.
         """
-        return np.vstack([
-            self._template_to_event_boolarray(clique, self._all_ortho_groups_as_boolarrays)
+        return np.fromiter(chain.from_iterable(
+            self._template_to_event_boolarray(clique, self._all_ortho_groups_as_boolarrays).flat
             for clique in tqdm(self.maximal_compatible_templates, disable=not self.verbose,
              desc="Converting templates to global events...")
-        ])
+        ), dtype=bool).reshape((-1, self._nr_operators))
 
     @cached_property
     def minimal_sparse_equalities(self) -> coo_array:
