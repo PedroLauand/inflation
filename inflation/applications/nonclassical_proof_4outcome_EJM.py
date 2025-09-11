@@ -16,13 +16,14 @@ def ring_problem(inflation_level: int, nof_outcomes: int = 2) -> InflationProble
         really_just_one_source=True)
     return inf_prob
 
+inflation_level=3
 print("Initiating InflationProblem instance.")
-prob = ring_problem(4, 4)
+prob = ring_problem(inflation_level, 4)
 print("Adding symmetries.")
 prob.add_symmetries(prob._setting_specific_outcome_relabelling_symmetries)
 print("InflationProblem initiation complete. Now calculating probabilities.")
 
-values = build_values(4)  # for inflation level 4
+values = build_values(inflation_level)  # for inflation level 4
 print("Probability calculations complete, now initiation InflationLP initialization.")
 ring_LP = InflationLP(prob, verbose=2, include_all_outcomes=True)
 print("Extracting all atomic monomials from the LP.")
@@ -42,7 +43,12 @@ for k in values:
 print("Assigning these values to the LP")
 ring_LP.update_values(values=actual_values, only_specified_values=False)
 print("Assignment complete. Beginning solve.")
-
+print("Enumerating equality constraints for sanity checking.")
+for eq in ring_LP.moment_equalities_by_name:
+    str = "0="
+    for name, coeiff in eq.items():
+        str += f" + {coeiff}*{name}"
+    print(str="\n")
 
 ring_LP.solve(solve_dual=False)
 #print(ring_LP.status)
