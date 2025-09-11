@@ -1437,27 +1437,19 @@ class InflationLP(object):
 
     @cached_property
     def _raw_monomials_as_lexboolvecs(self) -> Sparse2DBitArray:
-        all_rows_as_bitmaps = []
+        new = Sparse2DBitArray(self._nr_operators)
         for subclique in tqdm(self.all_compatible_templates, disable=not self.verbose,
                               desc="Converting templates to generating monomials..."):
-            numpy_array = self._template_to_event_boolarray(subclique, self._CG_limited_ortho_groups_as_boolarrays)
-            if numpy_array.size > 0:
-                for row in numpy_array:
-                    all_rows_as_bitmaps.append(pyroaring.BitMap(np.flatnonzero(row)))
-
-        return Sparse2DBitArray.from_bitmaps(all_rows_as_bitmaps, self._nr_operators)
+            new.extend(self._template_to_event_boolarray(subclique, self._CG_limited_ortho_groups_as_boolarrays))
+        return new
 
     @cached_property
     def _raw_monomials_as_lexboolvecs_non_CG(self) -> Sparse2DBitArray:
-        all_rows_as_bitmaps = []
+        new = Sparse2DBitArray(self._nr_operators)
         for clique in tqdm(self.maximal_compatible_templates, disable=not self.verbose,
                            desc="Converting templates to global events..."):
-            numpy_array = self._template_to_event_boolarray(clique, self._all_ortho_groups_as_boolarrays)
-            if numpy_array.size > 0:
-                for row in numpy_array:
-                    all_rows_as_bitmaps.append(pyroaring.BitMap(np.flatnonzero(row)))
-
-        return Sparse2DBitArray.from_bitmaps(all_rows_as_bitmaps, self._nr_operators)
+            new.extend(self._template_to_event_boolarray(clique, self._all_ortho_groups_as_boolarrays))
+        return new
 
     @cached_property
     def minimal_sparse_equalities(self) -> coo_array:
