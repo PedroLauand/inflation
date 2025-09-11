@@ -16,6 +16,7 @@ from warnings import warn
 
 import numpy as np
 import sympy as sp
+import pyroaring
 from scipy.sparse import coo_array, vstack
 from tqdm import tqdm
 
@@ -29,6 +30,7 @@ from ..sdp.fast_npa import nb_is_knowable as is_knowable
 from ..sdp.quantum_tools import flatten_symbolic_powers
 from ..utils import clean_coefficients, eprint, partsextractor, \
     expand_sparse_vec
+from ..sparse_utils import Sparse2DBitArray
 
 
 class InflationLP(object):
@@ -1434,26 +1436,28 @@ class InflationLP(object):
         return self.all_and_maximal_compatible_templates[1]
 
     @cached_property
-    def _raw_monomials_as_lexboolvecs(self) -> np.ndarray:
-        r"""Creates the generating set of monomials (as boolvecs),
-        of ALL lengths, limited to Collins-Gisin notation.
-        """
-        return np.fromiter(chain.from_iterable(
-            self._template_to_event_boolarray(subclique, self._CG_limited_ortho_groups_as_boolarrays).flat
-            for subclique in tqdm(self.all_compatible_templates, disable=not self.verbose,
-                                  desc="Converting templates to generating monomials...")
-        ), dtype=bool).reshape((-1, self._nr_operators))
+    def _raw_monomials_as_lexboolvecs(self) -> Sparse2DBitArray:
+        all_rows_as_bitmaps = []
+        for subclique in tqdm(self.all_compatible_templates, disable=not self.verbose,
+                              desc="Converting templates to generating monomials..."):
+            numpy_array = self._template_to_event_boolarray(subclique, self._CG_limited_ortho_groups_as_boolarrays)
+            if numpy_array.size > 0:
+                for row in numpy_array:
+                    all_rows_as_bitmaps.append(pyroaring.BitMap(np.flatnonzero(row)))
+
+        return Sparse2DBitArray.from_bitmaps(all_rows_as_bitmaps, self._nr_operators)
 
     @cached_property
-    def _raw_monomials_as_lexboolvecs_non_CG(self) -> np.ndarray:
-        r"""Creates the generating set of monomials (as boolvecs),
-        of ALL lengths, limited to Collins-Gisin notation.
-        """
-        return np.fromiter(chain.from_iterable(
-            self._template_to_event_boolarray(clique, self._all_ortho_groups_as_boolarrays).flat
-            for clique in tqdm(self.maximal_compatible_templates, disable=not self.verbose,
-             desc="Converting templates to global events...")
-        ), dtype=bool).reshape((-1, self._nr_operators))
+    def _raw_monomials_as_lexboolvecs_non_CG(self) -> Sparse2DBitArray:
+        all_rows_as_bitmaps = []
+        for clique in tqdm(self.maximal_compatible_templates, disable=not self.verbose,
+                           desc="Converting templates to global events..."):
+            numpy_array = self._template_to_event_boolarray(clique, self._all_ortho_groups_as_boolarrays)
+            if numpy_array.size > 0:
+                for row in numpy_array:
+                    all_rows_as_bitmaps.append(pyroaring.BitMap(np.flatnonzero(row)))
+
+        return Sparse2DBitArray.from_bitmaps(all_rows_as_bitmaps, self._nr_operators)
 
     @cached_property
     def minimal_sparse_equalities(self) -> coo_array:

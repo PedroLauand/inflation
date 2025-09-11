@@ -7,7 +7,7 @@ setup(
     name="inflation",
     version=__version__,
     install_requires=["mosek>=10", "networkx", "numba", "numpy",
-                      "scipy>=1.8.0", "sympy", "tqdm"],
+                      "scipy>=1.8.0", "sympy", "tqdm", "pyroaring"],
     extras_require={
         "docs": ["nbsphinx", "m2r2", "sphinx_rtd_theme", "sphinx_copybutton"]
     },
