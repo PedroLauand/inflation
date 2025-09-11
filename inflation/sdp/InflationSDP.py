@@ -27,8 +27,7 @@ from .monomial_classes import InternalAtomicMonomialSDP, CompoundMomentSDP
 from .quantum_tools import (apply_inflation_symmetries,
                             calculate_momentmatrix_1d_internal,
                             construct_normalization_eqs,
-                            flatten_symbolic_powers,
-                            generate_operators
+                            flatten_symbolic_powers
                             )
 from .sdp_utils import solveSDP_MosekFUSION
 from .writer_utils import (write_to_csv,
@@ -83,7 +82,7 @@ class InflationSDP:
         self.names = inflationproblem.names
         self.names_to_ints = {name: i + 1 for i, name in enumerate(self.names)}
         if self.verbose > 1:
-            print(inflationproblem)
+            eprint(inflationproblem)
 
         self.nr_parties = len(self.names)
         self.nr_sources = inflationproblem.nr_sources
@@ -103,11 +102,10 @@ class InflationSDP:
         self.setting_cardinalities = inflationproblem.settings_per_party
         self._quantum_sources = inflationproblem._nonclassical_sources
 
-        self.measurements = self._generate_parties()
         if self.verbose > 1:
             eprint("Number of single operator measurements per party:", end="")
             prefix = " "
-            for i, measures in enumerate(self.measurements):
+            for i, measures in enumerate(self.InflationProblem.measurements_symbolic):
                 counter = count()
                 deque(zip(chain.from_iterable(
                     chain.from_iterable(measures)),
@@ -212,6 +210,8 @@ class InflationSDP:
                     + " inflation, \nbut have not specified classical_sources=`all`." \
                     + "\nNote that the `commuting` keyword argument has been deprecated as of release 2.0.0"
         if real_qt:
+            warn("Support for real quantum theory is experimental. " + 
+                 "Use at your own risk.")
             assert not self.all_operators_commute, \
                 "You appear to be requesting inflation assuming real quantum theory," \
                 + " but this is meaningless without noncommuting operators."
@@ -1616,12 +1616,9 @@ class InflationSDP:
             else:
                 pass
         atoms = tuple(sorted(list_of_atoms))
-        if not self.all_operators_commute:
+        if (not self.all_operators_commute) and (not self.real_qt):
             conjugate = [factor.dagger for factor in atoms]
-            if not self.real_qt:
-                atoms = min(atoms, tuple(sorted(conjugate)))
-            else:
-                atoms = min(tuple(sorted(candidate)) for candidate in product(*zip(atoms, conjugate)))
+            atoms = min(atoms, tuple(sorted(conjugate)))
             del conjugate
         try:
             mon = self.monomial_from_atoms[atoms]
@@ -2016,66 +2013,10 @@ class InflationSDP:
                  + f" {permutations_failed} symmetries were not be implemented.")
         return np.unique(discovered_symmetries, axis=0)[1:]
 
-    def _generate_parties(self) -> List[List[List[List[sp.Symbol]]]]:
-        """Generates all the party operators in the quantum inflation.
-
-        Returns
-        -------
-        List[List[List[List[sympy.Symbol]]]]
-            The measurement operators as symbols. The array is indexed as
-            measurements[p][c][i][o] for party p, inflation copies c, input i,
-            and output o.
-        """
-        settings = self.setting_cardinalities
-        outcomes = self.outcome_cardinalities
-
-        assert len(settings) == len(outcomes), \
-            "There\'s a different number of settings and outcomes"
-        assert len(settings) == self.hypergraph.shape[1], \
-            "The hypergraph does not have as many columns as parties"
-        measurements = []
-        parties = self.names
-        n_states = self.hypergraph.shape[0]
-        for pos, [party, ins, outs] in enumerate(zip(parties,
-                                                     settings,
-                                                     outcomes)):
-            party_meas = []
-            # Generate all possible copy indices for a party
-            all_inflation_indices = product(
-                *[list(range(self.inflation_levels[p_idx]))
-                  for p_idx in np.flatnonzero(self.hypergraph[:, pos])])
-            # Include zeros in the positions of states not feeding the party
-            all_indices = []
-            for inflation_indices in all_inflation_indices:
-                indices = []
-                i = 0
-                for idx in range(n_states):
-                    if self.hypergraph[idx, pos] == 0:
-                        indices.append("0")
-                    elif self.hypergraph[idx, pos] == 1:
-                        # The +1 is just to begin at 1
-                        indices.append(str(inflation_indices[i] + 1))
-                        i += 1
-                    else:
-                        raise Exception("You don\'t have a proper hypergraph")
-                all_indices.append(indices)
-            # Generate measurements for every combination of indices.
-            # The -1 in outs - 1 is because the use of Collins-Gisin notation
-            # (see [arXiv:quant-ph/0306129]), whereby the last operator is
-            # understood to be written as the identity minus the rest.
-            for indices in all_indices:
-                meas = generate_operators(
-                    [outs - 1 for _ in range(ins)],
-                    party + "_" + "_".join(indices)
-                )
-                party_meas.append(meas)
-            measurements.append(party_meas)
-        return measurements
-
     ###########################################################################
     # HELPER FUNCTIONS FOR ENSURING CONSISTENCY                               #
     ###########################################################################
-    
+
     def _cleanup_after_set_values(self) -> None:
         """Helper function to reset or make consistent class attributes after
         setting values."""

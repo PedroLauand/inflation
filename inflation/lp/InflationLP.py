@@ -901,7 +901,7 @@ class InflationLP(object):
             raise Exception("For extracting a certificate you need to solve " +
                             "a problem. Call \"InflationSDP.solve()\" first.")
 
-        desymmetrized = {}
+        desymmetrized = defaultdict(int)
         norm = len(self.InflationProblem.symmetries)
         lexmon_names = self.InflationProblem._lexrepr_to_copy_index_free_names
         for symm in self.InflationProblem.symmetries:
@@ -914,11 +914,8 @@ class InflationLP(object):
                         desymm_name = "P[" + " ".join(desymm_mon) + "]"
                     else:
                         desymm_name = "1"
-                    if desymm_name not in desymmetrized:
-                        desymmetrized[desymm_name] = coeff / norm
-                    else:
-                        desymmetrized[desymm_name] += coeff / norm
-        return desymmetrized
+                    desymmetrized[desymm_name] += coeff / norm
+        return {k:v for k,v in desymmetrized.items()}
 
     ###########################################################################
     # OTHER ROUTINES EXPOSED TO THE USER                                      #
@@ -1371,7 +1368,7 @@ class InflationLP(object):
         old_num_columns = self.n_columns
         self.n_columns = len(self.monomials)
         self.first_free_idx = first_free_index
-        self.monomial_names = np.array([mon.name for mon in monomials_as_list])
+        self.monomial_names = np.array([mon.name for mon in monomials_as_list], dtype=object)
         if self.n_columns < old_num_columns:
             if self.verbose > 0:
                 eprint("Further variable reduction has been made possible. Number of variables in the LP:",

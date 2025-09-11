@@ -450,7 +450,7 @@ def solveSDP_MosekFUSION(mask_matrices: Dict = None,
             M.acceptedSolutionStatus(AccSolutionStatus.Anything)
             M.solve()
             if solve_dual:
-                x_values = {x: -ci_constraints[i].dual()[0]
+                x_values = {x: float(-ci_constraints[i].dual()[0])
                             for i, x in enumerate(variables)}
                 if mask_matrices:
                     ymat = Z.level().reshape([mat_dim, mat_dim])

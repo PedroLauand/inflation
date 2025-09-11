@@ -1,5 +1,7 @@
+
+
 <!DOCTYPE html>
-<html class="writer-html5" lang="en" >
+<html class="writer-html5" lang="en" data-content_root="./">
 <head>
   <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
 
@@ -38,7 +40,7 @@
           </a>
 <div role="search">
   <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
-    <input type="text" name="q" placeholder="Search docs" />
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
     <input type="hidden" name="check_keywords" value="yes" />
     <input type="hidden" name="area" value="default" />
   </form>
@@ -85,8 +87,8 @@
         <div class="rst-content">
           <div role="navigation" aria-label="Page navigation">
   <ul class="wy-breadcrumbs">
-      <li><a href="contents.html" class="icon icon-home"></a> &raquo;</li>
-      <li>Tutorial</li>
+      <li><a href="contents.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">Tutorial</li>
       <li class="wy-breadcrumbs-aside">
             <a href="_sources/tutorial.ipynb.txt" rel="nofollow"> View page source</a>
       </li>
@@ -399,7 +401,7 @@ different sources are described by different physical theories. The implementati
 <h2>Encoding the inflation problem<a class="headerlink" href="#Encoding-the-inflation-problem" title="Permalink to this heading"></a></h2>
 <p>The first object of interest is <a class="reference external" href="https://ecboghiu.github.io/inflation/_build/html/inflationproblem.html#inflation.InflationProblem">InflationProblem</a>. When instantiating it, we pass all the relevant information about the causal scenario and the type of inflation we want to perform.</p>
 <section id="Basics-of-causal-diagrams">
-<h3>Basics of causal diagrams<a class="headerlink" href="#Basics-of-causal-diagrams" title="Permalink to this heading"></a></h3>
+<h3>Basics of causal diagrams<a class="headerlink" href="#Basics-of-causal-diagrams" title="Link to this heading"></a></h3>
 <p>Causal relationships are encoded through a Bayesian Directed Acyclic Graph, or DAG for short. The nodes of the graph represent random variables, which can be either observable (visible) or unobservable (hidden). Directed arrows encode causal influences between nodes. Arrows point from parent nodes to the nodes causally influenced by them, called children nodes. The acyclicity property avoids the presence of causal loops.</p>
 <p>For applications to physics, another class of random variables is often considered called “settings”. These correspond to observable variables on whose outcome we condition in order to obtain the observed data. For example, this might correspond to measuring one property of a system versus another in an experiment. Furthermore, in physics we also have sources generating quantum correlations. These are modeled through the presence of quantum unobservable variables, which represent quantum
 systems. Arrows going into a quantum node represent controlling the corresponding quantum system. Arrows going out of the quantum node represent the children of the quantum node generating statistics by measuring the quantum system.</p>
@@ -469,7 +471,7 @@ will be important for problems involving compatibility with classical causal mod
 hierarchy level, the tighter is the SDP relaxation (at the cost of needing more computational resources).</p>
 </section>
 <section id="Running-a-feasibility-problem">
-<h2>Running a feasibility problem<a class="headerlink" href="#Running-a-feasibility-problem" title="Permalink to this heading"></a></h2>
+<h2>Running a feasibility problem<a class="headerlink" href="#Running-a-feasibility-problem" title="Link to this heading"></a></h2>
 <p>If we have a specific distribution in mind, we can test whether such distribution can be generated in a certain causal structure. We can consider for the example the 2PR distribution, which is defined as</p>
 <div class="math notranslate nohighlight">
 \[P_{\text{2PR}}(abc|xyz) := \frac{1+ (-1)^{a+b+c+xy+yz}}{8}\]</div>

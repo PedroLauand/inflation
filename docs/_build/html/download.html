@@ -1,5 +1,7 @@
+
+
 <!DOCTYPE html>
-<html class="writer-html5" lang="en" >
+<html class="writer-html5" lang="en" data-content_root="./">
 <head>
   <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
 
@@ -36,7 +38,7 @@
           </a>
 <div role="search">
   <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
-    <input type="text" name="q" placeholder="Search docs" />
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
     <input type="hidden" name="check_keywords" value="yes" />
     <input type="hidden" name="area" value="default" />
   </form>
@@ -71,8 +73,8 @@
         <div class="rst-content">
           <div role="navigation" aria-label="Page navigation">
   <ul class="wy-breadcrumbs">
-      <li><a href="contents.html" class="icon icon-home"></a> &raquo;</li>
-      <li>Download and Installation</li>
+      <li><a href="contents.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">Download and Installation</li>
       <li class="wy-breadcrumbs-aside">
             <a href="_sources/download.rst.txt" rel="nofollow"> View page source</a>
       </li>
@@ -82,32 +84,8 @@
           <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
            <div itemprop="articleBody">
              
-  
-<style>
-/* CSS overrides for sphinx_rtd_theme */
-
-/* 24px margin */
-.nbinput.nblast.container,
-.nboutput.nblast.container {
-    margin-bottom: 19px;  /* padding has already 5px */
-}
-
-/* ... except between code cells! */
-.nblast.container + .nbinput.container {
-    margin-top: -19px;
-}
-
-.admonition > p:before {
-    margin-right: 4px;  /* make room for the exclamation icon */
-}
-
-/* Fix math alignment, see https://github.com/rtfd/sphinx_rtd_theme/pull/686 */
-.math {
-    text-align: unset;
-}
-</style>
-<section id="download-and-installation">
-<h1>Download and Installation<a class="headerlink" href="#download-and-installation" title="Permalink to this heading"></a></h1>
+  <section id="download-and-installation">
+<h1>Download and Installation<a class="headerlink" href="#download-and-installation" title="Link to this heading"></a></h1>
 <p>The package is available in the Python Package Index. The latest development version is available on GitHub.</p>
 <section id="dependencies">
 <h2>Dependencies<a class="headerlink" href="#dependencies" title="Permalink to this heading"></a></h2>
@@ -115,7 +93,7 @@
 <p>Generated relaxations can be exported in <a class="reference external" href="http://euler.nmt.edu/~brian/sdplib/FORMAT">SDPA format</a>, which can be loaded with other solvers. We also support the use of the <a class="reference external" href="http://www.mosek.com/">MOSEK</a> solver for efficiently solving the relaxation (MOSEK has <a class="reference external" href="https://www.mosek.com/products/academic-licenses/">free academic licenses</a>). The MOSEK Python package needs to be installed. Future updates will include exporting to other solver interfaces, such as CVXPY, PICOS or YALMIP.</p>
 </section>
 <section id="installation">
-<h2>Installation<a class="headerlink" href="#installation" title="Permalink to this heading"></a></h2>
+<h2>Installation<a class="headerlink" href="#installation" title="Link to this heading"></a></h2>
 <p>Follow the standard procedure for installing Python modules:</p>
 <div class="highlight-default notranslate"><div class="highlight"><pre><span></span>$ pip install inflation
 </pre></div>

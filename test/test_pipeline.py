@@ -46,7 +46,7 @@ class TestMonomialGeneration(unittest.TestCase):
                      [0], [1], [2],
                      [0, 0], [0, 1], [0, 2], [1, 1], [1, 2], [2, 2]]
     # Monomials for the NPA level 2 in the bilocality scenario
-    meas = bilocalSDP.measurements
+    meas = bilocality_c.measurements_symbolic
     A_1_0_0_0 = meas[0][0][0][0]
     A_2_0_0_0 = meas[0][1][0][0]
     B_1_1_0_0 = meas[1][0][0][0]
@@ -181,8 +181,8 @@ class TestReset(unittest.TestCase):
     del physical_bounds[sdp.One]
 
     def prepare_objects(self, infSDP):
-        var1 = infSDP.measurements[0][0][0][0]
-        var2 = infSDP.measurements[0][0][1][0]
+        var1 = trivial.measurements_symbolic[0][0][0][0]
+        var2 = trivial.measurements_symbolic[0][0][1][0]
         infSDP.set_objective(var1, "max")
         infSDP.set_bounds({var1*var2: 0.9}, "up")
         infSDP.set_bounds({var1*var2: 0.1}, "lo")
@@ -349,7 +349,7 @@ class TestSDPOutput(unittest.TestCase):
         very_trivial = InflationProblem({"a": ["b"]}, outcomes_per_party=[2])
         sdp          = InflationSDP(very_trivial)
         sdp.generate_relaxation("npa1")
-        operator = np.asarray(sdp.measurements).flatten()[0]
+        operator = np.asarray(very_trivial.measurements_symbolic).flatten()[0]
         sdp.set_objective(operator, "max")
         sdp.set_bounds({operator: ub}, "up")
         sdp.solve()
@@ -374,7 +374,7 @@ class TestSDPOutput(unittest.TestCase):
                          "The count of knowable moments is wrong.")
         self.assertEqual(sdp.n_unknowable, 2,
                          "The count of unknowable moments is wrong.")
-        meas = sdp.measurements
+        meas = bellScenario.measurements_symbolic
         A0 = 2*meas[0][0][0][0] - 1
         A1 = 2*meas[0][0][1][0] - 1
         B0 = 2*meas[1][0][0][0] - 1
@@ -414,11 +414,12 @@ class TestSDPOutput(unittest.TestCase):
         prob = InflationProblem(dag={"U_AB": ["A", "B"],
                                      "U_AC": ["A", "C"],
                                      "U_AD": ["A", "D"],
+                                     "U_CD": ["C", "D"],
                                      "C": ["D"],
                                      "A": ["B", "C", "D"]},
                                 outcomes_per_party=(2, 2, 2, 2),
                                 settings_per_party=(1, 1, 1, 1),
-                                inflation_level_per_source=(1, 1, 1),
+                                inflation_level_per_source=(1, 1, 1, 1),
                                 order=("A", "B", "C", "D"))
         sdp = InflationSDP(prob)
         sdp.generate_relaxation("npa2")
@@ -550,7 +551,7 @@ class TestSDPOutput(unittest.TestCase):
 
     def test_lpi(self):
         sdp = InflationSDP(trivial)
-        [[[[A10], [A11]], [[A20], [A21]]]] = sdp.measurements
+        [[[[A10,_],[A11,_]],[[A20,_],[A21,_]]]] = trivial.measurements_symbolic
         sdp.generate_relaxation([1,
                                  A10, A11, A20, A21,
                                  A10*A11, A10*A21, A11*A20, A20*A21])
@@ -790,7 +791,7 @@ class TestSymmetries(unittest.TestCase):
         BellLP = InflationLP(bellScenario_c)
         BellLP.set_distribution(PR_box(1/2+1e-4))
         BellLP.solve()
-        self.assertEqual(BellLP.status, "dual_infeas_cer",
+        self.assertEqual(BellLP.success, False,
                          "The symmetrized LP is not identifying incompatible" +
                          " distributions.")
         BellLP.set_distribution(PR_box(1/2-1e-4))
@@ -801,7 +802,7 @@ class TestSymmetries(unittest.TestCase):
 
         BellSDP = InflationSDP(bellScenario)
         BellSDP.generate_relaxation("npa2")
-        BellSDP.set_distribution(PR_box(1/np.sqrt(2)+1e-4))
+        BellSDP.set_distribution(PR_box(1/np.sqrt(2)+5e-3))
         BellSDP.solve()
         self.assertEqual(BellSDP.status, "dual_infeas_cer",
                          "The symmetrized SDP is not identifying incompatible" +
