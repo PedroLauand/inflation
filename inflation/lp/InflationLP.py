@@ -153,6 +153,8 @@ class InflationLP(object):
                 self._CG_nonadjusting_ortho_groups_as_boolarrays.extend(ortho_groups_as_boolarrays)
                 self._CG_limited_ortho_groups_as_boolarrays.extend(ortho_groups_as_boolarrays)
             self._all_ortho_groups_as_boolarrays.extend(ortho_groups_as_boolarrays)
+        self._CG_nonadjusting_ortho_groups_as_counts = [len(boolarray) for boolarray in self._CG_nonadjusting_ortho_groups_as_boolarrays]
+        self._CG_limited_ortho_groups_as_counts = [len(boolarray) for boolarray in self._CG_limited_ortho_groups_as_boolarrays]
 
         # We want to consider ALL outcomes for variables which have children, 
         # but not the last outcome for childless variables.
@@ -1417,6 +1419,9 @@ class InflationLP(object):
         else:
             return self.blank_bool_array
 
+    def _template_to_event_count(self, template: List[int], decompressor: List[int]) -> int:
+        return int(np.prod(partsextractor(decompressor, template)).tolist())
+
     @cached_property
     def all_and_maximal_compatible_templates(self):
         if self.verbose > 1:
@@ -1438,11 +1443,26 @@ class InflationLP(object):
         r"""Creates the generating set of monomials (as boolvecs),
         of ALL lengths, limited to Collins-Gisin notation.
         """
-        return np.fromiter(chain.from_iterable(
-            self._template_to_event_boolarray(subclique, self._CG_limited_ortho_groups_as_boolarrays).flat
-            for subclique in tqdm(self.all_compatible_templates, disable=not self.verbose,
-                                  desc="Converting templates to generating monomials...")
-        ), dtype=bool).reshape((-1, self._nr_operators))
+        total_event_count = 0
+        list_of_slices = []
+        for subclique in self.all_compatible_templates:
+            new_event_count = self._template_to_event_count(subclique, self._CG_limited_ortho_groups_as_counts)
+            list_of_slices.append(np.s_[total_event_count:total_event_count + new_event_count])
+            total_event_count += new_event_count
+        all_events = np.zeros((self._nr_operators, total_event_count), dtype = bool)
+        for subclique, associated_slice in tqdm(zip(self.all_compatible_templates, list_of_slices),
+                                                disable=not self.verbose,
+                                                desc="Converting templates to generating monomials...",
+                                                total=len(self.all_compatible_templates)):
+            all_events[associated_slice] = self._template_to_event_boolarray(subclique, self._CG_limited_ortho_groups_as_boolarrays)
+        return all_events
+        # return np.fromiter(chain.from_iterable(
+        #     self._template_to_event_boolarray(subclique, self._CG_limited_ortho_groups_as_boolarrays).flat
+        #     for subclique in tqdm(self.all_compatible_templates, disable=not self.verbose,
+        #                           desc="Converting templates to generating monomials...",
+        #                           total=len(self.all_compatible_templates))
+        # ), dtype=bool).reshape((-1, self._nr_operators))
+
 
     @cached_property
     def _raw_monomials_as_lexboolvecs_non_CG(self) -> np.ndarray:
