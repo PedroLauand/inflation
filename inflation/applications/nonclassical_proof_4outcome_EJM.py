@@ -17,14 +17,40 @@ def ring_problem(inflation_level: int, nof_outcomes: int = 2) -> InflationProble
     return inf_prob
 
 print("Initiating InflationProblem instance.")
-prob = ring_problem(4, 4)
+prob = ring_problem(2, 2)
 print("Adding symmetries.")
 prob.add_symmetries(prob._setting_specific_outcome_relabelling_symmetries)
 print("InflationProblem initiation complete. Now calculating probabilities.")
 
 values = build_values(4)  # for inflation level 4
 print("Probability calculations complete, now initiation InflationLP initialization.")
-ring_LP = InflationLP(prob, verbose=2, include_all_outcomes=True)
+
+#print(len(prob.inflation_symmetries))
+
+#l=prob._lexorder
+G=prob.symmetries
+print(G)
+#Operator A^{i,j}=k, refer as [1,i,j,0,k]. i,j = 0,...,n-1 and k is #outcomes. 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+'''ring_LP = InflationLP(prob, verbose=2, include_all_outcomes=True)
 print("Extracting all atomic monomials from the LP.")
 at=ring_LP.atomic_monomials
 
@@ -51,4 +77,4 @@ ring_LP.solve(solve_dual=False)
 #lp_keys = set([m.name for m in prob.atomic_monomials])
 #settable_keys = pedro_keys.intersection(lp_keys)
 #new_dict = {k, my_dict[k] for k in settable_keys}
-#new_dict = {k: my_dict[k] for k in settable_keys}
+#new_dict = {k: my_dict[k] for k in settable_keys}'''
