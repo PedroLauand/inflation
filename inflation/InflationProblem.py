@@ -409,7 +409,11 @@ class InflationProblem:
                     for o in O_vals.flat:
                         measurements_per_party[i, s, o, -1] = o
             self.measurements.append(measurements_per_party)
-        
+
+        self.measurements_symbolic = \
+            [np.apply_along_axis(self._1d_to_symbol, -1, measurements_per_party)
+             for measurements_per_party in self.measurements]
+
         # Useful for LP
         self._ortho_groups_per_party = []
         for p, measurements_per_party in enumerate(self.measurements):
@@ -644,7 +648,7 @@ class InflationProblem:
     @cached_property
     def _lexrepr_to_symbols(self) -> np.ndarray:
         """For each operator in the lexorder, create a sympy symbol with the 
-        same name as returned by InflationPRoblem._lexrepr_to_names()
+        same name as returned by InflationProblem._lexrepr_to_names()
 
         Returns
         -------
@@ -652,7 +656,8 @@ class InflationProblem:
             List of the same length as lexorder, where the i-th element is the
             string representation of the i-th operator in the lexorder.
         """
-        return np.array([Symbol(name, commutative=False) for name in self._lexrepr_to_names],
+        return np.array([Symbol(name, commutative=False)
+                         for name in self._lexrepr_to_names],
                         dtype=object)
 
     @cached_property
@@ -668,6 +673,25 @@ class InflationProblem:
             Dictionary mapping party names to integers.
         """
         return {name: i + 1 for i, name in enumerate(self.names)}
+
+    def _1d_to_symbol(self, repr_1d: np.ndarray) -> Symbol:
+        """Convert a 1D representation of an operator to a sympy symbol.
+        
+        Parameters
+        ----------
+        repr_1d : np.ndarray
+            1D representation of an operator.
+
+        Returns
+        -------
+        sympy.Symbol
+            Sympy symbol representing the operator.
+        """
+        name = self._interpretation_to_name(self._interpret_operator(repr_1d))
+        if not self._any_inflation:
+            # If there is no inflation, we can remove the copy indices
+            name = name.split('^{')[0] + name.split('}')[1]
+        return Symbol(name, commutative=False)
 
     ###########################################################################
     # FUNCTIONS PERTAINING TO KNOWABILITY                                     #
@@ -742,8 +766,6 @@ class InflationProblem:
             op_as_str += "_" + str(op["Composite Setting"])
         op_as_str += "_" + str(op['Outcome'])
         return op_as_str
-
-
 
     def _is_knowable_q_non_networks(self, monomial: np.ndarray) -> bool:
         """Checks if a monomial (written as a sequence of operators in 2d array
@@ -1026,7 +1048,7 @@ class InflationProblem:
         for c, parents in enumerate(self.parents_per_party):
             for p in parents:
                 g1.add_edge(p+self.nr_sources, c + nr_sources)
-        GMgen = isomorphism.GraphMatcher(g1, g1)
+        GMgen = isomorphism.DiGraphMatcher(g1, g1)
         discovered_automorphisms = list()
         for mapping in GMgen.isomorphisms_iter():
             valid_automorphism = True

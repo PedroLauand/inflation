@@ -79,19 +79,20 @@ def clean_coefficients(cert: Dict[str, float],
     if not cert:
         return cert
     chop_tol = np.abs(chop_tol)
-    coeffs = np.asarray(list(cert.values()))
+    coeffs = np.array(list(cert.values()))
+    good_coeffs_places = (np.abs(coeffs) > chop_tol)
+    new_coeffs = np.compress(good_coeffs_places, coeffs)
+    new_keys = [k for i,k in enumerate(cert.keys()) if good_coeffs_places[i]]
     if chop_tol > 0:
         # Try to take the smallest nonzero one and make it 1, when possible
-        normalising_factor = np.min(np.abs(coeffs[np.abs(coeffs) > chop_tol]))
+        normalising_factor = np.min(np.abs(new_coeffs))
     else:
         # Take the largest nonzero one and make it 1
-        normalising_factor = np.max(np.abs(coeffs[np.abs(coeffs) > chop_tol]))
-    coeffs /= normalising_factor
-    # Set to zero very small coefficients
-    coeffs[np.abs(coeffs) <= chop_tol] = 0
+        normalising_factor = np.max(np.abs(new_coeffs))
+    new_coeffs /= normalising_factor
     # Round
-    coeffs = np.round(coeffs, decimals=round_decimals)
-    return dict(zip(cert.keys(), coeffs.flat))
+    new_coeffs = np.round(new_coeffs, decimals=round_decimals)
+    return dict(zip(new_keys, new_coeffs.flat))
 
 
 def eprint(*args, **kwargs):

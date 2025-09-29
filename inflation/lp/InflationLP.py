@@ -901,7 +901,7 @@ class InflationLP(object):
             raise Exception("For extracting a certificate you need to solve " +
                             "a problem. Call \"InflationSDP.solve()\" first.")
 
-        desymmetrized = {}
+        desymmetrized = defaultdict(int)
         norm = len(self.InflationProblem.symmetries)
         lexmon_names = self.InflationProblem._lexrepr_to_copy_index_free_names
         for symm in self.InflationProblem.symmetries:
@@ -914,11 +914,8 @@ class InflationLP(object):
                         desymm_name = "P[" + " ".join(desymm_mon) + "]"
                     else:
                         desymm_name = "1"
-                    if desymm_name not in desymmetrized:
-                        desymmetrized[desymm_name] = coeff / norm
-                    else:
-                        desymmetrized[desymm_name] += coeff / norm
-        return desymmetrized
+                    desymmetrized[desymm_name] += coeff / norm
+        return {k:v for k,v in desymmetrized.items()}
 
     ###########################################################################
     # OTHER ROUTINES EXPOSED TO THE USER                                      #
@@ -1371,7 +1368,7 @@ class InflationLP(object):
         old_num_columns = self.n_columns
         self.n_columns = len(self.monomials)
         self.first_free_idx = first_free_index
-        self.monomial_names = np.array([mon.name for mon in monomials_as_list])
+        self.monomial_names = np.array([mon.name for mon in monomials_as_list], dtype=object)
         if self.n_columns < old_num_columns:
             if self.verbose > 0:
                 eprint("Further variable reduction has been made possible. Number of variables in the LP:",
@@ -1437,27 +1434,19 @@ class InflationLP(object):
 
     @cached_property
     def _raw_monomials_as_lexboolvecs(self) -> Sparse2DBitArray:
-        all_rows_as_bitmaps = []
+        new = Sparse2DBitArray(self._nr_operators)
         for subclique in tqdm(self.all_compatible_templates, disable=not self.verbose,
                               desc="Converting templates to generating monomials..."):
-            numpy_array = self._template_to_event_boolarray(subclique, self._CG_limited_ortho_groups_as_boolarrays)
-            if numpy_array.size > 0:
-                for row in numpy_array:
-                    all_rows_as_bitmaps.append(pyroaring.BitMap(np.flatnonzero(row)))
-
-        return Sparse2DBitArray.from_bitmaps(all_rows_as_bitmaps, self._nr_operators)
+            new.extend(self._template_to_event_boolarray(subclique, self._CG_limited_ortho_groups_as_boolarrays))
+        return new
 
     @cached_property
     def _raw_monomials_as_lexboolvecs_non_CG(self) -> Sparse2DBitArray:
-        all_rows_as_bitmaps = []
+        new = Sparse2DBitArray(self._nr_operators)
         for clique in tqdm(self.maximal_compatible_templates, disable=not self.verbose,
                            desc="Converting templates to global events..."):
-            numpy_array = self._template_to_event_boolarray(clique, self._all_ortho_groups_as_boolarrays)
-            if numpy_array.size > 0:
-                for row in numpy_array:
-                    all_rows_as_bitmaps.append(pyroaring.BitMap(np.flatnonzero(row)))
-
-        return Sparse2DBitArray.from_bitmaps(all_rows_as_bitmaps, self._nr_operators)
+            new.extend(self._template_to_event_boolarray(clique, self._all_ortho_groups_as_boolarrays))
+        return new
 
     @cached_property
     def minimal_sparse_equalities(self) -> coo_array:

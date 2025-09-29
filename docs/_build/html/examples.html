@@ -1,5 +1,7 @@
+
+
 <!DOCTYPE html>
-<html class="writer-html5" lang="en" >
+<html class="writer-html5" lang="en" data-content_root="./">
 <head>
   <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
 
@@ -38,7 +40,7 @@
           </a>
 <div role="search">
   <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
-    <input type="text" name="q" placeholder="Search docs" />
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
     <input type="hidden" name="check_keywords" value="yes" />
     <input type="hidden" name="area" value="default" />
   </form>
@@ -122,8 +124,8 @@
         <div class="rst-content">
           <div role="navigation" aria-label="Page navigation">
   <ul class="wy-breadcrumbs">
-      <li><a href="contents.html" class="icon icon-home"></a> &raquo;</li>
-      <li>Examples and features</li>
+      <li><a href="contents.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">Examples and features</li>
       <li class="wy-breadcrumbs-aside">
             <a href="_sources/examples.ipynb.txt" rel="nofollow"> View page source</a>
       </li>
@@ -418,7 +420,7 @@ div.rendered_html tbody tr:hover {
 <h2>Compatibility problems<a class="headerlink" href="#Compatibility-problems" title="Permalink to this heading"></a></h2>
 <p>One of the basic functionalities of Inflation is addressing compatibility problems of probability distributions with causal models. These were illustrated in the <a class="reference external" href="https://ecboghiu.github.io/inflation/_build/html/tutorial.html">Tutorial</a> section. Here we revisit briefly the examples, and complement them with further functionality, such as extraction of infeasibility certificates and rephrasing feasibility problems in optimization ones.</p>
 <section id="Example-1:-Infeasibility-of-the-2PR-distribution-in-the-quantum-tripartite-line-scenario">
-<h3>Example 1: Infeasibility of the 2PR distribution in the quantum tripartite line scenario<a class="headerlink" href="#Example-1:-Infeasibility-of-the-2PR-distribution-in-the-quantum-tripartite-line-scenario" title="Permalink to this heading"></a></h3>
+<h3>Example 1: Infeasibility of the 2PR distribution in the quantum tripartite line scenario<a class="headerlink" href="#Example-1:-Infeasibility-of-the-2PR-distribution-in-the-quantum-tripartite-line-scenario" title="Link to this heading"></a></h3>
 <p>Let us begin by recalling the example considered in the <a class="reference external" href="https://ecboghiu.github.io/inflation/_build/html/tutorial.html">Tutorial</a>, namely the compatibility of the 2PR distribution,</p>
 <div class="math notranslate nohighlight">
 \[P_{\text{2PR}}(a,b,c|x,y,z) := \frac{1+ (-1)^{a+b+c+xy+yz}}{8},\]</div>
@@ -766,7 +768,7 @@ The distribution for θ=1.5707963267948966 is optimal
 </section>
 </section>
 <section id="Optimization-of-Bell-operators">
-<h2>Optimization of Bell operators<a class="headerlink" href="#Optimization-of-Bell-operators" title="Permalink to this heading"></a></h2>
+<h2>Optimization of Bell operators<a class="headerlink" href="#Optimization-of-Bell-operators" title="Link to this heading"></a></h2>
 <p>One can use inflation techniques to not only run causal compatibility problems, but also to optimize over the generated relaxation, and therefore get upper bounds on the values of various Bell operators.</p>
 <section id="Example-4.-Upper-bounds-on-Mermin’s-inequality">
 <h3>Example 4. Upper bounds on Mermin’s inequality<a class="headerlink" href="#Example-4.-Upper-bounds-on-Mermin’s-inequality" title="Permalink to this heading"></a></h3>
@@ -1077,14 +1079,14 @@ of evaluations. The goal will be to reproduce the results of [<a class="referenc
 <span class="n">meas</span> <span class="o">=</span> <span class="n">sdp</span><span class="o">.</span><span class="n">measurements</span>
 
 <span class="k">def</span> <span class="nf">get_W_reduced</span><span class="p">(</span><span class="n">N</span><span class="p">):</span>
-    <span class="sd">&quot;&quot;&quot;Generates the reduced four-body state for the N-partite</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Generates the reduced four-body state for the N-partite</span>
 <span class="sd">    W state. Since the W state is symmetric, it is independent</span>
 <span class="sd">    of the choice of the four parties that one considers.</span>
 <span class="sd">    Source:</span>
 <span class="sd">    https://github.com/FlavioBaccari/Hierarchy-for-nonlocality-detection</span>
 <span class="sd">    &quot;&quot;&quot;</span>
     <span class="k">def</span> <span class="nf">get_W_state</span><span class="p">(</span><span class="n">N</span><span class="p">):</span>
-        <span class="sd">&quot;&quot;&quot;Generates the density matrix for the N-partite W</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Generates the density matrix for the N-partite W</span>
 <span class="sd">        state.&quot;&quot;&quot;</span>
         <span class="n">state</span> <span class="o">=</span> <span class="n">tensor</span><span class="p">([</span><span class="n">basis</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">1</span><span class="p">)]</span>
                        <span class="o">+</span> <span class="p">[</span><span class="n">basis</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">N</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)])</span>
@@ -1455,7 +1457,7 @@ Generating the distribution in the single-latent-layer network is infeasible
 </section>
 </section>
 <section id="Feasibility-based-on-distribution-supports">
-<h2>Feasibility based on distribution supports<a class="headerlink" href="#Feasibility-based-on-distribution-supports" title="Permalink to this heading"></a></h2>
+<h2>Feasibility based on distribution supports<a class="headerlink" href="#Feasibility-based-on-distribution-supports" title="Link to this heading"></a></h2>
 <p>There is a lot of literature regarding the violation of Bell-type inequalities as certification of non-classical behavior. These inequalities put constraints on combinations of probability elements. There exist even simpler certifications of non-classicality, that instead rely on possibilistic arguments: they only assume whether certain events are possible (positive probability) or impossible (zero probability) in order to reach a contradiction. These are known as Hardy-type paradoxes
 [<a class="reference external" href="https://arxiv.org/abs/1105.1819">13</a>].</p>
 <p>Inflation can handle proofs of non-classicality and non-quantumness in arbitrary DAGs based on possibilistic arguments. It does so by assessing whether a quantum inflation (with commuting or non-commuting operators, respectively) exists where the probability elements inside the support are constrained to lie in the interval <span class="math notranslate nohighlight">\([1,\infty)\)</span> while those outside the support are given the value <span class="math notranslate nohighlight">\(0\)</span>. This represents a rescaled version of a standard quantum inflation moment matrix,

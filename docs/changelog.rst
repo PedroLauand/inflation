@@ -2,6 +2,21 @@
 Changelog
 *********
 
+2.0.3 - 2025-08-08
+******************
+
+* New: Added support for symmetries in the target distributions. This allows to further simplify the optimization problems when the target distribution is known to have some symmetries (for instance, under relabeling of parties, or under relabeling of outcomes). See example of use in the `Advanced  <https://ecboghiu.github.io/inflation/_build/html/advanced.html>`_ page.
+
+* New: Initial and experimental support for quantum theory based only on real numbers.
+
+* Improved: The arguments for ``InflationSDP.build_columns`` can be now directly passed onto ``InflationSDP.generate_relaxation``. This means that one can now build directly SDPs for restricted generating sets just by calling, e.g., ``InflationSDP.generate_relaxation("local3", max_monomial_length=2)``.
+
+* Improved: The computation of dual LPs is now handled automatically by MOSEK. This improves the reliability of the code (and reduces the maintenance effort). The analogous for SDPs will come soon.
+
+* Improved: The error messages for unsupported scenarios (namely, structures where a parent and a child node do not share a latent common cause, and structures with intermediate latents that have observable parents) are now more informative.
+
+* Fixed: The output status of LPs and SDPs is now the same.
+
 2.0.2 - 2024-12-14
 ******************
 

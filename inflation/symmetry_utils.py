@@ -26,7 +26,7 @@ def discover_distribution_symmetries(distribution: np.ndarray,
     distribution : numpy.ndarray
         The distribution to be analyzed. It must be a numpy array of shape
         ``[o1, ..., oN, s1, ..., sN]``, where ``oi`` and ``si`` are, respectively,
-         the number of outcomes and settings for party ``i``.
+        the number of outcomes and settings for party ``i``.
     scenario : InflationProblem
         The scenario object.
 

@@ -46,7 +46,7 @@ class InternalAtomicMonomialSDP(InternalAtomicMonomialLP):
                           [3, 2, 0, 1, 4, 5]])
 
         Given that this moment is knowable and can be associated with a
-        probability, it is given the name ``"pAC(35|24)"``.
+        probability, it is given the name ``"P[A_2=3 C_4=5]"``.
 
         Parameters
         ----------
