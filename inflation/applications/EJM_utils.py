@@ -87,7 +87,7 @@ def iterate_global_events_containing_marginal(
             raise RuntimeError("Internal error: incomplete assignment.")
         yield out
 
-def to_lex_representation(evt: List[int], outcomes: int) -> List[int]:
+'''def to_lex_representation(evt: List[int], outcomes: int) -> List[int]:
     """
     Convert a global event into its lexicographic one-hot representation.
 
@@ -112,10 +112,10 @@ def to_lex_representation(evt: List[int], outcomes: int) -> List[int]:
         if not (0 <= k < outcomes):
             raise ValueError(f"Outcome {k} at position {i} out of range 0..{outcomes-1}")
         lex_rep_evt[k + outcomes * i] = 1
-    return lex_rep_evt
+    return lex_rep_evt'''
 
 
-def apply_perm_to_lex(lex_rep_evt: List[int], g: List[int]) -> List[int]:
+'''def apply_perm_to_lex(lex_rep_evt: List[int], g: List[int]) -> List[int]:
     """
     Apply a permutation g to a one-hot lexicographic event vector.
 
@@ -149,8 +149,8 @@ def apply_perm_to_lex(lex_rep_evt: List[int], g: List[int]) -> List[int]:
     for p in range(N):
         q = g[p]
         out[q] = lex_rep_evt[p]
-    return out
-from typing import List
+    return out'''
+'''from typing import List
 
 def from_lex_representation(lex_rep_evt: List[int], outcomes: int) -> List[int]:
     """
@@ -183,8 +183,8 @@ def from_lex_representation(lex_rep_evt: List[int], outcomes: int) -> List[int]:
             raise ValueError(f"Block {i} is not one-hot: {block}")
         evt[i] = block.index(1)
 
-    return evt
-# -----------------------
+    return evt'''
+'''# -----------------------
 # Example usage
 # -----------------------
 
@@ -205,4 +205,4 @@ for evt in iterate_global_events_containing_marginal(n, outcomes, marginal):
     print(lex_evt,perm_lex_evt)
     print(evt,from_lex_representation(perm_lex_evt,outcomes))
     count += 1
-print("Total:", count)
+print("Total:", count)'''
