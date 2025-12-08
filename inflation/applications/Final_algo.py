@@ -14,13 +14,16 @@
 # -------------------------------------------------------------------
 
 from __future__ import annotations
-from typing import List, Tuple, Dict, Iterable
+from typing import List, Tuple, Dict, Iterable, Union
 from functools import lru_cache
 from math import ldexp
 import numpy as np
 import sys
 sys.path.append('/Users/pedrolauand/My_Code/Inflation/inflation')
 from inflation import InflationProblem, InflationLP, InflationSDP
+from collections import defaultdict
+from tqdm import tqdm
+from scipy.sparse import coo_array
 
 
 # =========================
@@ -286,7 +289,7 @@ def _normalize_perm_list(g: List[int], N: int) -> List[int]:
         raise ValueError("Invalid permutation (not a bijection).")
     return g
 
-def build_sympy_group(raw_G: List[List[int]], N: int) -> PermutationGroup:
+def build_sympy_group(raw_G: Union[List[List[int]], np.ndarray], N: int) -> PermutationGroup:
     """Build group from raw list permutations (0- or 1-based)."""
     gens = [Permutation(_normalize_perm_list(gl, N)) for gl in raw_G] or [Permutation(list(range(N)))]
     return PermutationGroup(gens)
@@ -316,7 +319,6 @@ def apply_perm_to_lex(lex_evt: List[int], perm: Permutation) -> List[int]:
 def canonical_leximin_coset_chain(
     evt: List[int],
     outcomes: int,
-    *,
     precomp: Dict[str, object],
 ) -> Tuple[List[int], Permutation]:
     """
@@ -324,7 +326,7 @@ def canonical_leximin_coset_chain(
     scans transversal reps at each level to minimize lex-image in one-hot space.
     """
     x = to_lex_representation(evt, outcomes)
-    G: PermutationGroup = precomp["G"]  # type: ignore
+    # G: PermutationGroup = precomp["G"]  # type: ignore
     base = precomp["base"]              # type: ignore
     basic_orbits = precomp["basic_orbits"]          # type: ignore
     basic_transversals = precomp["basic_transversals"]  # type: ignore
@@ -413,55 +415,80 @@ def representatives_of_global_extensions(
     Iterate global extensions of 'marginal', canonicalize each under precomp['G'],
     and count representatives.
     """
-    counts: Dict[Tuple[int, ...], int] = {}
+    counts = defaultdict(int)
     for evt in iterate_global_events_containing_marginal(n, outcomes, marginal):
         rep_evt, _ = canonical_leximin_coset_chain(evt, outcomes, precomp=precomp)
         key = tuple(rep_evt)
-        counts[key] = counts.get(key, 0) + 1
+        counts[key] += 1
     return counts
 
 # =========================
 # Top-level pipeline
 # =========================
 def run_pipeline(
-    n: int,
-    outcomes: int,
-    raw_G: List[List[int]],
-) -> List[List[Dict]]:
+    prob: InflationProblem
+) -> Tuple[List[Dict], coo_array]:
     """
     Build:
       [
-        [ { marginal_tuple : value_float }, { canonical_global_rep_tuple : count_int } ],
+        [ { marginal_tuple : value_float }, { canonical_global_rep_tuple : count_int ...} ],
         ...
       ]
     over all symmetry-reduced marginals for (n, outcomes).
     """
+    n = prob.inflation_level_per_source[0]
+    outcomes = prob.outcomes_per_party[0]
+    raw_G = prob.symmetries
+
     # group acts on one-hot coordinates of size N = n^2 * outcomes
     N = (n * n) * outcomes
     G = build_sympy_group(raw_G, N)
     precomp = prepare_group_chain(G, N)
     
     marginals = generate_minimal_marginal_events(n, outcomes)
-    total = len(marginals)
-    bar_width = 30
 
-    result = []
-    for idx, marginal in enumerate(marginals, start=1):
-    # progress bar
-        filled = int(bar_width * idx / total)
-        bar = "#" * filled + "-" * (bar_width - filled)
-        pct = (idx * 100) // total
-        print(f"\r[{bar}] {pct:3d}%  {idx}/{total} marginals", end="", flush=True)
+    list_of_marginal_dictionaries = []
+    list_of_global_dictionaries = []
+    sparse_matrix_rows = []
+    sparse_matrix_cols = []
+    sparse_matrix_data = []
 
+    # result = []
+    # LOOP 0: Compute the marginal probabilities
+    for marginal in tqdm(marginals,  desc="Computing marginal values..."):
         # --- your existing body per marginal ---
         val = factorized_marginal_value(marginal)
-        mkey = tuple(tuple(x) for x in marginal)
+        mkey = tuple(prob._lexrepr_to_names[prob.mon_to_lexrepr(marginal)])
+        # mkey = tuple(tuple(x) for x in marginal)
         e1 = {mkey: val}
-        e2 = representatives_of_global_extensions(n, outcomes, marginal, precomp=precomp)
-        result.append([e1, e2])
+        list_of_marginal_dictionaries.append(e1)
 
-    print()  # newline after finishing the bar
-    return result
+    # LOOP 1: Create the dictionaries of global events and their counts
+    for marginal in tqdm(marginals,  desc="Finding global extensions..."):
+        list_of_global_dictionaries.append(
+            representatives_of_global_extensions(n, outcomes, marginal, precomp=precomp))
+
+    # LOOP 2: Convert canonical global events and their counts to sparse arrays
+    global_event_to_idx_dict = defaultdict(int)
+    idx = 1
+    for row_num, global_dict in enumerate(list_of_global_dictionaries):
+        for event_tuple, multiplicity in global_dict.items():
+            event_idx = global_event_to_idx_dict[event_tuple]
+            if event_idx == 0:
+                event_idx = idx
+                global_event_to_idx_dict[event_tuple] = event_idx
+                idx += 1
+            sparse_matrix_rows.append(row_num)
+            sparse_matrix_cols.append(event_idx)
+            sparse_matrix_data.append(multiplicity)
+    sparse_matrix_rows = np.array(sparse_matrix_rows, dtype=int)
+    sparse_matrix_cols = np.array(sparse_matrix_cols, dtype=int)
+    sparse_matrix_data = np.array(sparse_matrix_data, dtype=float)
+    inflation_matrix = coo_array((sparse_matrix_data, (sparse_matrix_rows, sparse_matrix_cols)),
+                          shape=(len(list_of_global_dictionaries), idx))
+    inflation_matrix.sum_duplicates()
+
+    return list_of_marginal_dictionaries, inflation_matrix
 
 """# ---- inside run_pipeline, after you compute `marginals` ----
 marginals = generate_minimal_marginal_events(n, outcomes)
@@ -500,17 +527,17 @@ if __name__ == "__main__":
     
     print("done with prob")
 
-    raw_G =prob.symmetries
     
-    out = run_pipeline(n, outcomes, raw_G)
-    # Print a small summary
-    for idx, (e1, e2) in enumerate(out):
-        print(f"\nItem {idx}:")
-        # marginal & value
-        (marginal_key, val) = next(iter(e1.items()))
-        print("  marginal:", list(list(t) for t in marginal_key))
-        print("  value:   ", val)
-        # reps & counts
-        print("  reps (compact evt) -> count:")
-        for rep, cnt in e2.items():
-            print("   ", list(rep), "->", cnt)
+    marginals_dict, inflation_matrix = run_pipeline(prob)
+    print(inflation_matrix)
+    # # Print a small summary
+    # for idx, (e1, e2) in enumerate(out):
+    #     print(f"\nItem {idx}:")
+    #     # marginal & value
+    #     (marginal_key, val) = next(iter(e1.items()))
+    #     print("  marginal:", list(list(t) for t in marginal_key))
+    #     print("  value:   ", val)
+    #     # reps & counts
+    #     print("  reps (compact evt) -> count:")
+    #     for rep, cnt in e2.items():
+    #         print("   ", list(rep), "->", cnt)
