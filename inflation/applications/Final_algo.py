@@ -320,7 +320,7 @@ def canonical_leximin_coset_chain(
     evt: List[int],
     outcomes: int,
     precomp: Dict[str, object],
-) -> Tuple[List[int], Permutation]:
+) -> List[int]:
     """
     Canonical representative of 'evt' under G using the stabilizer chain:
     scans transversal reps at each level to minimize lex-image in one-hot space.
@@ -351,7 +351,7 @@ def canonical_leximin_coset_chain(
             g_star = cand_U * g_star
             best_vec = cand_vec  # type: ignore
     rep_evt = from_lex_representation(best_vec, outcomes)
-    return rep_evt, g_star
+    return rep_evt
 
 # =========================
 # Cycle extraction & factorized value for a marginal
@@ -410,17 +410,13 @@ def representatives_of_global_extensions(
     marginal: List[List[int]],
     *,
     precomp: Dict[str, object],
-) -> Dict[Tuple[int, ...], int]:
+) -> List[Tuple[int, ...]]:
     """
-    Iterate global extensions of 'marginal', canonicalize each under precomp['G'],
-    and count representatives.
+    Iterate global extensions of 'marginal', canonicalize each under precomp['G'].
     """
-    counts = defaultdict(int)
-    for evt in iterate_global_events_containing_marginal(n, outcomes, marginal):
-        rep_evt, _ = canonical_leximin_coset_chain(evt, outcomes, precomp=precomp)
-        key = tuple(rep_evt)
-        counts[key] += 1
-    return counts
+    return [canonical_leximin_coset_chain(evt, outcomes, precomp=precomp)
+            for evt in iterate_global_events_containing_marginal(n, outcomes, marginal)]
+
 
 # =========================
 # Top-level pipeline
@@ -448,7 +444,7 @@ def run_pipeline(
     marginals = generate_minimal_marginal_events(n, outcomes)
 
     list_of_marginal_dictionaries = []
-    list_of_global_dictionaries = []
+    list_of_global_expansions = []
     sparse_matrix_rows = []
     sparse_matrix_cols = []
     sparse_matrix_data = []
@@ -465,14 +461,15 @@ def run_pipeline(
 
     # LOOP 1: Create the dictionaries of global events and their counts
     for marginal in tqdm(marginals,  desc="Finding global extensions..."):
-        list_of_global_dictionaries.append(
+        list_of_global_expansions.append(
             representatives_of_global_extensions(n, outcomes, marginal, precomp=precomp))
+    list_of_global_expansions = np.array(list_of_global_expansions)
 
     # LOOP 2: Convert canonical global events and their counts to sparse arrays
     global_event_to_idx_dict = defaultdict(int)
     idx = 1
-    for row_num, global_dict in enumerate(list_of_global_dictionaries):
-        for event_tuple, multiplicity in global_dict.items():
+    for row_num, global_expansion in enumerate(list_of_global_expansions):
+        for event_tuple in map(tuple, global_expansion):
             event_idx = global_event_to_idx_dict[event_tuple]
             if event_idx == 0:
                 event_idx = idx
@@ -480,12 +477,12 @@ def run_pipeline(
                 idx += 1
             sparse_matrix_rows.append(row_num)
             sparse_matrix_cols.append(event_idx)
-            sparse_matrix_data.append(multiplicity)
+            sparse_matrix_data.append(1)
     sparse_matrix_rows = np.array(sparse_matrix_rows, dtype=int)
     sparse_matrix_cols = np.array(sparse_matrix_cols, dtype=int)
     sparse_matrix_data = np.array(sparse_matrix_data, dtype=float)
     inflation_matrix = coo_array((sparse_matrix_data, (sparse_matrix_rows, sparse_matrix_cols)),
-                          shape=(len(list_of_global_dictionaries), idx))
+                          shape=(len(list_of_global_expansions), idx))
     inflation_matrix.sum_duplicates()
 
     return list_of_marginal_dictionaries, inflation_matrix
