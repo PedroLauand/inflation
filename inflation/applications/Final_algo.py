@@ -515,13 +515,13 @@ return result"""
 # =========================
 if __name__ == "__main__":
     # Example: n=2, outcomes=4
-    n, outcomes = 4, 2
+    n, outcomes = 3, 2
     # One small example group on N = n^2 * outcomes = 4 * 4 = 16 coordinates:
     #   - identity
     #   - swap within each outcome block of the four operator slots (toy example)
     prob = ring_problem(n, outcomes)
-    prob.add_symmetries(prob._setting_specific_outcome_relabelling_symmetries)
-    
+    #prob.add_symmetries(prob._setting_specific_outcome_relabelling_symmetries)
+    print(len(prob.symmetries))
     print("done with prob")
 
     
