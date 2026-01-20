@@ -1,3 +1,6 @@
+import sys
+# --- your Inflation import style ---
+sys.path.append('/Users/pedrolauand/My_Code/Inflation/inflation')
 from inflation import InflationProblem, InflationSDP
 import numpy as np
 
@@ -40,4 +43,4 @@ print(ring_SDP.known_moments)
 
 ring_SDP.solve(solve_dual=False)
 print(ring_SDP.status)
-
+print(ring_SDP.momentmatrix)
