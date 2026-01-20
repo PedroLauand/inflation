@@ -20,6 +20,7 @@ from math import ldexp
 from pathlib import Path
 import numpy as np
 import sys
+from itertools import product
 
 # Ensure repo root is on sys.path so "import inflation" works when running this file directly.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -215,37 +216,6 @@ def generate_minimal_marginal_events(n: int, outcomes: int) -> List[List[List[in
 # =========================
 # Global extensions iterator for a marginal
 # =========================
-def iterate_global_events_containing_marginal(
-    n: int,
-    outcomes: int,
-    marginal: List[List[int]],
-):
-    """
-    Yield all compact global events (length n^2, row-major over (i,j)) that extend the marginal.
-    marginal format: [[1,i,j,0,a], ...] with i,j 1-based.
-    """
-    # fixed slots
-    fixed: Dict[int, int] = {}
-    for (one, i, j, zero, a) in marginal:
-        si = (i - 1) * n + (j - 1)
-        if si in fixed and fixed[si] != a:
-            return  # inconsistent; yield nothing
-        fixed[si] = a
-    # build remaining indices
-    Nslots = n * n
-    remaining = [s for s in range(Nslots) if s not in fixed]
-    # iterate assignments
-    from itertools import product
-    for combo in product(range(outcomes), repeat=len(remaining)):
-        evt = [0] * Nslots
-        # set fixed
-        for s, a in fixed.items():
-            evt[s] = a
-        # set remaining
-        for s, a in zip(remaining, combo):
-            evt[s] = a
-        yield np.array(evt, dtype=np.int64)
-
 # =========================
 # One-hot lex helpers (for group action on events)
 # =========================
@@ -420,10 +390,37 @@ def representatives_of_global_extensions(
     level_invperms: List[np.ndarray],
 ) -> List[np.ndarray]:
     """
-    Iterate global extensions of 'marginal', canonicalize each under precomp['G'].
+    Iterate global extensions of 'marginal', canonicalize each under the group.
     """
-    return [canonical_leximin_coset_chain(evt, outcomes, level_invperms)
-            for evt in iterate_global_events_containing_marginal(n, outcomes, marginal)]
+    # fixed slots
+    fixed: Dict[int, int] = {}
+    for (one, i, j, zero, a) in marginal:
+        si = (i - 1) * n + (j - 1)
+        if si in fixed and fixed[si] != a:
+            return []
+        fixed[si] = a
+    # build remaining indices
+    Nslots = n * n
+    fixed_idx = np.fromiter(fixed.keys(), dtype=np.int64)
+    fixed_val = np.fromiter(fixed.values(), dtype=np.int64)
+    mask = np.ones(Nslots, dtype=bool)
+    mask[fixed_idx] = False
+    remaining = np.nonzero(mask)[0]
+    # build base event (fixed slots set once)
+    evt = np.zeros(Nslots, dtype=np.int64)
+    if fixed_idx.size:
+        evt[fixed_idx] = fixed_val
+    # iterate assignments without copying
+    if remaining.size == 0:
+        return [canonical_leximin_coset_chain(evt, outcomes, level_invperms)]
+    reps = []
+    total = outcomes ** remaining.size
+    for combo in tqdm(product(range(outcomes), repeat=remaining.size),
+                      total=total,
+                      desc="Canonicalizing globals...   "):
+        evt[remaining] = combo
+        reps.append(canonical_leximin_coset_chain(evt, outcomes, level_invperms))
+    return reps
 
 
 # =========================
@@ -531,7 +528,7 @@ if __name__ == "__main__":
     import itertools
     from inflation.lp.lp_utils import solveLP_sparse
     # Example: n=2, outcomes=4
-    n, outcomes = 4, 2
+    n, outcomes = 4, 4
     # One small example group on N = n^2 * outcomes = 4 * 4 = 16 coordinates:
     #   - identity
     #   - swap within each outcome block of the four operator slots (toy example)
