@@ -1,4 +1,9 @@
-from inflation import InflationProblem, InflationSDP
+import sys
+sys.path.append('/Users/pedrolauand/My_Code/Inflation/inflation')
+from inflation import InflationProblem, InflationLP, InflationSDP
+
+
+#from inflation import InflationProblem, InflationSDP
 import numpy as np
 
 

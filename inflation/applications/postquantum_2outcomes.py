@@ -1,14 +1,14 @@
 from sympy import sqrt, simplify, binomial, radsimp
-from functools import cache
+from functools import lru_cache
 
 u=sqrt(5+4*sqrt(2))
 term_1 = simplify(2/(u-1))
 term_2 = simplify(-2/(u+1))
 
-@cache
+@lru_cache
 def expec_line(n: int) -> float:
     return simplify(radsimp((term_1**(n-1)-term_2**(n-1)) / u))
-@cache
+@lru_cache
 def expec_loop(n: int) -> float:
     if n==1:
         return 0
