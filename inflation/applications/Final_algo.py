@@ -17,24 +17,13 @@ from __future__ import annotations
 from typing import List, Tuple, Dict, Iterable, Union
 from functools import lru_cache
 from math import ldexp
-from pathlib import Path
 import numpy as np
 import sys
-from itertools import product
-
-# Ensure repo root is on sys.path so "import inflation" works when running this file directly.
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+sys.path.append('/Users/pedrolauand/My_Code/Inflation/inflation')
 from inflation import InflationProblem
 from collections import defaultdict, OrderedDict
 from tqdm import tqdm
 from scipy.sparse import coo_array
-try:
-    from numba import njit
-    _NUMBA_AVAILABLE = True
-except Exception:
-    _NUMBA_AVAILABLE = False
 
 
 # =========================
@@ -216,26 +205,73 @@ def generate_minimal_marginal_events(n: int, outcomes: int) -> List[List[List[in
 # =========================
 # Global extensions iterator for a marginal
 # =========================
+def iterate_global_events_containing_marginal(
+    n: int,
+    outcomes: int,
+    marginal: List[List[int]],
+):
+    """
+    Yield all compact global events (length n^2, row-major over (i,j)) that extend the marginal.
+    marginal format: [[1,i,j,0,a], ...] with i,j 1-based.
+    """
+    # fixed slots
+    fixed: Dict[int, int] = {}
+    for (one, i, j, zero, a) in marginal:
+        si = (i - 1) * n + (j - 1)
+        if si in fixed and fixed[si] != a:
+            return  # inconsistent; yield nothing
+        fixed[si] = a
+    # build remaining indices
+    Nslots = n * n
+    remaining = [s for s in range(Nslots) if s not in fixed]
+    # iterate assignments
+    from itertools import product
+    for combo in product(range(outcomes), repeat=len(remaining)):
+        evt = [0] * Nslots
+        # set fixed
+        for s, a in fixed.items():
+            evt[s] = a
+        # set remaining
+        for s, a in zip(remaining, combo):
+            evt[s] = a
+        yield evt
+
 # =========================
 # One-hot lex helpers (for group action on events)
 # =========================
-def to_lex_representation(evt: np.ndarray, outcomes: int) -> np.ndarray:
+def to_lex_representation(evt: List[int], outcomes: int) -> List[int]:
     """Compact event -> one-hot lex vector (length n^2 * outcomes)."""
-    evt_arr = np.asarray(evt, dtype=np.int64)
-    n2 = evt_arr.shape[0]
-    lex = np.zeros(n2 * outcomes, dtype=np.int64)
-    idx = evt_arr + outcomes * np.arange(n2, dtype=np.int64)
-    # Assumes 0 <= evt_arr[s] < outcomes for all s.
-    lex[idx] = 1
+    n2 = len(evt)
+    N = n2 * outcomes
+    lex = [0] * N
+    for s, k in enumerate(evt):
+        if not (0 <= k < outcomes):
+            raise ValueError("Outcome out of range")
+        lex[k + outcomes * s] = 1
     return lex
 
-def from_lex_representation(lex_evt: np.ndarray, outcomes: int) -> np.ndarray:
+def from_lex_representation(lex_evt: List[int], outcomes: int) -> List[int]:
     """One-hot lex vector -> compact event; validates one-hot per block."""
-    lex_arr = np.asarray(lex_evt, dtype=np.int64)
-    blocks = lex_arr.reshape(-1, outcomes)
-    # Assumes length is divisible by outcomes and blocks are one-hot.
-    return blocks.argmax(axis=1).astype(np.int64, copy=False)
+    N = len(lex_evt)
+    if N % outcomes != 0:
+        raise ValueError("Invalid length")
+    n2 = N // outcomes
+    evt = [0] * n2
+    for s in range(n2):
+        block = lex_evt[s * outcomes : (s + 1) * outcomes]
+        if sum(block) != 1:
+            raise ValueError(f"Block {s} not one-hot: {block}")
+        evt[s] = block.index(1)
+    return evt
 
+def lex_less(a: List[int], b: List[int]) -> bool:
+    """True iff a < b in lexicographic order."""
+    for x, y in zip(a, b):
+        if x < y:
+            return True
+        if x > y:
+            return False
+    return False
 
 # =========================
 # SymPy group utilities
@@ -258,76 +294,62 @@ def build_sympy_group(raw_G: Union[List[List[int]], np.ndarray], N: int) -> Perm
     gens = [Permutation(_normalize_perm_list(gl, N)) for gl in raw_G] or [Permutation(list(range(N)))]
     return PermutationGroup(gens)
 
-def prepare_group_chain(G: PermutationGroup, N: int) -> List[np.ndarray]:
+def prepare_group_chain(G: PermutationGroup, N: int) -> Dict[str, object]:
     """
-    Run Schreier-Sims once. Returns inverse-transversal matrices per level
+    Run Schreier–Sims once. Returns a dict with base, orbits, transversals
     for use in the canonicalizer (no recomputation).
     """
     G.schreier_sims()
-    level_invperms = []
-    for orbits, trans in zip(G.basic_orbits, G.basic_transversals):
-        invperm_matrix = np.empty((len(orbits), N), dtype=np.int64)
-        for i, u in enumerate(orbits):
-            perm_arr = np.array(trans[u].array_form, dtype=np.int64)
-            invperm = np.empty_like(perm_arr)
-            invperm[perm_arr] = np.arange(perm_arr.size, dtype=perm_arr.dtype)
-            invperm_matrix[i] = invperm
-        level_invperms.append(invperm_matrix)
-    return level_invperms
+    return {
+        "G": G,
+        "base": list(G.base),
+        "basic_orbits": list(G.basic_orbits),
+        "basic_transversals": list(G.basic_transversals),
+        "N": N,
+    }
 
-if _NUMBA_AVAILABLE:
-    @njit(cache=True)
-    def _lexmin_with_invperms(current, invperms):
-        m, n = invperms.shape
-        best_idx = 0
-        for i in range(1, m):
-            for j in range(n):
-                a = current[invperms[i, j]]
-                b = current[invperms[best_idx, j]]
-                if a < b:
-                    best_idx = i
-                    break
-                if a > b:
-                    break
-        best_vec = np.empty(n, dtype=current.dtype)
-        for j in range(n):
-            best_vec[j] = current[invperms[best_idx, j]]
-        return best_vec, best_idx
-else:
-    _lexmin_with_invperms = None
-
-def lexmin_with_invperms(current: np.ndarray, invperms: np.ndarray) -> Tuple[np.ndarray, int]:
-    """Return lex-min vector and its index using inverse-permutation matrix."""
-    if _NUMBA_AVAILABLE:
-        return _lexmin_with_invperms(current, invperms)
-    y = current[invperms]
-    if y.shape[0] == 1:
-        return y[0], 0
-    best_idx = int(np.lexsort(y[:, ::-1].T)[0])
-    return y[best_idx], best_idx
+def apply_perm_to_lex(lex_evt: List[int], perm: Permutation) -> List[int]:
+    """Apply SymPy permutation to one-hot vector: out[perm(p)] = lex_evt[p]."""
+    N = len(lex_evt)
+    out = [0] * N
+    for p in range(N):
+        out[perm(p)] = lex_evt[p]
+    return out
 
 def canonical_leximin_coset_chain(
-    evt: np.ndarray,
+    evt: List[int],
     outcomes: int,
-    level_invperms: List[np.ndarray],
-) -> np.ndarray:
+    precomp: Dict[str, object],
+) -> List[int]:
     """
     Canonical representative of 'evt' under G using the stabilizer chain:
     scans transversal reps at each level to minimize lex-image in one-hot space.
     """
     x = to_lex_representation(evt, outcomes)
-    # witness permutation (inverse array) and current best image
-    current_invperm = np.arange(len(x), dtype=np.int64)
+    # G: PermutationGroup = precomp["G"]  # type: ignore
+    base = precomp["base"]              # type: ignore
+    basic_orbits = precomp["basic_orbits"]          # type: ignore
+    basic_transversals = precomp["basic_transversals"]  # type: ignore
+
+    # witness permutation and current best image
+    g_star = Permutation(list(range(len(x))))  # identity
     best_vec = x
 
     # walk the chain
-    levels = len(level_invperms)
+    levels = len(base)
     for k in range(levels):
-        current = x[current_invperm]
-        invperm_matrix = level_invperms[k]
-        cand_vec, cand_idx = lexmin_with_invperms(current, invperm_matrix)
-        current_invperm = current_invperm[invperm_matrix[cand_idx]]
-        best_vec = cand_vec
+        current = apply_perm_to_lex(x, g_star)
+        cand_vec = None
+        cand_U = None
+        for u in basic_orbits[k]:
+            U = basic_transversals[k][u]
+            y = apply_perm_to_lex(current, U)
+            if (cand_vec is None) or lex_less(y, cand_vec):
+                cand_vec = y
+                cand_U = U
+        if cand_U is not None:
+            g_star = cand_U * g_star
+            best_vec = cand_vec  # type: ignore
     rep_evt = from_lex_representation(best_vec, outcomes)
     return rep_evt
 
@@ -387,40 +409,13 @@ def representatives_of_global_extensions(
     outcomes: int,
     marginal: List[List[int]],
     *,
-    level_invperms: List[np.ndarray],
-) -> List[np.ndarray]:
+    precomp: Dict[str, object],
+) -> List[Tuple[int, ...]]:
     """
-    Iterate global extensions of 'marginal', canonicalize each under the group.
+    Iterate global extensions of 'marginal', canonicalize each under precomp['G'].
     """
-    # fixed slots
-    fixed: Dict[int, int] = {}
-    for (one, i, j, zero, a) in marginal:
-        si = (i - 1) * n + (j - 1)
-        if si in fixed and fixed[si] != a:
-            return []
-        fixed[si] = a
-    # build remaining indices
-    Nslots = n * n
-    fixed_idx = np.fromiter(fixed.keys(), dtype=np.int64)
-    fixed_val = np.fromiter(fixed.values(), dtype=np.int64)
-    mask = np.ones(Nslots, dtype=bool)
-    mask[fixed_idx] = False
-    remaining = np.nonzero(mask)[0]
-    # build base event (fixed slots set once)
-    evt = np.zeros(Nslots, dtype=np.int64)
-    if fixed_idx.size:
-        evt[fixed_idx] = fixed_val
-    # iterate assignments without copying
-    if remaining.size == 0:
-        return [canonical_leximin_coset_chain(evt, outcomes, level_invperms)]
-    reps = []
-    total = outcomes ** remaining.size
-    for combo in tqdm(product(range(outcomes), repeat=remaining.size),
-                      total=total,
-                      desc="Canonicalizing globals...   "):
-        evt[remaining] = combo
-        reps.append(canonical_leximin_coset_chain(evt, outcomes, level_invperms))
-    return reps
+    return [canonical_leximin_coset_chain(evt, outcomes, precomp=precomp)
+            for evt in iterate_global_events_containing_marginal(n, outcomes, marginal)]
 
 
 # =========================
@@ -444,11 +439,12 @@ def run_pipeline(
     # group acts on one-hot coordinates of size N = n^2 * outcomes
     N = (n * n) * outcomes
     G = build_sympy_group(raw_G, N)
-    level_invperms = prepare_group_chain(G, N)
+    precomp = prepare_group_chain(G, N)
 
     list_of_all_LP_variables = ["1"]
     marginals = generate_minimal_marginal_events(n, outcomes)
 
+    list_of_marginal_dictionaries = []
     list_of_global_expansions = []
     sparse_matrix_rows = []
     sparse_matrix_cols = []
@@ -461,15 +457,19 @@ def run_pipeline(
         # --- your existing body per marginal ---
         val = factorized_marginal_value(marginal)  ## This computes the numeric probabilities
         mkey = tuple(prob._lexrepr_to_names[prob.mon_to_lexrepr(marginal)])
+        # list_of_marginal_dictionaries.append(marginal ## We don't need this anymore
         # mkey = tuple(tuple(x) for x in marginal)
         list_of_all_LP_variables.append("P_global("+",".join(mkey)+")")
         known_values_dict[mkey] = val
         # e1 = {mkey: val}
+        # list_of_marginal_dictionaries.append(e1)
 
     # LOOP 1: Create the dictionaries of global events and their counts
     for marginal in tqdm(marginals,  desc="Finding global extensions..."):
+        print(len(list_of_global_expansions))
         list_of_global_expansions.append(
-            representatives_of_global_extensions(n, outcomes, marginal, level_invperms=level_invperms))
+            representatives_of_global_extensions(n, outcomes, marginal, precomp=precomp))
+    list_of_global_expansions = np.array(list_of_global_expansions)
 
     # LOOP 2: Convert canonical global events and their counts to sparse arrays
     global_event_to_idx_dict = defaultdict(int)
@@ -528,7 +528,7 @@ if __name__ == "__main__":
     import itertools
     from inflation.lp.lp_utils import solveLP_sparse
     # Example: n=2, outcomes=4
-    n, outcomes = 4, 4
+    n, outcomes = 4, 3
     # One small example group on N = n^2 * outcomes = 4 * 4 = 16 coordinates:
     #   - identity
     #   - swap within each outcome block of the four operator slots (toy example)
