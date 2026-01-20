@@ -14,6 +14,9 @@
 # -------------------------------------------------------------------
 
 from __future__ import annotations
+from collections import defaultdict, OrderedDict, Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from math import prod
 from typing import List, Tuple, Dict, Iterable, Union
 from functools import lru_cache
 from math import ldexp
@@ -21,10 +24,182 @@ import numpy as np
 import sys
 sys.path.append('/Users/pedrolauand/My_Code/Inflation/inflation')
 from inflation import InflationProblem
-from collections import defaultdict, OrderedDict
 from tqdm import tqdm
 from scipy.sparse import coo_array
+# ---------------------------
+# Globals for worker processes
+# ---------------------------
+# NEW: progress-bar control and worker identity
+_WORK_SHOW_INNER = False
+_WORK_WORKER_ID = None
 
+# NEW: shared worker-id allocator
+from multiprocessing import Value, Lock
+_WORKER_ID_COUNTER = Value("i", 0)
+_WORKER_ID_LOCK = Lock()
+
+def _worker_init(raw_G, n: int, outcomes: int, show_inner: bool):
+    """
+    Runs once per worker process.
+    Builds the SymPy group + stabilizer-chain precomp and stores as globals.
+    Also assigns a stable worker-id for progress bars.
+    """
+    global _WORK_N, _WORK_OUTCOMES, _WORK_PRECOMP
+    global _WORK_SHOW_INNER, _WORK_WORKER_ID
+
+    _WORK_N = n
+    _WORK_OUTCOMES = outcomes
+    _WORK_SHOW_INNER = show_inner
+
+    # NEW: assign a unique worker-id (0,1,2,...) once per process
+    with _WORKER_ID_LOCK:
+        _WORK_WORKER_ID = _WORKER_ID_COUNTER.value
+        _WORKER_ID_COUNTER.value += 1
+
+    N = (n * n) * outcomes
+    G = build_sympy_group(raw_G, N)
+    _WORK_PRECOMP = prepare_group_chain(G, N)
+
+def _build_row_task(args):
+    row_num, marginal = args
+    n = _WORK_N
+    outcomes = _WORK_OUTCOMES
+    precomp = _WORK_PRECOMP
+
+    row_counter = Counter()
+
+    # --- inner progress bar setup (same style as your serial version) ---
+    nof_free = n * n - n
+    total_ext = outcomes ** nof_free
+    update_every = max(1, total_ext // 1000)
+    counter = 0
+
+    pbar = None
+    if _WORK_SHOW_INNER:
+        pbar = tqdm(
+            total=total_ext,
+            desc=f"worker {_WORK_WORKER_ID}: row {row_num+1}",
+            position=int(_WORK_WORKER_ID),  # NEW: one fixed line per worker
+            leave=True
+        )
+
+    for evt in iterate_global_events_containing_marginal(n, outcomes, marginal):
+        rep = canonical_leximin_coset_chain(evt, outcomes, precomp=precomp)
+        row_counter[tuple(rep)] += 1
+
+        if pbar is not None:
+            counter += 1
+            if counter % update_every == 0:
+                pbar.update(update_every)
+
+    if pbar is not None:
+        pbar.update(total_ext - pbar.n)
+        pbar.close()
+
+    return row_num, row_counter
+
+
+def run_pipeline_parallel(
+    prob: InflationProblem,
+    *,
+    max_workers: int | None = None,
+    chunksize: int = 1,
+) -> Tuple[OrderedDict, coo_array, List[str]]:
+    n = prob.inflation_level_per_source[0]
+    outcomes = prob.outcomes_per_party[0]
+    raw_G = prob.symmetries
+
+    list_of_all_LP_variables = ["1"]
+    marginals = generate_minimal_marginal_events(n, outcomes)
+    nof_marginals = len(marginals)
+
+    # --------------------------
+    # LOOP 0 unchanged (serial)
+    # --------------------------
+    known_values_dict = OrderedDict()
+    for marginal in tqdm(marginals, desc="Computing marginal values..."):
+        val = factorized_marginal_value(marginal)
+        mkey = tuple(prob._lexrepr_to_names[prob.mon_to_lexrepr(marginal)])
+        list_of_all_LP_variables.append("P_global(" + ",".join(mkey) + ")")
+        known_values_dict[mkey] = val
+
+    # ----------------------------------------
+    # PARALLEL: compute row_counters per row
+    # ----------------------------------------
+    tasks = [(row_num, marginal) for row_num, marginal in enumerate(marginals)]
+    row_results: List[tuple[int, Counter]] = [None] * nof_marginals  # type: ignore
+    
+    show_inner = True  # enable per-worker progress bars
+
+    with ProcessPoolExecutor(
+        max_workers=max_workers,
+        initializer=_worker_init,
+        initargs=(raw_G, n, outcomes, show_inner),
+    ) as ex:
+
+        # submit all tasks
+        futures = [ex.submit(_build_row_task, t) for t in tasks]
+
+        # progress bar over completed rows
+        outer_pos = (max_workers )
+
+    for fut in tqdm(
+        as_completed(futures),
+        total=nof_marginals,
+        desc="rows done",
+        position=outer_pos,   # NEW: below worker bars
+        leave=True
+    ):
+        row_num, row_counter = fut.result()
+        row_results[row_num] = (row_num, row_counter)
+
+
+    # ----------------------------------------
+    # SERIAL: assemble global columns + COO
+    # ----------------------------------------
+    sparse_matrix_rows: List[int] = []
+    sparse_matrix_cols: List[int] = []
+    sparse_matrix_data: List[float] = []
+
+    global_event_to_idx_dict = defaultdict(int)
+    idx = 1 + nof_marginals  # first free column after marginals block
+
+    for row_num, row_counter in row_results:
+        for event_tuple, coeff in row_counter.items():
+            event_idx = global_event_to_idx_dict[event_tuple]
+            if event_idx == 0:
+                list_of_all_LP_variables.append(
+                    "P_global(" + ",".join(map(str, event_tuple)) + ")"
+                )
+                event_idx = idx
+                global_event_to_idx_dict[event_tuple] = event_idx
+                idx += 1
+
+            sparse_matrix_rows.append(row_num)
+            sparse_matrix_cols.append(event_idx)
+            sparse_matrix_data.append(float(coeff))
+
+    # Add diagonal block: - P_global(marginal_row)  (col = row+1)
+    sparse_matrix_rows_arr = np.hstack((
+        np.arange(nof_marginals, dtype=int),
+        np.array(sparse_matrix_rows, dtype=int)
+    ))
+    sparse_matrix_cols_arr = np.hstack((
+        np.arange(1, nof_marginals + 1, dtype=int),
+        np.array(sparse_matrix_cols, dtype=int)
+    ))
+    sparse_matrix_data_arr = np.hstack((
+        -np.ones(nof_marginals, dtype=float),
+        np.array(sparse_matrix_data, dtype=float)
+    ))
+
+    inflation_matrix = coo_array(
+        (sparse_matrix_data_arr, (sparse_matrix_rows_arr, sparse_matrix_cols_arr)),
+        shape=(nof_marginals, idx)
+    )
+    inflation_matrix.sum_duplicates()
+
+    return known_values_dict, inflation_matrix, list_of_all_LP_variables
 
 # =========================
 # EJM distribution (4 outcomes)
@@ -421,17 +596,7 @@ def representatives_of_global_extensions(
 # =========================
 # Top-level pipeline
 # =========================
-def run_pipeline(
-    prob: InflationProblem
-) -> Tuple[List[Dict], coo_array]:
-    """
-    Build:
-      [
-        [ { marginal_tuple : value_float }, { canonical_global_rep_tuple : count_int ...} ],
-        ...
-      ]
-    over all symmetry-reduced marginals for (n, outcomes).
-    """
+def run_pipeline(prob: InflationProblem) -> Tuple[OrderedDict, coo_array, List[str]]:
     n = prob.inflation_level_per_source[0]
     outcomes = prob.outcomes_per_party[0]
     raw_G = prob.symmetries
@@ -443,61 +608,85 @@ def run_pipeline(
 
     list_of_all_LP_variables = ["1"]
     marginals = generate_minimal_marginal_events(n, outcomes)
-
-    list_of_marginal_dictionaries = []
-    list_of_global_expansions = []
-    sparse_matrix_rows = []
-    sparse_matrix_cols = []
-    sparse_matrix_data = []
-
-    # result = []
-    # LOOP 0: Compute the marginal probabilities
-    known_values_dict = OrderedDict()
-    for marginal in tqdm(marginals,  desc="Computing marginal values..."):
-        # --- your existing body per marginal ---
-        val = factorized_marginal_value(marginal)  ## This computes the numeric probabilities
-        mkey = tuple(prob._lexrepr_to_names[prob.mon_to_lexrepr(marginal)])
-        # list_of_marginal_dictionaries.append(marginal ## We don't need this anymore
-        # mkey = tuple(tuple(x) for x in marginal)
-        list_of_all_LP_variables.append("P_global("+",".join(mkey)+")")
-        known_values_dict[mkey] = val
-        # e1 = {mkey: val}
-        # list_of_marginal_dictionaries.append(e1)
-
-    # LOOP 1: Create the dictionaries of global events and their counts
-    for marginal in tqdm(marginals,  desc="Finding global extensions..."):
-        print(len(list_of_global_expansions))
-        list_of_global_expansions.append(
-            representatives_of_global_extensions(n, outcomes, marginal, precomp=precomp))
-    list_of_global_expansions = np.array(list_of_global_expansions)
-
-    # LOOP 2: Convert canonical global events and their counts to sparse arrays
-    global_event_to_idx_dict = defaultdict(int)
     nof_marginals = len(marginals)
-    idx = 1 + nof_marginals
-    for row_num, global_expansion in enumerate(list_of_global_expansions):
-        for event_tuple in map(tuple, global_expansion):
+
+    # COO builders as Python lists (DO NOT convert until the end)
+    sparse_matrix_rows: List[int] = []
+    sparse_matrix_cols: List[int] = []
+    sparse_matrix_data: List[float] = []
+
+    # LOOP 0: known marginal values + create marginal LP vars (columns 1..nof_marginals)
+    known_values_dict = OrderedDict()
+    for marginal in tqdm(marginals, desc="Computing marginal values..."):
+        val = factorized_marginal_value(marginal)
+        mkey = tuple(prob._lexrepr_to_names[prob.mon_to_lexrepr(marginal)])
+        list_of_all_LP_variables.append("P_global(" + ",".join(mkey) + ")")
+        known_values_dict[mkey] = val
+
+    # LOOP 1/2 merged: stream global extensions, canonicalize, count per marginal row
+    global_event_to_idx_dict = defaultdict(int)
+    idx = 1 + nof_marginals  # first free column after the marginals block
+    for row_num, marginal in enumerate(tqdm(marginals, desc="Finding global extensions...")):
+        row_counter = Counter()
+        nof_free = n * n - n
+        total_ext = outcomes ** nof_free
+        update_every = max(1, total_ext // 1000)  # update ~1000 times
+        counter = 0
+
+        pbar = tqdm(
+            total=total_ext,
+            desc=f"  extensions for marginal {row_num+1}/{nof_marginals}",
+            leave=False
+        )
+
+        for evt in iterate_global_events_containing_marginal(n, outcomes, marginal):
+            rep = canonical_leximin_coset_chain(evt, outcomes, precomp=precomp)
+            row_counter[tuple(rep)] += 1
+
+            counter += 1
+            if counter % update_every == 0:
+                pbar.update(update_every)
+
+        # finalize bar
+        pbar.update(total_ext - pbar.n)
+        pbar.close()
+
+        # write one sparse entry per canonical rep (with multiplicity)
+        for event_tuple, coeff in row_counter.items():
             event_idx = global_event_to_idx_dict[event_tuple]
             if event_idx == 0:
-                list_of_all_LP_variables.append("P_global("+",".join(map(str,event_tuple))+")")
+                list_of_all_LP_variables.append(
+                    "P_global(" + ",".join(map(str, event_tuple)) + ")"
+                )
                 event_idx = idx
                 global_event_to_idx_dict[event_tuple] = event_idx
                 idx += 1
+
             sparse_matrix_rows.append(row_num)
             sparse_matrix_cols.append(event_idx)
-            sparse_matrix_data.append(1)
-    sparse_matrix_rows = np.hstack((np.arange(nof_marginals, dtype=int),
-                                   np.array(sparse_matrix_rows, dtype=int)))
-    sparse_matrix_cols = np.hstack((np.arange(1,nof_marginals+1, dtype=int),
-                                   np.array(sparse_matrix_cols, dtype=int)))
-    sparse_matrix_data = np.hstack((-np.ones(nof_marginals, dtype=int),
-                                   np.array(sparse_matrix_data, dtype=float)))
-    inflation_matrix = coo_array((sparse_matrix_data, (sparse_matrix_rows, sparse_matrix_cols)),
-                          shape=(nof_marginals, idx))
+            sparse_matrix_data.append(float(coeff))
+
+    # Add diagonal block: - P_global(marginal_row)  (col = row+1)
+    sparse_matrix_rows = np.hstack((
+        np.arange(nof_marginals, dtype=int),
+        np.array(sparse_matrix_rows, dtype=int)
+    ))
+    sparse_matrix_cols = np.hstack((
+        np.arange(1, nof_marginals + 1, dtype=int),
+        np.array(sparse_matrix_cols, dtype=int)
+    ))
+    sparse_matrix_data = np.hstack((
+        -np.ones(nof_marginals, dtype=float),
+        np.array(sparse_matrix_data, dtype=float)
+    ))
+
+    inflation_matrix = coo_array(
+        (sparse_matrix_data, (sparse_matrix_rows, sparse_matrix_cols)),
+        shape=(nof_marginals, idx)
+    )
     inflation_matrix.sum_duplicates()
 
     return known_values_dict, inflation_matrix, list_of_all_LP_variables
-
 """# ---- inside run_pipeline, after you compute `marginals` ----
 marginals = generate_minimal_marginal_events(n, outcomes)
 total = len(marginals)
@@ -527,6 +716,8 @@ return result"""
 if __name__ == "__main__":
     import itertools
     from inflation.lp.lp_utils import solveLP_sparse
+    import multiprocessing as mp
+    mp.set_start_method("spawn", force=True)
     # Example: n=2, outcomes=4
     n, outcomes = 4, 3
     # One small example group on N = n^2 * outcomes = 4 * 4 = 16 coordinates:
@@ -538,7 +729,7 @@ if __name__ == "__main__":
     print("done with prob")
 
     
-    knowns_dict, inflation_matrix, list_of_LP_variables = run_pipeline(prob)
+    knowns_dict, inflation_matrix, list_of_LP_variables = run_pipeline_parallel(prob,max_workers=2)
 
 
     def convert_known_dict_to_sparse(known_values_dict: OrderedDict, nof_variables_total: int):
