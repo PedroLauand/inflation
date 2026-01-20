@@ -17,13 +17,23 @@ from __future__ import annotations
 from typing import List, Tuple, Dict, Iterable, Union
 from functools import lru_cache
 from math import ldexp
+from pathlib import Path
 import numpy as np
 import sys
-sys.path.append('/Users/pedrolauand/My_Code/Inflation/inflation')
+
+# Ensure repo root is on sys.path so "import inflation" works when running this file directly.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 from inflation import InflationProblem
 from collections import defaultdict, OrderedDict
 from tqdm import tqdm
 from scipy.sparse import coo_array
+try:
+    from numba import njit
+    _NUMBA_AVAILABLE = True
+except Exception:
+    _NUMBA_AVAILABLE = False
 
 
 # =========================
@@ -234,39 +244,96 @@ def iterate_global_events_containing_marginal(
         # set remaining
         for s, a in zip(remaining, combo):
             evt[s] = a
-        yield evt
+        yield np.array(evt, dtype=np.int64)
 
 # =========================
 # One-hot lex helpers (for group action on events)
 # =========================
-def to_lex_representation(evt: List[int], outcomes: int) -> List[int]:
+if _NUMBA_AVAILABLE:
+    @njit(cache=True)
+    def _to_lex_numba(evt, outcomes):
+        n2 = evt.shape[0]
+        N = n2 * outcomes
+        lex = np.zeros(N, dtype=np.int64)
+        for s in range(n2):
+            k = evt[s]
+            if k < 0 or k >= outcomes:
+                raise ValueError("Outcome out of range")
+            lex[k + outcomes * s] = 1
+        return lex
+
+def to_lex_representation(evt: np.ndarray, outcomes: int) -> np.ndarray:
     """Compact event -> one-hot lex vector (length n^2 * outcomes)."""
-    n2 = len(evt)
+    evt_arr = np.asarray(evt, dtype=np.int64)
+    if _NUMBA_AVAILABLE:
+        return _to_lex_numba(evt_arr, outcomes)
+    n2 = evt_arr.shape[0]
     N = n2 * outcomes
-    lex = [0] * N
-    for s, k in enumerate(evt):
+    lex = np.zeros(N, dtype=np.int64)
+    for s in range(n2):
+        k = evt_arr[s]
         if not (0 <= k < outcomes):
             raise ValueError("Outcome out of range")
         lex[k + outcomes * s] = 1
     return lex
 
-def from_lex_representation(lex_evt: List[int], outcomes: int) -> List[int]:
+if _NUMBA_AVAILABLE:
+    @njit(cache=True)
+    def _from_lex_numba(lex_evt, outcomes):
+        N = lex_evt.shape[0]
+        if N % outcomes != 0:
+            raise ValueError("Invalid length")
+        n2 = N // outcomes
+        evt = np.empty(n2, dtype=np.int64)
+        for s in range(n2):
+            start = s * outcomes
+            block_sum = 0
+            idx = -1
+            for j in range(outcomes):
+                v = lex_evt[start + j]
+                if v != 0:
+                    block_sum += v
+                    idx = j
+            if block_sum != 1:
+                raise ValueError("Block not one-hot")
+            evt[s] = idx
+        return evt
+
+def from_lex_representation(lex_evt: np.ndarray, outcomes: int) -> np.ndarray:
     """One-hot lex vector -> compact event; validates one-hot per block."""
-    N = len(lex_evt)
+    lex_arr = np.asarray(lex_evt, dtype=np.int64)
+    if _NUMBA_AVAILABLE:
+        return _from_lex_numba(lex_arr, outcomes)
+    N = len(lex_arr)
     if N % outcomes != 0:
         raise ValueError("Invalid length")
     n2 = N // outcomes
-    evt = [0] * n2
+    evt = np.empty(n2, dtype=np.int64)
     for s in range(n2):
-        block = lex_evt[s * outcomes : (s + 1) * outcomes]
-        if sum(block) != 1:
+        block = lex_arr[s * outcomes : (s + 1) * outcomes]
+        if int(block.sum()) != 1:
             raise ValueError(f"Block {s} not one-hot: {block}")
-        evt[s] = block.index(1)
+        evt[s] = int(np.argmax(block))
     return evt
 
-def lex_less(a: List[int], b: List[int]) -> bool:
+if _NUMBA_AVAILABLE:
+    @njit(cache=True)
+    def _lex_less_numba(a, b):
+        n = a.shape[0]
+        for i in range(n):
+            if a[i] < b[i]:
+                return True
+            if a[i] > b[i]:
+                return False
+        return False
+
+def lex_less(a: np.ndarray, b: np.ndarray) -> bool:
     """True iff a < b in lexicographic order."""
-    for x, y in zip(a, b):
+    a_arr = np.asarray(a, dtype=np.int64)
+    b_arr = np.asarray(b, dtype=np.int64)
+    if _NUMBA_AVAILABLE:
+        return bool(_lex_less_numba(a_arr, b_arr))
+    for x, y in zip(a_arr, b_arr):
         if x < y:
             return True
         if x > y:
@@ -300,27 +367,54 @@ def prepare_group_chain(G: PermutationGroup, N: int) -> Dict[str, object]:
     for use in the canonicalizer (no recomputation).
     """
     G.schreier_sims()
+    basic_transversals = []
+    level_invperms = []
+    for trans in G.basic_transversals:
+        trans_arrays = {}
+        for u, perm in trans.items():
+            perm_arr = np.array(perm.array_form, dtype=np.int64)
+            invperm = np.empty_like(perm_arr)
+            invperm[perm_arr] = np.arange(perm_arr.size, dtype=perm_arr.dtype)
+            trans_arrays[u] = (perm_arr, invperm)
+        basic_transversals.append(trans_arrays)
+    for level, orbits in enumerate(G.basic_orbits):
+        invperm_matrix = np.empty((len(orbits), N), dtype=np.int64)
+        for i, u in enumerate(orbits):
+            invperm_matrix[i] = basic_transversals[level][u][1]
+        level_invperms.append(invperm_matrix)
     return {
         "G": G,
         "base": list(G.base),
         "basic_orbits": list(G.basic_orbits),
-        "basic_transversals": list(G.basic_transversals),
+        "basic_transversals": basic_transversals,
+        "level_invperms": level_invperms,
         "N": N,
     }
 
-def apply_perm_to_lex(lex_evt: List[int], perm: Permutation) -> List[int]:
-    """Apply SymPy permutation to one-hot vector: out[perm(p)] = lex_evt[p]."""
-    N = len(lex_evt)
-    out = [0] * N
-    for p in range(N):
-        out[perm(p)] = lex_evt[p]
-    return out
+if _NUMBA_AVAILABLE:
+    @njit(cache=True)
+    def _lexmin_with_invperms(current, invperms):
+        m, n = invperms.shape
+        best_idx = 0
+        for i in range(1, m):
+            for j in range(n):
+                a = current[invperms[i, j]]
+                b = current[invperms[best_idx, j]]
+                if a < b:
+                    best_idx = i
+                    break
+                if a > b:
+                    break
+        best_vec = np.empty(n, dtype=current.dtype)
+        for j in range(n):
+            best_vec[j] = current[invperms[best_idx, j]]
+        return best_vec, best_idx
 
 def canonical_leximin_coset_chain(
-    evt: List[int],
+    evt: np.ndarray,
     outcomes: int,
     precomp: Dict[str, object],
-) -> List[int]:
+) -> np.ndarray:
     """
     Canonical representative of 'evt' under G using the stabilizer chain:
     scans transversal reps at each level to minimize lex-image in one-hot space.
@@ -328,28 +422,29 @@ def canonical_leximin_coset_chain(
     x = to_lex_representation(evt, outcomes)
     # G: PermutationGroup = precomp["G"]  # type: ignore
     base = precomp["base"]              # type: ignore
-    basic_orbits = precomp["basic_orbits"]          # type: ignore
-    basic_transversals = precomp["basic_transversals"]  # type: ignore
+    level_invperms = precomp["level_invperms"]  # type: ignore
 
-    # witness permutation and current best image
-    g_star = Permutation(list(range(len(x))))  # identity
+    # witness permutation (inverse array) and current best image
+    current_invperm = np.arange(len(x), dtype=np.int64)
     best_vec = x
 
     # walk the chain
     levels = len(base)
     for k in range(levels):
-        current = apply_perm_to_lex(x, g_star)
-        cand_vec = None
-        cand_U = None
-        for u in basic_orbits[k]:
-            U = basic_transversals[k][u]
-            y = apply_perm_to_lex(current, U)
-            if (cand_vec is None) or lex_less(y, cand_vec):
-                cand_vec = y
-                cand_U = U
-        if cand_U is not None:
-            g_star = cand_U * g_star
-            best_vec = cand_vec  # type: ignore
+        current = x[current_invperm]
+        invperm_matrix = level_invperms[k]
+        if _NUMBA_AVAILABLE:
+            cand_vec, cand_idx = _lexmin_with_invperms(current, invperm_matrix)
+        else:
+            y = current[invperm_matrix]
+            if y.shape[0] == 1:
+                cand_idx = 0
+                cand_vec = y[0]
+            else:
+                cand_idx = int(np.lexsort(y[:, ::-1].T)[0])
+                cand_vec = y[cand_idx]
+        current_invperm = current_invperm[invperm_matrix[cand_idx]]
+        best_vec = cand_vec
     rep_evt = from_lex_representation(best_vec, outcomes)
     return rep_evt
 
@@ -410,7 +505,7 @@ def representatives_of_global_extensions(
     marginal: List[List[int]],
     *,
     precomp: Dict[str, object],
-) -> List[Tuple[int, ...]]:
+) -> List[np.ndarray]:
     """
     Iterate global extensions of 'marginal', canonicalize each under precomp['G'].
     """
