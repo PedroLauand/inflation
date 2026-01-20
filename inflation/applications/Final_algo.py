@@ -20,8 +20,8 @@ from math import ldexp
 import numpy as np
 import sys
 sys.path.append('/Users/pedrolauand/My_Code/Inflation/inflation')
-from inflation import InflationProblem, InflationLP, InflationSDP
-from collections import defaultdict
+from inflation import InflationProblem
+from collections import defaultdict, OrderedDict
 from tqdm import tqdm
 from scipy.sparse import coo_array
 
@@ -440,7 +440,8 @@ def run_pipeline(
     N = (n * n) * outcomes
     G = build_sympy_group(raw_G, N)
     precomp = prepare_group_chain(G, N)
-    
+
+    list_of_all_LP_variables = ["1"]
     marginals = generate_minimal_marginal_events(n, outcomes)
 
     list_of_marginal_dictionaries = []
@@ -451,13 +452,17 @@ def run_pipeline(
 
     # result = []
     # LOOP 0: Compute the marginal probabilities
+    known_values_dict = OrderedDict()
     for marginal in tqdm(marginals,  desc="Computing marginal values..."):
         # --- your existing body per marginal ---
-        val = factorized_marginal_value(marginal)
+        val = factorized_marginal_value(marginal)  ## This computes the numeric probabilities
         mkey = tuple(prob._lexrepr_to_names[prob.mon_to_lexrepr(marginal)])
+        # list_of_marginal_dictionaries.append(marginal ## We don't need this anymore
         # mkey = tuple(tuple(x) for x in marginal)
-        e1 = {mkey: val}
-        list_of_marginal_dictionaries.append(e1)
+        list_of_all_LP_variables.append("P_global("+",".join(mkey)+")")
+        known_values_dict[mkey] = val
+        # e1 = {mkey: val}
+        # list_of_marginal_dictionaries.append(e1)
 
     # LOOP 1: Create the dictionaries of global events and their counts
     for marginal in tqdm(marginals,  desc="Finding global extensions..."):
@@ -467,25 +472,30 @@ def run_pipeline(
 
     # LOOP 2: Convert canonical global events and their counts to sparse arrays
     global_event_to_idx_dict = defaultdict(int)
-    idx = 1
+    nof_marginals = len(marginals)
+    idx = 1 + nof_marginals
     for row_num, global_expansion in enumerate(list_of_global_expansions):
         for event_tuple in map(tuple, global_expansion):
             event_idx = global_event_to_idx_dict[event_tuple]
             if event_idx == 0:
+                list_of_all_LP_variables.append("P_global("+",".join(map(str,event_tuple))+")")
                 event_idx = idx
                 global_event_to_idx_dict[event_tuple] = event_idx
                 idx += 1
             sparse_matrix_rows.append(row_num)
             sparse_matrix_cols.append(event_idx)
             sparse_matrix_data.append(1)
-    sparse_matrix_rows = np.array(sparse_matrix_rows, dtype=int)
-    sparse_matrix_cols = np.array(sparse_matrix_cols, dtype=int)
-    sparse_matrix_data = np.array(sparse_matrix_data, dtype=float)
+    sparse_matrix_rows = np.hstack((np.arange(nof_marginals, dtype=int),
+                                   np.array(sparse_matrix_rows, dtype=int)))
+    sparse_matrix_cols = np.hstack((np.arange(1,nof_marginals+1, dtype=int),
+                                   np.array(sparse_matrix_cols, dtype=int)))
+    sparse_matrix_data = np.hstack((-np.ones(nof_marginals, dtype=int),
+                                   np.array(sparse_matrix_data, dtype=float)))
     inflation_matrix = coo_array((sparse_matrix_data, (sparse_matrix_rows, sparse_matrix_cols)),
-                          shape=(len(list_of_global_expansions), idx))
+                          shape=(nof_marginals, idx))
     inflation_matrix.sum_duplicates()
 
-    return list_of_marginal_dictionaries, inflation_matrix
+    return known_values_dict, inflation_matrix, list_of_all_LP_variables
 
 """# ---- inside run_pipeline, after you compute `marginals` ----
 marginals = generate_minimal_marginal_events(n, outcomes)
@@ -514,6 +524,8 @@ return result"""
 # Example of usage
 # =========================
 if __name__ == "__main__":
+    import itertools
+    from inflation.lp.lp_utils import solveLP_sparse
     # Example: n=2, outcomes=4
     n, outcomes = 4, 2
     # One small example group on N = n^2 * outcomes = 4 * 4 = 16 coordinates:
@@ -525,8 +537,22 @@ if __name__ == "__main__":
     print("done with prob")
 
     
-    marginals_dict, inflation_matrix = run_pipeline(prob)
-    print(inflation_matrix)
+    knowns_dict, inflation_matrix, list_of_LP_variables = run_pipeline(prob)
+
+
+    def convert_known_dict_to_sparse(known_values_dict: OrderedDict, nof_variables_total: int):
+        data = np.array(list(known_values_dict.values()), dtype=float)
+        nof_marginals = len(data)
+        row = np.zeros(nof_marginals, dtype=int)
+        col = np.arange(1, nof_marginals+1, dtype=int)
+        # data = list(itertools.chain.from_iterable(marginals_dict.keys() for marginals_dict in marginals_dicts))
+        return coo_array((data, (row, col)), shape=(1, nof_variables_total))
+
+    nof_known, nof_all_LP_vars = inflation_matrix.shape
+    known_vars_coo_vec = convert_known_dict_to_sparse(knowns_dict, nof_all_LP_vars)
+
+    for k, v in knowns_dict.items():
+        print(f"{k}: {v}")
     # # Print a small summary
     # for idx, (e1, e2) in enumerate(out):
     #     print(f"\nItem {idx}:")
@@ -538,3 +564,12 @@ if __name__ == "__main__":
     #     print("  reps (compact evt) -> count:")
     #     for rep, cnt in e2.items():
     #         print("   ", list(rep), "->", cnt)
+
+    solution = solveLP_sparse(objective=coo_array(([], ([], [])), shape=(1, nof_all_LP_vars)),
+                              known_vars=known_vars_coo_vec,
+                              equalities=inflation_matrix,
+                              default_non_negative=True,
+                              variables=list_of_LP_variables,
+                              verbose=True)
+
+    print(solution["status"])
