@@ -28,7 +28,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 from inflation import InflationProblem
 from collections import defaultdict, OrderedDict
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from scipy.sparse import coo_array
 from numba import njit, int64, types
 from numba.typed import List as NumbaList
@@ -91,11 +91,11 @@ def ring_problem(inflation_level: int, nof_outcomes: int = 2) -> InflationProble
     inf_prob = InflationProblem(
         dag={"i1": ["A"],
              "i2": ["A"], },
-        outcomes_per_party=(nof_outcomes,),
-        settings_per_party=(1,),
+        outcomes_per_party=[nof_outcomes],
+        settings_per_party=[1],
         classical_sources=None,
         inflation_level_per_source=(inflation_level,inflation_level),
-        order=["A"])
+        order=("A",))
 
     to_stabilize = np.flatnonzero(inf_prob._lexorder[:, 1] == inf_prob._lexorder[:, 2])
 
@@ -420,7 +420,9 @@ def representatives_of_global_extensions(
     for combo in tqdm(product(range(outcomes), repeat=remaining.size),
                       total=total,
                       desc="Canonicalizing globals...",
-                      disable=not show_progress):
+                      disable=not show_progress,
+                      leave=True,
+                      position=0):
         evt[remaining] = combo
         reps.append(canonical_leximin_coset_chain(evt, outcomes, level_invperms))
     return reps
@@ -462,7 +464,8 @@ def run_pipeline(
     # result = []
     # LOOP 0: Compute the marginal probabilities
     known_values_dict = OrderedDict()
-    for marginal in tqdm(marginals, desc="Computing marginal values...", disable=not show_progress):
+    for marginal in tqdm(marginals, desc="Computing marginal values...",
+                         disable=not show_progress):
         # --- your existing body per marginal ---
         val = factorized_marginal_value(marginal)  ## This computes the numeric probabilities
         mkey = tuple(prob._lexrepr_to_names[prob.mon_to_lexrepr(marginal)])
@@ -472,7 +475,8 @@ def run_pipeline(
         # e1 = {mkey: val}
 
     # LOOP 1: Create the dictionaries of global events and their counts
-    for marginal in tqdm(marginals, desc="Finding global extensions...", disable=not show_progress):
+    for marginal in tqdm(marginals, desc="Finding global extensions...",
+                         disable=not show_progress):
         list_of_global_expansions.append(
             representatives_of_global_extensions(
                 n,
