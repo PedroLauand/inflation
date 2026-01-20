@@ -466,7 +466,7 @@ def run_pipeline(
 
     # LOOP 1: Create the dictionaries of global events and their counts
     for marginal in tqdm(marginals,  desc="Finding global extensions..."):
-        print(len(list_of_global_expansions))
+        #print(len(list_of_global_expansions))
         list_of_global_expansions.append(
             representatives_of_global_extensions(n, outcomes, marginal, precomp=precomp))
     list_of_global_expansions = np.array(list_of_global_expansions)
@@ -528,7 +528,7 @@ if __name__ == "__main__":
     import itertools
     from inflation.lp.lp_utils import solveLP_sparse
     # Example: n=2, outcomes=4
-    n, outcomes = 4, 3
+    n, outcomes = 4, 2
     # One small example group on N = n^2 * outcomes = 4 * 4 = 16 coordinates:
     #   - identity
     #   - swap within each outcome block of the four operator slots (toy example)
