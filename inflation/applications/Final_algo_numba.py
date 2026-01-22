@@ -31,7 +31,10 @@ from collections import defaultdict, OrderedDict
 from tqdm.auto import tqdm
 from scipy.sparse import coo_array
 from numba import njit, int64, uint8, types
+from numba.typed import Dict as NumbaDict
 from numba.typed import List as NumbaList
+
+ZERO_I32 = np.int32(0)
 
 
 # =========================
@@ -333,6 +336,155 @@ def canonical_leximin_coset_chain(
     rep_evt = from_lex_representation(best_vec, outcomes)
     return rep_evt
 
+_KEY_T3 = types.UniTuple(types.uint8, 9)
+_KEY_T4 = types.UniTuple(types.uint8, 16)
+_KEY_T5 = types.UniTuple(types.uint8, 25)
+_KEY_T6 = types.UniTuple(types.uint8, 36)
+
+@njit(cache=True, fastmath=True)
+def _fill_cols_n3(
+    evt: np.ndarray,
+    remaining: np.ndarray,
+    outcomes: int,
+    level_invperms: NumbaList,
+    global_event_map,
+    next_event_idx: int,
+    sparse_matrix_cols: np.ndarray,
+    start: int,
+    total: int,
+    new_keys: NumbaList,
+) -> int:
+    """Writes into sparse_matrix_cols and updates global_event_map/new_keys."""
+    next_event_idx = np.int32(next_event_idx)
+    for pos in range(total):
+        tmp = pos
+        for r in range(remaining.size - 1, -1, -1):
+            idx = remaining[r]
+            evt[idx] = tmp % outcomes
+            tmp //= outcomes
+        canon = canonical_leximin_coset_chain(evt, outcomes, level_invperms)
+        key = (canon[0], canon[1], canon[2], canon[3], canon[4], canon[5], canon[6], canon[7], canon[8])
+        event_idx = global_event_map.get(key, ZERO_I32)
+        if event_idx == 0:
+            event_idx = next_event_idx
+            next_event_idx = np.int32(next_event_idx + 1)
+            global_event_map[key] = event_idx
+            new_keys.append(key)
+        sparse_matrix_cols[start + pos] = event_idx
+    return next_event_idx
+
+@njit(cache=True, fastmath=True)
+def _fill_cols_n4(
+    evt: np.ndarray,
+    remaining: np.ndarray,
+    outcomes: int,
+    level_invperms: NumbaList,
+    global_event_map,
+    next_event_idx: int,
+    sparse_matrix_cols: np.ndarray,
+    start: int,
+    total: int,
+    new_keys: NumbaList,
+) -> int:
+    """Writes into sparse_matrix_cols and updates global_event_map/new_keys."""
+    next_event_idx = np.int32(next_event_idx)
+    for pos in range(total):
+        tmp = pos
+        for r in range(remaining.size - 1, -1, -1):
+            idx = remaining[r]
+            evt[idx] = tmp % outcomes
+            tmp //= outcomes
+        canon = canonical_leximin_coset_chain(evt, outcomes, level_invperms)
+        key = (
+            canon[0], canon[1], canon[2], canon[3], canon[4], canon[5], canon[6], canon[7],
+            canon[8], canon[9], canon[10], canon[11], canon[12], canon[13], canon[14], canon[15],
+        )
+        event_idx = global_event_map.get(key, ZERO_I32)
+        if event_idx == 0:
+            event_idx = next_event_idx
+            next_event_idx = np.int32(next_event_idx + 1)
+            global_event_map[key] = event_idx
+            new_keys.append(key)
+        sparse_matrix_cols[start + pos] = event_idx
+    return next_event_idx
+
+@njit(cache=True, fastmath=True)
+def _fill_cols_n5(
+    evt: np.ndarray,
+    remaining: np.ndarray,
+    outcomes: int,
+    level_invperms: NumbaList,
+    global_event_map,
+    next_event_idx: int,
+    sparse_matrix_cols: np.ndarray,
+    start: int,
+    total: int,
+    new_keys: NumbaList,
+) -> int:
+    """Writes into sparse_matrix_cols and updates global_event_map/new_keys."""
+    next_event_idx = np.int32(next_event_idx)
+    for pos in range(total):
+        tmp = pos
+        for r in range(remaining.size - 1, -1, -1):
+            idx = remaining[r]
+            evt[idx] = tmp % outcomes
+            tmp //= outcomes
+        canon = canonical_leximin_coset_chain(evt, outcomes, level_invperms)
+        key = (
+            canon[0], canon[1], canon[2], canon[3], canon[4],
+            canon[5], canon[6], canon[7], canon[8], canon[9],
+            canon[10], canon[11], canon[12], canon[13], canon[14],
+            canon[15], canon[16], canon[17], canon[18], canon[19],
+            canon[20], canon[21], canon[22], canon[23], canon[24],
+        )
+        event_idx = global_event_map.get(key, ZERO_I32)
+        if event_idx == 0:
+            event_idx = next_event_idx
+            next_event_idx = np.int32(next_event_idx + 1)
+            global_event_map[key] = event_idx
+            new_keys.append(key)
+        sparse_matrix_cols[start + pos] = event_idx
+    return next_event_idx
+
+@njit(cache=True, fastmath=True)
+def _fill_cols_n6(
+    evt: np.ndarray,
+    remaining: np.ndarray,
+    outcomes: int,
+    level_invperms: NumbaList,
+    global_event_map,
+    next_event_idx: int,
+    sparse_matrix_cols: np.ndarray,
+    start: int,
+    total: int,
+    new_keys: NumbaList,
+) -> int:
+    """Writes into sparse_matrix_cols and updates global_event_map/new_keys."""
+    next_event_idx = np.int32(next_event_idx)
+    for pos in range(total):
+        tmp = pos
+        for r in range(remaining.size - 1, -1, -1):
+            idx = remaining[r]
+            evt[idx] = tmp % outcomes
+            tmp //= outcomes
+        canon = canonical_leximin_coset_chain(evt, outcomes, level_invperms)
+        key = (
+            canon[0], canon[1], canon[2], canon[3], canon[4], canon[5],
+            canon[6], canon[7], canon[8], canon[9], canon[10], canon[11],
+            canon[12], canon[13], canon[14], canon[15], canon[16], canon[17],
+            canon[18], canon[19], canon[20], canon[21], canon[22], canon[23],
+            canon[24], canon[25], canon[26], canon[27], canon[28], canon[29],
+            canon[30], canon[31], canon[32], canon[33], canon[34], canon[35],
+        )
+        event_idx = global_event_map.get(key, ZERO_I32)
+        if event_idx == 0:
+            event_idx = next_event_idx
+            next_event_idx = np.int32(next_event_idx + 1)
+            global_event_map[key] = event_idx
+            new_keys.append(key)
+        sparse_matrix_cols[start + pos] = event_idx
+    return next_event_idx
+
 # =========================
 # Cycle extraction & factorized value for a marginal
 # =========================
@@ -388,7 +540,6 @@ def representatives_of_global_extensions(
     n: int,
     outcomes: int,
     marginal: List[List[int]],
-    *,
     level_invperms: NumbaList,
     global_event_map: DefaultDict[bytes, int],
     next_event_idx: int,
@@ -396,17 +547,18 @@ def representatives_of_global_extensions(
     total: int,
     sparse_matrix_cols: np.ndarray,
     start: int,
-    show_progress: bool = True,
+    show_progress: bool,
 ) -> int:
     """
     Iterate global extensions of 'marginal', canonicalize each under the group.
+    Modifies global_event_map, sparse_matrix_cols, list_of_all_LP_variables.
     """
     # fixed slots
     fixed: Dict[int, int] = {}
     for (one, i, j, zero, a) in marginal:
         si = (i - 1) * n + (j - 1)
         if si in fixed and fixed[si] != a:
-            return []
+            return next_event_idx
         fixed[si] = a
     # build remaining indices
     Nslots = n * n
@@ -452,6 +604,56 @@ def representatives_of_global_extensions(
         sparse_matrix_cols[start + pos] = event_idx
     return next_event_idx
 
+def representatives_of_global_extensions_tuple_n(
+    n: int,
+    outcomes: int,
+    marginal: List[List[int]],
+    level_invperms: NumbaList,
+    global_event_map,
+    next_event_idx: int,
+    list_of_all_LP_variables: List[str],
+    total: int,
+    sparse_matrix_cols: np.ndarray,
+    start: int,
+    fill_cols_fn,
+    key_type,
+) -> int:
+    """
+    Tuple-keyed path for fixed n (3,4,5,6) using Numba typed dicts.
+    Modifies global_event_map, sparse_matrix_cols, list_of_all_LP_variables.
+    """
+    fixed: Dict[int, int] = {}
+    for (one, i, j, zero, a) in marginal:
+        si = (i - 1) * n + (j - 1)
+        if si in fixed and fixed[si] != a:
+            return next_event_idx
+        fixed[si] = a
+    Nslots = n * n
+    fixed_idx = np.fromiter(fixed.keys(), dtype=np.int64)
+    fixed_val = np.fromiter(fixed.values(), dtype=np.uint8)
+    mask = np.ones(Nslots, dtype=bool)
+    mask[fixed_idx] = False
+    remaining = np.nonzero(mask)[0]
+    evt = np.zeros(Nslots, dtype=np.uint8)
+    if fixed_idx.size:
+        evt[fixed_idx] = fixed_val
+    new_keys = NumbaList.empty_list(key_type)
+    next_event_idx = fill_cols_fn(
+        evt,
+        remaining,
+        outcomes,
+        level_invperms,
+        global_event_map,
+        next_event_idx,
+        sparse_matrix_cols,
+        start,
+        total,
+        new_keys,
+    )
+    for key in new_keys:
+        list_of_all_LP_variables.append("P_global("+",".join(map(str, key))+")")
+    return next_event_idx
+
 
 # =========================
 # Top-level pipeline
@@ -486,8 +688,26 @@ def run_pipeline(
     marginals = generate_minimal_marginal_events(n, outcomes)
 
     nof_marginals = len(marginals)
-    global_event_map: DefaultDict[bytes, int] = defaultdict(int)
-    next_event_idx = 1 + nof_marginals
+    fill_cols_fn = None
+    key_type = None
+    if n == 3:
+        fill_cols_fn = _fill_cols_n3
+        key_type = _KEY_T3
+    elif n == 4:
+        fill_cols_fn = _fill_cols_n4
+        key_type = _KEY_T4
+    elif n == 5:
+        fill_cols_fn = _fill_cols_n5
+        key_type = _KEY_T5
+    elif n == 6:
+        fill_cols_fn = _fill_cols_n6
+        key_type = _KEY_T6
+    if fill_cols_fn is None:
+        global_event_map: DefaultDict[bytes, int] = defaultdict(int)
+        next_event_idx = 1 + nof_marginals
+    else:
+        global_event_map = NumbaDict.empty(key_type=key_type, value_type=types.int32)
+        next_event_idx = np.int32(1 + nof_marginals)
     global_extension_counts = np.empty(nof_marginals, dtype=np.int64)
     for row_num, marginal in enumerate(marginals):
         fixed_slots = {(i - 1) * n + (j - 1) for (_, i, j, _, _) in marginal}
@@ -520,26 +740,42 @@ def run_pipeline(
     for row_num, marginal in enumerate(tqdm(marginals, desc="Finding global extensions...",
                                            disable=not show_progress)):
         total = int(global_extension_counts[row_num])
-        next_event_idx = representatives_of_global_extensions(
-            n,
-            outcomes,
-            marginal,
-            level_invperms=level_invperms,
-            global_event_map=global_event_map,
-            next_event_idx=next_event_idx,
-            list_of_all_LP_variables=list_of_all_LP_variables,
-            total=total,
-            sparse_matrix_cols=sparse_matrix_cols,
-            start=start,
-            show_progress=show_progress,
-        )
+        if fill_cols_fn is None:
+            next_event_idx = representatives_of_global_extensions(
+                n=n,
+                outcomes=outcomes,
+                marginal=marginal,
+                level_invperms=level_invperms,
+                global_event_map=global_event_map,
+                next_event_idx=next_event_idx,
+                list_of_all_LP_variables=list_of_all_LP_variables,
+                total=total,
+                sparse_matrix_cols=sparse_matrix_cols,
+                start=start,
+                show_progress=show_progress,
+            )
+        else:
+            next_event_idx = representatives_of_global_extensions_tuple_n(
+                n=n,
+                outcomes=outcomes,
+                marginal=marginal,
+                level_invperms=level_invperms,
+                global_event_map=global_event_map,
+                next_event_idx=next_event_idx,
+                list_of_all_LP_variables=list_of_all_LP_variables,
+                total=total,
+                sparse_matrix_cols=sparse_matrix_cols,
+                start=start,
+                fill_cols_fn=fill_cols_fn,
+                key_type=key_type,
+            )
         finish = start + total
         sparse_matrix_rows[start:finish] = row_num
         start = finish
-    if next_event_idx > np.iinfo(np.int32).max:
+    if int(next_event_idx) > np.iinfo(np.int32).max:
         raise ValueError("next_event_idx exceeds int32 range; use wider dtype")
     inflation_matrix = coo_array((sparse_matrix_data, (sparse_matrix_rows, sparse_matrix_cols)),
-                          shape=(nof_marginals, next_event_idx))
+                          shape=(nof_marginals, int(next_event_idx)))
     inflation_matrix.sum_duplicates()
 
     return known_values_dict, inflation_matrix, list_of_all_LP_variables
