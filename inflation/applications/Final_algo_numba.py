@@ -30,7 +30,7 @@ from inflation import InflationProblem
 from collections import defaultdict, OrderedDict
 from tqdm.auto import tqdm
 from scipy.sparse import coo_array
-from numba import njit, int64, types
+from numba import njit, int64, uint8, types
 from numba.typed import List as NumbaList
 
 
@@ -130,7 +130,7 @@ def integer_partitions(n: int) -> List[List[int]]:
     rec(n, n, [])
     return out
 
-@njit(int64[:](int64[:]), cache=True, fastmath=True)
+@njit(cache=True, fastmath=True)
 def representative_perm_for_partition(parts: np.ndarray) -> np.ndarray:
     """
     Given partition parts of n (e.g., [3,1]), build a canonical 1-line permutation J of {1..n}
@@ -216,23 +216,24 @@ def generate_minimal_marginal_events(n: int, outcomes: int) -> List[List[List[in
 # =========================
 # One-hot lex helpers (for group action on events)
 # =========================
-@njit(int64[:](int64[:], int64), cache=True, fastmath=True)
+@njit(types.boolean[:](uint8[:], int64), cache=True, fastmath=True)
 def to_lex_representation(evt: np.ndarray, outcomes: int) -> np.ndarray:
     """Compact event -> one-hot lex vector (length n^2 * outcomes)."""
     n2 = evt.shape[0]
-    lex = np.zeros(n2 * outcomes, dtype=np.int64)
-    idx = evt + outcomes * np.arange(n2, dtype=np.int64)
+    lex = np.zeros(n2 * outcomes, dtype=np.bool_)
+    base = np.uint16(outcomes)
+    idx = evt + base * np.arange(n2, dtype=np.uint16)
     # Assumes 0 <= evt[s] < outcomes for all s.
     for s in range(n2):
         lex[idx[s]] = 1
     return lex
 
-@njit(int64[:](int64[:], int64), cache=True, fastmath=True)
+@njit(uint8[:](types.boolean[:], int64), cache=True, fastmath=True)
 def from_lex_representation(lex_evt: np.ndarray, outcomes: int) -> np.ndarray:
     """One-hot lex vector -> compact event."""
     lex_evt = np.ascontiguousarray(lex_evt)
     n2 = lex_evt.shape[0] // outcomes
-    evt = np.empty(n2, dtype=np.int64)
+    evt = np.empty(n2, dtype=np.uint8)
     blocks = lex_evt.reshape(n2, outcomes)
     # Assumes length is divisible by outcomes and blocks are one-hot.
     for s in range(n2):
@@ -273,21 +274,21 @@ def prepare_group_chain(G: PermutationGroup, N: int) -> NumbaList:
     """
     G.schreier_sims()
     level_invperms = NumbaList()
+    if N <= np.iinfo(np.uint8).max:
+        perm_dtype = np.uint8
+    else:
+        perm_dtype = np.uint16
     for orbits, trans in zip(G.basic_orbits, G.basic_transversals):
-        invperm_matrix = np.empty((len(orbits), N), dtype=np.int64)
+        invperm_matrix = np.empty((len(orbits), N), dtype=perm_dtype)
         for i, u in enumerate(orbits):
-            perm_arr = np.array(trans[u].array_form, dtype=np.int64)
+            perm_arr = np.array(trans[u].array_form, dtype=perm_dtype)
             invperm = np.empty_like(perm_arr)
             invperm[perm_arr] = np.arange(perm_arr.size, dtype=perm_arr.dtype)
             invperm_matrix[i] = invperm
         level_invperms.append(invperm_matrix)
     return level_invperms
 
-_LEVEL_INVPERMS_ITEM = types.Array(types.int64, 2, "C")
-_LEVEL_INVPERMS_TYPE = types.ListType(_LEVEL_INVPERMS_ITEM)
-_LEXMIN_RET_TYPE = types.Tuple((int64[:], int64))
-
-@njit(_LEXMIN_RET_TYPE(int64[:], _LEVEL_INVPERMS_ITEM), cache=True, fastmath=True)
+@njit(cache=True, fastmath=True)
 def lexmin_with_invperms(current: np.ndarray, invperms: np.ndarray) -> Tuple[np.ndarray, int]:
     """Return lex-min vector and its index using inverse-permutation matrix."""
     m, n = invperms.shape
@@ -306,7 +307,7 @@ def lexmin_with_invperms(current: np.ndarray, invperms: np.ndarray) -> Tuple[np.
         best_vec[j] = current[invperms[best_idx, j]]
     return best_vec, best_idx
 
-@njit(int64[:](int64[:], int64, _LEVEL_INVPERMS_TYPE), cache=True, fastmath=True)
+@njit(cache=True, fastmath=True)
 def canonical_leximin_coset_chain(
     evt: np.ndarray,
     outcomes: int,
@@ -318,7 +319,7 @@ def canonical_leximin_coset_chain(
     """
     x = to_lex_representation(evt, outcomes)
     # witness permutation (inverse array) and current best image
-    current_invperm = np.arange(len(x), dtype=np.int64)
+    current_invperm = np.arange(len(x), dtype=level_invperms[0].dtype)
     best_vec = x
 
     # walk the chain
@@ -408,12 +409,12 @@ def representatives_of_global_extensions(
     # build remaining indices
     Nslots = n * n
     fixed_idx = np.fromiter(fixed.keys(), dtype=np.int64)
-    fixed_val = np.fromiter(fixed.values(), dtype=np.int64)
+    fixed_val = np.fromiter(fixed.values(), dtype=np.uint8)
     mask = np.ones(Nslots, dtype=bool)
     mask[fixed_idx] = False
     remaining = np.nonzero(mask)[0]
     # build base event (fixed slots set once)
-    evt = np.zeros(Nslots, dtype=np.int64)
+    evt = np.zeros(Nslots, dtype=np.uint8)
     if fixed_idx.size:
         evt[fixed_idx] = fixed_val
     # iterate assignments without copying
@@ -476,6 +477,8 @@ def run_pipeline(
 
     # group acts on one-hot coordinates of size N = n^2 * outcomes
     N = (n * n) * outcomes
+    if N > np.iinfo(np.uint16).max:
+        raise ValueError("N exceeds uint16 range; use wider dtype for permutations")
     G = build_sympy_group(raw_G, N)
     level_invperms = prepare_group_chain(G, N)
 
@@ -570,7 +573,7 @@ if __name__ == "__main__":
     import itertools
     from inflation.lp.lp_utils import solveLP_sparse
     # Example: n=2, outcomes=4
-    n, outcomes = 3, 4
+    n, outcomes = 4, 4
     # One small example group on N = n^2 * outcomes = 4 * 4 = 16 coordinates:
     #   - identity
     #   - swap within each outcome block of the four operator slots (toy example)
