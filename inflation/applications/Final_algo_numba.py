@@ -14,7 +14,7 @@
 # -------------------------------------------------------------------
 
 from __future__ import annotations
-from typing import List, Tuple, Dict, Iterable, Union
+from typing import List, Tuple, Dict, Iterable, Union, DefaultDict
 from functools import lru_cache
 from math import ldexp
 from pathlib import Path
@@ -389,8 +389,12 @@ def representatives_of_global_extensions(
     marginal: List[List[int]],
     *,
     level_invperms: NumbaList,
+    global_event_map: DefaultDict[bytes, int],
+    next_event_idx: int,
+    list_of_all_LP_variables: List[str],
+    total: int,
     show_progress: bool = True,
-) -> List[np.ndarray]:
+) -> Tuple[np.ndarray, int]:
     """
     Iterate global extensions of 'marginal', canonicalize each under the group.
     """
@@ -414,18 +418,38 @@ def representatives_of_global_extensions(
         evt[fixed_idx] = fixed_val
     # iterate assignments without copying
     if remaining.size == 0:
-        return [canonical_leximin_coset_chain(evt, outcomes, level_invperms)]
-    reps = []
-    total = outcomes ** remaining.size
-    for combo in tqdm(product(range(outcomes), repeat=remaining.size),
+        canon = canonical_leximin_coset_chain(evt, outcomes, level_invperms)
+        event_key = canon.tobytes()
+        event_idx = global_event_map[event_key]
+        if event_idx == 0:
+            event_idx = next_event_idx
+            next_event_idx += 1
+            global_event_map[event_key] = event_idx
+            list_of_all_LP_variables.append("P_global("+",".join(map(str, canon))+")")
+        reps = np.empty(1, dtype=np.int64)
+        reps[0] = event_idx
+        return reps, next_event_idx
+    reps = np.empty(total, dtype=np.int64)
+    if show_progress:
+        combos = tqdm(product(range(outcomes), repeat=remaining.size),
                       total=total,
                       desc="Canonicalizing globals...",
-                      disable=not show_progress,
                       leave=True,
-                      position=0):
+                      position=0)
+    else:
+        combos = product(range(outcomes), repeat=remaining.size)
+    for pos, combo in enumerate(combos):
         evt[remaining] = combo
-        reps.append(canonical_leximin_coset_chain(evt, outcomes, level_invperms))
-    return reps
+        canon = canonical_leximin_coset_chain(evt, outcomes, level_invperms)
+        event_key = canon.tobytes()
+        event_idx = global_event_map[event_key]
+        if event_idx == 0:
+            event_idx = next_event_idx
+            next_event_idx += 1
+            global_event_map[event_key] = event_idx
+            list_of_all_LP_variables.append("P_global("+",".join(map(str, canon))+")")
+        reps[pos] = event_idx
+    return reps, next_event_idx
 
 
 # =========================
@@ -456,10 +480,22 @@ def run_pipeline(
     list_of_all_LP_variables = ["1"]
     marginals = generate_minimal_marginal_events(n, outcomes)
 
-    list_of_global_expansions = []
-    sparse_matrix_rows = []
-    sparse_matrix_cols = []
-    sparse_matrix_data = []
+    nof_marginals = len(marginals)
+    global_event_map: DefaultDict[bytes, int] = defaultdict(int)
+    next_event_idx = 1 + nof_marginals
+    global_extension_counts = np.empty(nof_marginals, dtype=np.int64)
+    for row_num, marginal in enumerate(marginals):
+        fixed_slots = {(i - 1) * n + (j - 1) for (_, i, j, _, _) in marginal}
+        remaining_size = n * n - len(fixed_slots)
+        global_extension_counts[row_num] = pow(outcomes, remaining_size)
+
+    total_entries = int(nof_marginals + global_extension_counts.sum())
+    sparse_matrix_rows = np.empty(total_entries, dtype=int)
+    sparse_matrix_cols = np.empty(total_entries, dtype=int)
+    sparse_matrix_data = np.ones(total_entries, dtype=float)
+    sparse_matrix_rows[:nof_marginals] = np.arange(nof_marginals, dtype=int)
+    sparse_matrix_cols[:nof_marginals] = np.arange(1, nof_marginals + 1, dtype=int)
+    sparse_matrix_data[:nof_marginals] = -1.0
 
     # result = []
     # LOOP 0: Compute the marginal probabilities
@@ -474,41 +510,28 @@ def run_pipeline(
         known_values_dict[mkey] = val
         # e1 = {mkey: val}
 
-    # LOOP 1: Create the dictionaries of global events and their counts
-    for marginal in tqdm(marginals, desc="Finding global extensions...",
-                         disable=not show_progress):
-        list_of_global_expansions.append(
-            representatives_of_global_extensions(
-                n,
-                outcomes,
-                marginal,
-                level_invperms=level_invperms,
-                show_progress=show_progress,
-            ))
-
-    # LOOP 2: Convert canonical global events and their counts to sparse arrays
-    global_event_to_idx_dict = defaultdict(int)
-    nof_marginals = len(marginals)
-    idx = 1 + nof_marginals
-    for row_num, global_expansion in enumerate(list_of_global_expansions):
-        for event_tuple in map(tuple, global_expansion):
-            event_idx = global_event_to_idx_dict[event_tuple]
-            if event_idx == 0:
-                list_of_all_LP_variables.append("P_global("+",".join(map(str,event_tuple))+")")
-                event_idx = idx
-                global_event_to_idx_dict[event_tuple] = event_idx
-                idx += 1
-            sparse_matrix_rows.append(row_num)
-            sparse_matrix_cols.append(event_idx)
-            sparse_matrix_data.append(1)
-    sparse_matrix_rows = np.hstack((np.arange(nof_marginals, dtype=int),
-                                   np.array(sparse_matrix_rows, dtype=int)))
-    sparse_matrix_cols = np.hstack((np.arange(1,nof_marginals+1, dtype=int),
-                                   np.array(sparse_matrix_cols, dtype=int)))
-    sparse_matrix_data = np.hstack((-np.ones(nof_marginals, dtype=int),
-                                   np.array(sparse_matrix_data, dtype=float)))
+    # LOOP 1+2: Canonicalize globals and build sparse arrays on the fly
+    start = nof_marginals
+    for row_num, marginal in enumerate(tqdm(marginals, desc="Finding global extensions...",
+                                           disable=not show_progress)):
+        total = int(global_extension_counts[row_num])
+        global_expansion, next_event_idx = representatives_of_global_extensions(
+            n,
+            outcomes,
+            marginal,
+            level_invperms=level_invperms,
+            global_event_map=global_event_map,
+            next_event_idx=next_event_idx,
+            list_of_all_LP_variables=list_of_all_LP_variables,
+            total=total,
+            show_progress=show_progress,
+        )
+        finish = start + total
+        sparse_matrix_rows[start:finish] = row_num
+        sparse_matrix_cols[start:finish] = global_expansion
+        start = finish
     inflation_matrix = coo_array((sparse_matrix_data, (sparse_matrix_rows, sparse_matrix_cols)),
-                          shape=(nof_marginals, idx))
+                          shape=(nof_marginals, next_event_idx))
     inflation_matrix.sum_duplicates()
 
     return known_values_dict, inflation_matrix, list_of_all_LP_variables
