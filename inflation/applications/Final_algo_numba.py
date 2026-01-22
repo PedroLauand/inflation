@@ -394,8 +394,10 @@ def representatives_of_global_extensions(
     next_event_idx: int,
     list_of_all_LP_variables: List[str],
     total: int,
+    sparse_matrix_cols: np.ndarray,
+    start: int,
     show_progress: bool = True,
-) -> Tuple[np.ndarray, int]:
+) -> int:
     """
     Iterate global extensions of 'marginal', canonicalize each under the group.
     """
@@ -427,10 +429,8 @@ def representatives_of_global_extensions(
             next_event_idx += 1
             global_event_map[event_key] = event_idx
             list_of_all_LP_variables.append("P_global("+",".join(map(str, canon))+")")
-        reps = np.empty(1, dtype=np.int32)
-        reps[0] = event_idx
-        return reps, next_event_idx
-    reps = np.empty(total, dtype=np.int32)
+        sparse_matrix_cols[start] = event_idx
+        return next_event_idx
     if show_progress:
         combos = tqdm(product(range(outcomes), repeat=remaining.size),
                       total=total,
@@ -449,8 +449,8 @@ def representatives_of_global_extensions(
             next_event_idx += 1
             global_event_map[event_key] = event_idx
             list_of_all_LP_variables.append("P_global("+",".join(map(str, canon))+")")
-        reps[pos] = event_idx
-    return reps, next_event_idx
+        sparse_matrix_cols[start + pos] = event_idx
+    return next_event_idx
 
 
 # =========================
@@ -520,7 +520,7 @@ def run_pipeline(
     for row_num, marginal in enumerate(tqdm(marginals, desc="Finding global extensions...",
                                            disable=not show_progress)):
         total = int(global_extension_counts[row_num])
-        global_expansion, next_event_idx = representatives_of_global_extensions(
+        next_event_idx = representatives_of_global_extensions(
             n,
             outcomes,
             marginal,
@@ -529,11 +529,12 @@ def run_pipeline(
             next_event_idx=next_event_idx,
             list_of_all_LP_variables=list_of_all_LP_variables,
             total=total,
+            sparse_matrix_cols=sparse_matrix_cols,
+            start=start,
             show_progress=show_progress,
         )
         finish = start + total
         sparse_matrix_rows[start:finish] = row_num
-        sparse_matrix_cols[start:finish] = global_expansion
         start = finish
     if next_event_idx > np.iinfo(np.int32).max:
         raise ValueError("next_event_idx exceeds int32 range; use wider dtype")
