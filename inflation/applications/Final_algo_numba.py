@@ -426,10 +426,10 @@ def representatives_of_global_extensions(
             next_event_idx += 1
             global_event_map[event_key] = event_idx
             list_of_all_LP_variables.append("P_global("+",".join(map(str, canon))+")")
-        reps = np.empty(1, dtype=np.int64)
+        reps = np.empty(1, dtype=np.int32)
         reps[0] = event_idx
         return reps, next_event_idx
-    reps = np.empty(total, dtype=np.int64)
+    reps = np.empty(total, dtype=np.int32)
     if show_progress:
         combos = tqdm(product(range(outcomes), repeat=remaining.size),
                       total=total,
@@ -471,6 +471,8 @@ def run_pipeline(
     n = prob.inflation_level_per_source[0]
     outcomes = prob.outcomes_per_party[0]
     raw_G = prob.symmetries
+    if outcomes >= 255:
+        raise ValueError("outcomes must be < 255 to fit in compact dtypes")
 
     # group acts on one-hot coordinates of size N = n^2 * outcomes
     N = (n * n) * outcomes
@@ -490,12 +492,12 @@ def run_pipeline(
         global_extension_counts[row_num] = pow(outcomes, remaining_size)
 
     total_entries = int(nof_marginals + global_extension_counts.sum())
-    sparse_matrix_rows = np.empty(total_entries, dtype=int)
-    sparse_matrix_cols = np.empty(total_entries, dtype=int)
-    sparse_matrix_data = np.ones(total_entries, dtype=float)
-    sparse_matrix_rows[:nof_marginals] = np.arange(nof_marginals, dtype=int)
-    sparse_matrix_cols[:nof_marginals] = np.arange(1, nof_marginals + 1, dtype=int)
-    sparse_matrix_data[:nof_marginals] = -1.0
+    sparse_matrix_rows = np.empty(total_entries, dtype=np.int32)
+    sparse_matrix_cols = np.empty(total_entries, dtype=np.int32)
+    sparse_matrix_data = np.ones(total_entries, dtype=np.int8)
+    sparse_matrix_rows[:nof_marginals] = np.arange(nof_marginals, dtype=np.int32)
+    sparse_matrix_cols[:nof_marginals] = np.arange(1, nof_marginals + 1, dtype=np.int32)
+    sparse_matrix_data[:nof_marginals] = -1
 
     # result = []
     # LOOP 0: Compute the marginal probabilities
@@ -530,6 +532,8 @@ def run_pipeline(
         sparse_matrix_rows[start:finish] = row_num
         sparse_matrix_cols[start:finish] = global_expansion
         start = finish
+    if next_event_idx > np.iinfo(np.int32).max:
+        raise ValueError("next_event_idx exceeds int32 range; use wider dtype")
     inflation_matrix = coo_array((sparse_matrix_data, (sparse_matrix_rows, sparse_matrix_cols)),
                           shape=(nof_marginals, next_event_idx))
     inflation_matrix.sum_duplicates()
@@ -566,7 +570,7 @@ if __name__ == "__main__":
     import itertools
     from inflation.lp.lp_utils import solveLP_sparse
     # Example: n=2, outcomes=4
-    n, outcomes = 4, 4
+    n, outcomes = 3, 4
     # One small example group on N = n^2 * outcomes = 4 * 4 = 16 coordinates:
     #   - identity
     #   - swap within each outcome block of the four operator slots (toy example)
