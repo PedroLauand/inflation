@@ -48,6 +48,19 @@ def canonical_order(coo_mat: coo_array):
     coo_mat.data = np.asarray(coo_mat.data)[order]
     return coo_mat
 
+def _signed_index_dtype(max_index: int) -> np.dtype:
+    dtype = np.dtype(np.min_scalar_type(max_index))
+    if dtype.kind == "u":
+        dtype = np.dtype(f"int{dtype.itemsize * 8}")
+    return dtype
+
+def _ensure_index_dtype(coo_mat: coo_array, idx_dtype: np.dtype) -> coo_array:
+    if coo_mat.row.dtype != idx_dtype:
+        coo_mat.row = coo_mat.row.astype(idx_dtype, copy=False)
+    if coo_mat.col.dtype != idx_dtype:
+        coo_mat.col = coo_mat.col.astype(idx_dtype, copy=False)
+    return coo_mat
+
 def solveLP(objective: Union[coo_array, Dict] = None,
             known_vars: Union[coo_array, Dict] = None,
             semiknown_vars: Dict = None,
@@ -251,17 +264,20 @@ def solveLP_sparse(objective: coo_array = blank_coo_array,
 
             (nof_primal_constraints, nof_primal_variables) = constraints.shape
             nof_known_vars = known_vars.nnz
+            max_size = max(nof_primal_constraints, nof_primal_variables, nof_known_vars * 2, 1)
+            idx_dtype = _signed_index_dtype(max_size - 1)
 
             # Initialize b vector (RHS of constraints)
             b = [0] * nof_primal_constraints
 
             if relax_inequalities:
+                constraints = _ensure_index_dtype(constraints, idx_dtype)
                 # Add slack variable lambda to each inequality
                 cons_row = np.hstack(
-                    (constraints.row, np.arange(nof_primal_inequalities)))
+                    (constraints.row, np.arange(nof_primal_inequalities, dtype=idx_dtype)))
                 cons_col = np.hstack(
-                    (constraints.col, np.repeat(nof_primal_variables,
-                                                nof_primal_inequalities)))
+                    (constraints.col, np.full(nof_primal_inequalities,
+                                              nof_primal_variables, dtype=idx_dtype)))
                 cons_data = np.hstack(
                     (constraints.data, np.repeat(1, nof_primal_inequalities)))
                 constraints = coo_array((cons_data, (cons_row, cons_col)),
@@ -269,13 +285,14 @@ def solveLP_sparse(objective: coo_array = blank_coo_array,
                                                 nof_primal_variables + 1))
 
             if relax_known_vars:
+                known_vars = _ensure_index_dtype(known_vars, idx_dtype)
                 # Each known value is replaced by two inequalities with slacks
                 kv_row = np.tile(
-                    np.arange(nof_known_vars * 2),
+                    np.arange(nof_known_vars * 2, dtype=idx_dtype),
                     2)
                 kv_col = np.hstack((
                     np.tile(known_vars.col, 2),
-                    np.broadcast_to(nof_primal_variables, nof_known_vars * 2)
+                    np.full(nof_known_vars * 2, nof_primal_variables, dtype=idx_dtype)
                 ))
                 kv_data = np.hstack((
                     np.broadcast_to(1, nof_known_vars * 3),
@@ -291,7 +308,7 @@ def solveLP_sparse(objective: coo_array = blank_coo_array,
                 b = np.hstack((b, np.tile(known_vars.data, 2)))
             else:
                 # Add known values as equalities to the constraint matrix
-                kv_matrix = expand_sparse_vec(known_vars)
+                kv_matrix = expand_sparse_vec(known_vars, idx_dtype=idx_dtype)
                 b = np.hstack((b, known_vars.data))
                 nof_primal_equalities += nof_known_vars
 
@@ -307,6 +324,7 @@ def solveLP_sparse(objective: coo_array = blank_coo_array,
             if verbose > 1:
                 print("Proceeding with primal initialization...")
 
+            constraints = _ensure_index_dtype(constraints, idx_dtype)
             matrix = constraints.tocsc(copy=False)
 
             if verbose > 1:
@@ -504,7 +522,8 @@ def streamprinter(text: str) -> None:
 
 
 def to_sparse(argument: Union[Dict, List[Dict]],
-              variables: List) -> coo_array:
+              variables: List,
+              idx_dtype: np.dtype | None = None) -> coo_array:
     """Convert a solver argument to a sparse matrix to pass to the solver.
     
     Parameters
@@ -524,18 +543,21 @@ def to_sparse(argument: Union[Dict, List[Dict]],
         var_to_idx = {x: i for i, x in enumerate(variables)}
         data = list(argument.values())
         keys = list(argument.keys())
-        col = partsextractor(var_to_idx, keys)
-        row = np.zeros(len(col), dtype=int)
+        col = np.asarray(partsextractor(var_to_idx, keys),
+                         dtype=idx_dtype if idx_dtype is not None else None)
+        row = np.zeros(len(col), dtype=idx_dtype if idx_dtype is not None else int)
         return coo_array((data, (row, col)), shape=(1, len(variables)))
     else:
         # Argument is a list of constraints
         row = []
         for i, cons in enumerate(argument):
             row.extend([i] * len(cons))
-        cols = [to_sparse(cons, variables).col for cons in argument]
+        cols = [to_sparse(cons, variables, idx_dtype=idx_dtype).col for cons in argument]
         col = [c for vec_col in cols for c in vec_col]
-        data = [to_sparse(cons, variables).data for cons in argument]
+        data = [to_sparse(cons, variables, idx_dtype=idx_dtype).data for cons in argument]
         data = [d for vec_data in data for d in vec_data]
+        row = np.asarray(row, dtype=idx_dtype if idx_dtype is not None else None)
+        col = np.asarray(col, dtype=idx_dtype if idx_dtype is not None else None)
         return coo_array((data, (row, col)),
                           shape=(len(argument), len(variables)))
 
@@ -567,7 +589,8 @@ def convert_dicts(semiknown_vars: Dict = None,
     args.update(kwargs)
 
     # Arguments converted from dictionaries to sparse matrices
-    sparse_args = {k: to_sparse(arg, variables) for k, arg in args.items()
+    idx_dtype = _signed_index_dtype(max(len(variables) - 1, 0))
+    sparse_args = {k: to_sparse(arg, variables, idx_dtype=idx_dtype) for k, arg in args.items()
                    if isinstance(arg, (dict, list)) and k != "semiknown_vars"
                    and k != "solverparameters" and k != "variables"}
 
@@ -576,10 +599,10 @@ def convert_dicts(semiknown_vars: Dict = None,
         nof_semiknown = len(semiknown_vars)
         nof_variables = len(variables)
         var_to_idx = {x: i for i, x in enumerate(variables)}
-        row = np.repeat(np.arange(nof_semiknown), 2)
+        row = np.repeat(np.arange(nof_semiknown, dtype=idx_dtype), 2)
         col = [(var_to_idx[x], var_to_idx[x2])
                for x, (c, x2) in semiknown_vars.items()]
-        col = list(sum(col, ()))
+        col = np.asarray(list(sum(col, ())), dtype=idx_dtype)
         data = [(1, -c) for x, (c, x2) in semiknown_vars.items()]
         data = list(sum(data, ()))
         semiknown_mat = coo_array((data, (row, col)),

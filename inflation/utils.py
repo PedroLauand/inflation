@@ -112,25 +112,31 @@ def partsextractor(thing_to_take_parts_of, indices) -> Tuple[int,...]:
 
 
 def expand_sparse_vec(sparse_vec: sps.coo_array,
-                      conversion_style: str = "eq") -> sps.coo_array:
+                      conversion_style: str = "eq",
+                      idx_dtype: np.dtype | None = None) -> sps.coo_array:
     """Expand a one-dimensional sparse matrix to its full form. Used to expand
     the solver arguments known_vars, lower_bounds, and upper_bounds."""
     assert conversion_style in {"eq", "lb", "ub"}, \
         "Conversion style must be `lb`, `ub`, or `eq`."
     nof_rows = sparse_vec.nnz
     nof_cols = sparse_vec.shape[1]
+    if idx_dtype is None:
+        max_index = max(nof_rows - 1, nof_cols - 1, 0)
+        idx_dtype = np.dtype(np.min_scalar_type(max_index))
+        if idx_dtype.kind == "u":
+            idx_dtype = np.dtype(f"int{idx_dtype.itemsize * 8}")
     if conversion_style == "eq":
         # Data values do not appear in '1' monomial column
-        row = np.arange(nof_rows)
-        col = sparse_vec.col
+        row = np.arange(nof_rows, dtype=idx_dtype)
+        col = sparse_vec.col.astype(idx_dtype, copy=False)
         data = np.ones(nof_rows)
     else:
         # Data values appear in '1' monomial column
         # Upper bound format: x <= a -> a - x >= 0
-        row = np.repeat(np.arange(nof_rows), 2)
+        row = np.repeat(np.arange(nof_rows, dtype=idx_dtype), 2)
         col = np.vstack((
-            sparse_vec.col,
-            np.zeros(nof_rows)  # Assumes '1' monomial is first column
+            sparse_vec.col.astype(idx_dtype, copy=False),
+            np.zeros(nof_rows, dtype=idx_dtype)  # Assumes '1' monomial is first column
         )).T.ravel()
         data = np.vstack((
             -np.ones(nof_rows),
