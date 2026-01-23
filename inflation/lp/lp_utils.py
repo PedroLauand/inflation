@@ -226,7 +226,7 @@ def solveLP_sparse(objective: coo_array = blank_coo_array,
             task.putintparam(mosek.iparam.sim_reformulation,
                              mosek.simreform.aggressive)
             task.putintparam(mosek.iparam.sim_switch_optimizer, mosek.onoffkey.on)
-            task.putintparam(mosek.iparam.optimizer, mosek.optimizertype.new_primal_simplex)
+            task.putintparam(mosek.iparam.optimizer, mosek.optimizertype.primal_simplex)
             if solve_dual:
                 task.putintparam(mosek.iparam.sim_solve_form,
                                  mosek.solveform.dual)
