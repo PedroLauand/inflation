@@ -10,7 +10,7 @@ import numpy as np
 import scipy.sparse as sps
 
 from itertools import chain
-from typing import Any, Dict, Iterable, List, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 from sys import stderr
 from operator import itemgetter
 from collections import deque
@@ -113,7 +113,7 @@ def partsextractor(thing_to_take_parts_of, indices) -> Tuple[int,...]:
 
 def expand_sparse_vec(sparse_vec: sps.coo_array,
                       conversion_style: str = "eq",
-                      idx_dtype: np.dtype | None = None) -> sps.coo_array:
+                      idx_dtype: Optional[np.dtype] = None) -> sps.coo_array:
     """Expand a one-dimensional sparse matrix to its full form. Used to expand
     the solver arguments known_vars, lower_bounds, and upper_bounds."""
     assert conversion_style in {"eq", "lb", "ub"}, \

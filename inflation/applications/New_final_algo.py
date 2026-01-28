@@ -17,7 +17,7 @@ from __future__ import annotations
 from collections import defaultdict, OrderedDict, Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from math import prod
-from typing import List, Tuple, Dict, Iterable, Union
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 from functools import lru_cache
 from math import ldexp
 import numpy as np
@@ -102,7 +102,7 @@ def _build_row_task(args):
 def run_pipeline_parallel(
     prob: InflationProblem,
     *,
-    max_workers: int | None = None,
+    max_workers: Optional[int] = None,
     chunksize: int = 1,
 ) -> Tuple[OrderedDict, coo_array, List[str]]:
     n = prob.inflation_level_per_source[0]
