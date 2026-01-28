@@ -27,7 +27,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 from inflation import InflationProblem
-from collections import defaultdict, OrderedDict
+from collections import defaultdict
 from tqdm.auto import tqdm
 from scipy.sparse import coo_array
 from numba import njit, int64, uint8, types
@@ -605,13 +605,9 @@ def run_pipeline(
     prob: InflationProblem,
     *,
     show_progress: bool = True,
-) -> Tuple[List[Dict], coo_array]:
+) -> Tuple[np.ndarray, coo_array, coo_array]:
     """
-    Build:
-      [
-        [ { marginal_tuple : value_float }, { canonical_global_rep_tuple : count_int ...} ],
-        ...
-      ]
+    Build the inflation matrix, known values vector, and variable names
     over all symmetry-reduced marginals for (n, outcomes).
     """
     n = prob.inflation_level_per_source[0]
@@ -621,7 +617,7 @@ def run_pipeline(
         raise ValueError("outcomes must be < 255 to fit in compact dtypes")
     assert n <= 5, "uint64 canonical events are only supported up to n=5"
     max_event_count = pow(outcomes, n * n)
-    assert max_event_count <= (1 << 64), "events do not fit in uint64"
+    assert max_event_count <= np.iinfo(np.uint64).max, "events do not fit in uint64"
 
     # group acts on one-hot coordinates of size N = n^2 * outcomes
     N = (n * n) * outcomes
@@ -636,38 +632,38 @@ def run_pipeline(
     nof_marginals = len(marginals)
     global_event_map = NumbaDict.empty(key_type=types.uint64, value_type=types.int32)
     next_event_idx = np.int32(1 + nof_marginals)
-    global_extension_counts = np.empty(nof_marginals, dtype=np.int64)
-    for row_num, marginal in enumerate(marginals):
-        fixed_slots = {(i - 1) * n + (j - 1) for (_, i, j, _, _) in marginal}
-        remaining_size = n * n - len(fixed_slots)
-        global_extension_counts[row_num] = pow(outcomes, remaining_size)
-
-    total_entries = int(nof_marginals + global_extension_counts.sum())
+    global_extension_count = int(pow(outcomes, n * (n - 1)))
+    total_entries = int(nof_marginals * (1 + global_extension_count))
     sparse_matrix_rows = np.empty(total_entries, dtype=np.int32)
     sparse_matrix_cols = np.empty(total_entries, dtype=np.int32)
     sparse_matrix_data = np.ones(total_entries, dtype=np.int8)
     sparse_matrix_rows[:nof_marginals] = np.arange(nof_marginals, dtype=np.int32)
     sparse_matrix_cols[:nof_marginals] = np.arange(1, nof_marginals + 1, dtype=np.int32)
     sparse_matrix_data[:nof_marginals] = -1
+    # Broadcast to build row indices for all global extensions without a per-row loop.
+    row_grid = np.broadcast_to(
+        np.arange(nof_marginals, dtype=np.int32)[:, None],
+        (nof_marginals, global_extension_count),
+    )
+    sparse_matrix_rows[nof_marginals:] = row_grid.reshape(-1)
 
     # result = []
     # LOOP 0: Compute the marginal probabilities
-    known_values_dict = OrderedDict()
-    for marginal in tqdm(marginals, desc="Computing marginal values...",
-                         disable=not show_progress):
+    known_values = np.empty(nof_marginals, dtype=float)
+    for idx, marginal in enumerate(
+        tqdm(marginals, desc="Computing marginal values...", disable=not show_progress)
+    ):
         # --- your existing body per marginal ---
         val = factorized_marginal_value(marginal)  ## This computes the numeric probabilities
         mkey = tuple(prob._lexrepr_to_names[prob.mon_to_lexrepr(marginal)])
         # mkey = tuple(tuple(x) for x in marginal)
         list_of_all_LP_variables.append("P_global("+",".join(mkey)+")")
-        known_values_dict[mkey] = val
-        # e1 = {mkey: val}
+        known_values[idx] = val
 
     # LOOP 1+2: Canonicalize globals and build sparse arrays on the fly
-    start = nof_marginals
     for row_num, marginal in enumerate(tqdm(marginals, desc="Finding global extensions...",
                                            disable=not show_progress)):
-        total = int(global_extension_counts[row_num])
+        start = nof_marginals + row_num * global_extension_count
         next_event_idx = representatives_of_global_extensions_uint64(
             n=n,
             outcomes=outcomes,
@@ -676,49 +672,28 @@ def run_pipeline(
             global_event_map=global_event_map,
             next_event_idx=next_event_idx,
             list_of_all_LP_variables=list_of_all_LP_variables,
-            total=total,
+            total=global_extension_count,
             sparse_matrix_cols=sparse_matrix_cols,
             start=start,
         )
-        finish = start + total
-        sparse_matrix_rows[start:finish] = row_num
-        start = finish
     if int(next_event_idx) > np.iinfo(np.int32).max:
         raise ValueError("next_event_idx exceeds int32 range; use wider dtype")
     inflation_matrix = coo_array((sparse_matrix_data, (sparse_matrix_rows, sparse_matrix_cols)),
                           shape=(nof_marginals, int(next_event_idx)))
     inflation_matrix.sum_duplicates()
 
-    return known_values_dict, inflation_matrix, list_of_all_LP_variables
+    known_positions = np.arange(1, nof_marginals + 1, dtype=np.int32)
+    known_rows = np.broadcast_to(np.int32(0), (nof_marginals,))
+    known_vars_coo_vec = coo_array((known_values, (known_rows, known_positions)),
+                                   shape=(1, int(next_event_idx)))
+    variable_names = np.asarray(list_of_all_LP_variables, dtype=str)
 
-"""# ---- inside run_pipeline, after you compute `marginals` ----
-marginals = generate_minimal_marginal_events(n, outcomes)
-total = len(marginals)
-bar_width = 30
-
-result = []
-for idx, marginal in enumerate(marginals, start=1):
-    # progress bar
-    filled = int(bar_width * idx / total)
-    bar = "#" * filled + "-" * (bar_width - filled)
-    pct = (idx * 100) // total
-    print(f"\r[{bar}] {pct:3d}%  {idx}/{total} marginals", end="", flush=True)
-
-    # --- your existing body per marginal ---
-    val = factorized_marginal_value(marginal)
-    mkey = tuple(tuple(x) for x in marginal)
-    e1 = {mkey: val}
-    e2 = representatives_of_global_extensions(n, outcomes, marginal, precomp=precomp)
-    result.append([e1, e2])
-
-print()  # newline after finishing the bar
-return result"""
+    return variable_names, known_vars_coo_vec, inflation_matrix
 
 # =========================
 # Example of usage
 # =========================
 if __name__ == "__main__":
-    import itertools
     from inflation.lp.lp_utils import solveLP_sparse
     # Example: n=2, outcomes=4
     n, outcomes = 4, 4
@@ -731,22 +706,55 @@ if __name__ == "__main__":
     print("done with prob")
 
     
-    knowns_dict, inflation_matrix, list_of_LP_variables = run_pipeline(prob)
+    def _save_cache(path: Path,
+                    variable_names: np.ndarray,
+                    known_vars_coo_vec: coo_array,
+                    inflation_matrix: coo_array) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            path,
+            inflation_matrix_columns_indices=inflation_matrix.col,
+            inflation_matrix_row_indices=inflation_matrix.row,
+            inflation_matrix_data_entries=inflation_matrix.data,
+            variable_names=variable_names,
+            known_values=known_vars_coo_vec.data,
+            known_positions=known_vars_coo_vec.col,
+        )
 
+    def _load_cache(path: Path) -> Tuple[np.ndarray, coo_array, coo_array]:
+        with np.load(path, allow_pickle=False) as z:
+            row_idx = z["inflation_matrix_row_indices"]
+            col_idx = z["inflation_matrix_columns_indices"]
+            data = z["inflation_matrix_data_entries"]
+            n_rows = int(np.max(row_idx)) + 1 if row_idx.size else 0
+            n_cols = int(np.max(col_idx)) + 1 if col_idx.size else 0
+            inflation_shape = (n_rows, n_cols)
+            inflation_matrix = coo_array((data, (row_idx, col_idx)), shape=inflation_shape)
+            known_positions = z["known_positions"]
+            known_values = z["known_values"]
+            if known_values.size == 0:
+                known_vars_coo_vec = coo_array((1, inflation_shape[1]), dtype=float)
+            else:
+                known_rows = np.broadcast_to(
+                    np.array(0, dtype=known_positions.dtype),
+                    known_positions.shape,
+                )
+                known_vars_coo_vec = coo_array((known_values, (known_rows, known_positions)),
+                                               shape=(1, inflation_shape[1]))
+            variable_names = z["variable_names"]
+            return variable_names, known_vars_coo_vec, inflation_matrix
 
-    def convert_known_dict_to_sparse(known_values_dict: OrderedDict, nof_variables_total: int):
-        data = np.array(list(known_values_dict.values()), dtype=float)
-        nof_marginals = len(data)
-        row = np.zeros(nof_marginals, dtype=int)
-        col = np.arange(1, nof_marginals+1, dtype=int)
-        # data = list(itertools.chain.from_iterable(marginals_dict.keys() for marginals_dict in marginals_dicts))
-        return coo_array((data, (row, col)), shape=(1, nof_variables_total))
+    cache_dir = Path(__file__).resolve().parent / "cache"
+    cache_path = cache_dir / f"lp_cache_n{n}_o{outcomes}.npz"
 
-    nof_known, nof_all_LP_vars = inflation_matrix.shape
-    known_vars_coo_vec = convert_known_dict_to_sparse(knowns_dict, nof_all_LP_vars)
+    if cache_path.exists():
+        print(f"Loading cached LP constraints from {cache_path}")
+        variable_names, known_vars_coo_vec, inflation_matrix = _load_cache(cache_path)
+    else:
+        variable_names, known_vars_coo_vec, inflation_matrix = run_pipeline(prob)
+        _save_cache(cache_path, variable_names, known_vars_coo_vec, inflation_matrix)
 
-    for k, v in knowns_dict.items():
-        print(f"{k}: {v}")
+    nof_all_LP_vars = inflation_matrix.shape[1]
     # # Print a small summary
     # for idx, (e1, e2) in enumerate(out):
     #     print(f"\nItem {idx}:")
@@ -763,7 +771,7 @@ if __name__ == "__main__":
                               known_vars=known_vars_coo_vec,
                               equalities=inflation_matrix,
                               default_non_negative=True,
-                              variables=list_of_LP_variables,
+                              variables=variable_names,
                               verbose=True)
 
     print(solution["status"])

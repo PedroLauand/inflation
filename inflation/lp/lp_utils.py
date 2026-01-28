@@ -66,7 +66,7 @@ def solveLP(objective: Union[coo_array, Dict] = None,
             semiknown_vars: Dict = None,
             inequalities: Union[coo_array, List[Dict]] = None,
             equalities: Union[coo_array, List[Dict]] = None,
-            variables: List = None,
+            variables: Union[List, np.ndarray] = None,
             **kwargs
             ) -> Dict:
     """Wrapper function that converts all dictionaries to sparse matrices to
@@ -154,7 +154,7 @@ def solveLP_sparse(objective: coo_array = blank_coo_array,
                    relax_inequalities: bool = False,
                    verbose: int = 0,
                    solverparameters: Dict = None,
-                   variables: List = None
+                   variables: Union[List, np.ndarray] = None
                    ) -> Dict:
     """Internal function to solve an LP with the Mosek Optimizer API using
     sparse matrices. Columns of each matrix correspond to a fixed order of
@@ -389,6 +389,20 @@ def solveLP_sparse(objective: coo_array = blank_coo_array,
             numvar = nof_primal_variables
             if verbose > 1:
                 print("Starting task.inputdata in Mosek...")
+            use_64 = (
+                numcon > np.iinfo(np.int32).max
+                or numvar > np.iinfo(np.int32).max
+                or matrix.indptr.dtype.itemsize > 4
+                or matrix.indices.dtype.itemsize > 4
+            )
+            if use_64:
+                aptrb = array("q", matrix.indptr[:-1].astype(np.int64, copy=False))
+                aptre = array("q", matrix.indptr[1:].astype(np.int64, copy=False))
+                asub = array("q", matrix.indices.astype(np.int64, copy=False))
+            else:
+                aptrb = array("i", matrix.indptr[:-1].astype(np.int32, copy=False))
+                aptre = array("i", matrix.indptr[1:].astype(np.int32, copy=False))
+                asub = array("i", matrix.indices.astype(np.int32, copy=False))
             task.inputdata(# maxnumcon=
                            numcon,
                            # maxnumvar=
@@ -398,11 +412,11 @@ def solveLP_sparse(objective: coo_array = blank_coo_array,
                            # cfix=
                            0,
                            # aptrb=
-                           matrix.indptr[:-1],
+                           aptrb,
                            # aptre=
-                           matrix.indptr[1:],
+                           aptre,
                            # asub=
-                           array("i", matrix.indices),
+                           asub,
                            # aval=
                            matrix.data,
                            bkc,
