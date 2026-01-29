@@ -14,7 +14,7 @@
 # -------------------------------------------------------------------
 
 from __future__ import annotations
-from typing import List, Tuple, Dict, Iterable, Union, DefaultDict
+from typing import List, Tuple, Dict, Iterable, Union
 from functools import lru_cache
 from math import ldexp
 from pathlib import Path
@@ -311,32 +311,6 @@ def lexmin_with_invperms(current: np.ndarray, invperms: np.ndarray) -> Tuple[np.
     return best_vec, best_idx
 
 @njit(cache=True, fastmath=True)
-def canonical_leximin_coset_chain(
-    evt: np.ndarray,
-    outcomes: int,
-    level_invperms: NumbaList,
-) -> np.ndarray:
-    """
-    Canonical representative of 'evt' under G using the stabilizer chain:
-    scans transversal reps at each level to minimize lex-image in one-hot space.
-    """
-    x = to_lex_representation(evt, outcomes)
-    # witness permutation (inverse array) and current best image
-    current_invperm = np.arange(len(x), dtype=level_invperms[0].dtype)
-    best_vec = x
-
-    # walk the chain
-    levels = len(level_invperms)
-    for k in range(levels):
-        current = x[current_invperm]
-        invperm_matrix = level_invperms[k]
-        cand_vec, cand_idx = lexmin_with_invperms(current, invperm_matrix)
-        current_invperm = current_invperm[invperm_matrix[cand_idx]]
-        best_vec = cand_vec
-    rep_evt = from_lex_representation(best_vec, outcomes)
-    return rep_evt
-
-@njit(cache=True, fastmath=True)
 def canonical_leximin_coset_chain_uint64(
     evt: np.ndarray,
     outcomes: int,
@@ -477,78 +451,6 @@ def factorized_marginal_value(marginal: List[List[int]]) -> float:
         cyc_out = [a[i - 1] for i in cyc]
         val *= loop_prob_event(cyc_out)
     return val
-
-# =========================
-# Canonicalize & count representatives of global extensions
-# =========================
-# Deprecated: kept for reference only (uint64 path used).
-def representatives_of_global_extensions(
-    n: int,
-    outcomes: int,
-    marginal: List[List[int]],
-    level_invperms: NumbaList,
-    global_event_map: DefaultDict[bytes, int],
-    next_event_idx: int,
-    list_of_all_LP_variables: List[str],
-    total: int,
-    sparse_matrix_cols: np.ndarray,
-    start: int,
-    show_progress: bool,
-) -> int:
-    """
-    Iterate global extensions of 'marginal', canonicalize each under the group.
-    Modifies global_event_map, sparse_matrix_cols, list_of_all_LP_variables.
-    """
-    # fixed slots
-    fixed: Dict[int, int] = {}
-    for (one, i, j, zero, a) in marginal:
-        si = (i - 1) * n + (j - 1)
-        if si in fixed and fixed[si] != a:
-            return next_event_idx
-        fixed[si] = a
-    # build remaining indices
-    Nslots = n * n
-    fixed_idx = np.fromiter(fixed.keys(), dtype=np.int64)
-    fixed_val = np.fromiter(fixed.values(), dtype=np.uint8)
-    mask = np.ones(Nslots, dtype=bool)
-    mask[fixed_idx] = False
-    remaining = np.nonzero(mask)[0]
-    # build base event (fixed slots set once)
-    evt = np.zeros(Nslots, dtype=np.uint8)
-    if fixed_idx.size:
-        evt[fixed_idx] = fixed_val
-    # iterate assignments without copying
-    if remaining.size == 0:
-        canon = canonical_leximin_coset_chain(evt, outcomes, level_invperms)
-        event_key = canon.tobytes()
-        event_idx = global_event_map[event_key]
-        if event_idx == 0:
-            event_idx = next_event_idx
-            next_event_idx += 1
-            global_event_map[event_key] = event_idx
-            list_of_all_LP_variables.append("P_global("+",".join(map(str, canon))+")")
-        sparse_matrix_cols[start] = event_idx
-        return next_event_idx
-    if show_progress:
-        combos = tqdm(product(range(outcomes), repeat=remaining.size),
-                      total=total,
-                      desc="Canonicalizing globals...",
-                      leave=True,
-                      position=0)
-    else:
-        combos = product(range(outcomes), repeat=remaining.size)
-    for pos, combo in enumerate(combos):
-        evt[remaining] = combo
-        canon = canonical_leximin_coset_chain(evt, outcomes, level_invperms)
-        event_key = canon.tobytes()
-        event_idx = global_event_map[event_key]
-        if event_idx == 0:
-            event_idx = next_event_idx
-            next_event_idx += 1
-            global_event_map[event_key] = event_idx
-            list_of_all_LP_variables.append("P_global("+",".join(map(str, canon))+")")
-        sparse_matrix_cols[start + pos] = event_idx
-    return next_event_idx
 
 def representatives_of_global_extensions_uint64(
     n: int,

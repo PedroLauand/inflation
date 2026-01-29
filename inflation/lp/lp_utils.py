@@ -340,17 +340,36 @@ def solveLP_sparse(objective: coo_array = blank_coo_array,
             else:
                 objective_vector = objective.toarray().ravel()
 
+            # Set the objective sense
+            task.putobjsense(mosek.objsense.maximize)
+
+            # Add all the problem data to the task
+            numcon = nof_primal_constraints
+            numvar = nof_primal_variables
+            if verbose > 1:
+                print("Starting task.inputdata in Mosek...")
+            int32_max = np.iinfo(np.int32).max
+            indptr_max = int(matrix.indptr[-1]) if matrix.indptr.size else 0
+            indices_max = int(matrix.indices.max()) if matrix.indices.size else 0
+            use_64 = (
+                numcon > int32_max
+                or numvar > int32_max
+                or indptr_max > int32_max
+                or indices_max > int32_max
+            )
+            int_dtype = np.int64 if use_64 else np.int32
+
             # Set bound keys and values for constraints
             # Ax >= b where b is 0
             bkc = np.hstack((np.broadcast_to(mosek.boundkey.lo, nof_primal_inequalities),
                              np.broadcast_to(mosek.boundkey.fx,
                                              nof_primal_equalities)
-                             ))
+                             )).astype(int_dtype, copy=False)
             if relax_known_vars:
                 bkc = np.hstack((bkc,
                                  np.repeat([mosek.boundkey.lo, mosek.boundkey.up],
                                                  nof_known_vars)
-                                 ))
+                                 )).astype(int_dtype, copy=False)
             blc = buc = b
 
             ub_col = upper_bounds.col
@@ -367,10 +386,10 @@ def solveLP_sparse(objective: coo_array = blank_coo_array,
             lb_col = np.asarray(lower_bounds.col)
             lb_data = lower_bounds.data
             if default_non_negative:
-                bkx = np.repeat(mosek.boundkey.lo, nof_primal_variables)
+                bkx = np.repeat(mosek.boundkey.lo, nof_primal_variables).astype(int_dtype, copy=False)
                 bkx[ub_col] = mosek.boundkey.ra
             else:
-                bkx = np.repeat(mosek.boundkey.fr, nof_primal_variables)
+                bkx = np.repeat(mosek.boundkey.fr, nof_primal_variables).astype(int_dtype, copy=False)
                 bkx[np.setdiff1d(lb_col, ub_col)] = mosek.boundkey.lo
                 bkx[np.setdiff1d(ub_col, lb_col)] = mosek.boundkey.up
                 bkx[np.intersect1d(ub_col, lb_col)] = mosek.boundkey.ra
@@ -380,21 +399,6 @@ def solveLP_sparse(objective: coo_array = blank_coo_array,
 
             if relax_known_vars or relax_inequalities:
                 bkx[-1] = mosek.boundkey.fr
-
-            # Set the objective sense
-            task.putobjsense(mosek.objsense.maximize)
-
-            # Add all the problem data to the task
-            numcon = nof_primal_constraints
-            numvar = nof_primal_variables
-            if verbose > 1:
-                print("Starting task.inputdata in Mosek...")
-            use_64 = (
-                numcon > np.iinfo(np.int32).max
-                or numvar > np.iinfo(np.int32).max
-                or matrix.indptr.dtype.itemsize > 4
-                or matrix.indices.dtype.itemsize > 4
-            )
             if use_64:
                 aptrb = array("q", matrix.indptr[:-1].astype(np.int64, copy=False))
                 aptre = array("q", matrix.indptr[1:].astype(np.int64, copy=False))
