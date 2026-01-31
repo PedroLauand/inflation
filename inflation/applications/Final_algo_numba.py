@@ -70,6 +70,20 @@ def loop_prob_event(outcomes: Iterable[int]) -> float:
     amp = np.trace(Pmat)
     prob = (amp.real * amp.real + amp.imag * amp.imag) * ldexp(1.0, -4 * len(a))  # 16^{-n}
     return float(prob)
+
+# =========================
+# Pluggable event probability (EJM or custom)
+# =========================
+def event_prob(outcomes: Iterable[int], *, EJM: bool = True) -> float:
+    """
+    Return probability for an event (outcomes list).
+    If EJM is True, uses the existing EJM-based loop_prob_event.
+    If EJM is False, call your custom distribution (placeholder for now).
+    """
+    if EJM:
+        return loop_prob_event(outcomes)
+    # TODO: replace with your custom distribution logic
+    raise NotImplementedError("Custom event probability not yet implemented.")
 #===================================
 #Inflation Problem 
 #===================================
@@ -449,7 +463,7 @@ def factorized_marginal_value(marginal: List[List[int]]) -> float:
     val = 1.0
     for cyc in _cycles_from_J(J):
         cyc_out = [a[i - 1] for i in cyc]
-        val *= loop_prob_event(cyc_out)
+        val *= event_prob(cyc_out, EJM=True)
     return val
 
 def representatives_of_global_extensions_uint64(
@@ -598,7 +612,7 @@ def run_pipeline(
 if __name__ == "__main__":
     from inflation.lp.lp_utils import solveLP_sparse
     # Example: n=2, outcomes=4
-    n, outcomes = 4, 4
+    n, outcomes = 2, 3
     # One small example group on N = n^2 * outcomes = 4 * 4 = 16 coordinates:
     #   - identity
     #   - swap within each outcome block of the four operator slots (toy example)
