@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 from typing import List, Tuple, Dict, Iterable, Union
-from functools import lru_cache
+from functools import lru_cache, reduce
 from math import ldexp
 from pathlib import Path
 import numpy as np
@@ -53,35 +53,56 @@ def _M() -> np.ndarray:
     """Precompute M[a] = ejm[a] @ psi, shape (4,2,2)."""
     return np.einsum('aij,jk->aik', _ejm, _psi, optimize=True)
 
-def loop_prob_event(outcomes: Iterable[int]) -> float:
+def loop_prob_event(outcomes: Iterable[int], *, total_outcomes: int = 4) -> float:
     """
-    Probability P[a1,...,an] on an n-site RING (n=len(outcomes)), for outcomes in {0,1,2,3}.
+    Probability P[a1,...,an] on an n-site RING (n=len(outcomes)), for outcomes in {0..total_outcomes-1}.
     Uses unnormalized objects and applies the global factor 16^{-n}.
+    Coarse graining is inferred from total_outcomes:
+      - total_outcomes=4: no coarse graining
+      - total_outcomes=3: outcome 2 represents {2,3}
+      - total_outcomes=2: outcome 1 represents {1,2,3}
     """
     a = tuple(int(x) for x in outcomes)
     if not a:
         raise ValueError("Provide at least one outcome.")
-    if any((x < 0 or x > 3) for x in a):
-        raise ValueError("Outcomes must be in {0,1,2,3}.")
+    if total_outcomes not in (2, 3, 4):
+        raise ValueError("total_outcomes must be 2, 3, or 4.")
+    max_allowed = total_outcomes - 1
+    if any((x < 0 or x > max_allowed) for x in a):
+        raise ValueError(f"Outcomes must be in {{0,1,...,{max_allowed}}}.")
     M = _M()
-    Pmat = np.eye(2, dtype=np.complex128)
-    for x in a:
-        Pmat = Pmat @ M[x]
-    amp = np.trace(Pmat)
-    prob = (amp.real * amp.real + amp.imag * amp.imag) * ldexp(1.0, -4 * len(a))  # 16^{-n}
+
+    def _prob_for_tuple(a_tuple: Tuple[int, ...]) -> float:
+        Pmat = reduce(np.matmul, (M[x] for x in a_tuple), np.eye(2, dtype=np.complex128))
+        amp = np.trace(Pmat)
+        return (amp.real * amp.real + amp.imag * amp.imag) * ldexp(1.0, -4 * len(a_tuple))  # 16^{-n}
+
+    if total_outcomes == 4:
+        return float(_prob_for_tuple(a))
+
+    if total_outcomes == 3:
+        choices = [(2, 3) if x == 2 else (x,) for x in a]
+    else:
+        choices = [(1, 2, 3) if x == 1 else (x,) for x in a]
+    prob = sum(_prob_for_tuple(variant) for variant in product(*choices))
     return float(prob)
 
 # =========================
 # Pluggable event probability (EJM or custom)
 # =========================
-def event_prob(outcomes: Iterable[int], *, EJM: bool = True) -> float:
+def event_prob(
+    outcomes: Iterable[int],
+    *,
+    total_outcomes: int = 4,
+    EJM: bool = True,
+) -> float:
     """
     Return probability for an event (outcomes list).
     If EJM is True, uses the existing EJM-based loop_prob_event.
     If EJM is False, call your custom distribution (placeholder for now).
     """
     if EJM:
-        return loop_prob_event(outcomes)
+        return loop_prob_event(outcomes, total_outcomes=total_outcomes)
     # TODO: replace with your custom distribution logic
     raise NotImplementedError("Custom event probability not yet implemented.")
 #===================================
@@ -454,16 +475,21 @@ def _cycles_from_J(J: List[int]) -> List[List[int]]:
         cycles.append(cyc)
     return cycles
 
-def factorized_marginal_value(marginal: List[List[int]]) -> float:
+def factorized_marginal_value(
+    marginal: List[List[int]],
+    *,
+    total_outcomes: int = 4,
+) -> float:
     """
     Multiply EJM loop scalars over the disjoint cycles of J with outcomes taken in cycle order.
+    total_outcomes controls coarse-graining of outcomes in loop_prob_event.
     """
     J = _perm_from_marginal(marginal)
     a = _outcomes_from_marginal(marginal)
     val = 1.0
     for cyc in _cycles_from_J(J):
         cyc_out = [a[i - 1] for i in cyc]
-        val *= event_prob(cyc_out, EJM=True)
+        val *= event_prob(cyc_out, total_outcomes=total_outcomes, EJM=True)
     return val
 
 def representatives_of_global_extensions_uint64(
@@ -570,7 +596,7 @@ def run_pipeline(
         tqdm(marginals, desc="Computing marginal values...", disable=not show_progress)
     ):
         # --- your existing body per marginal ---
-        val = factorized_marginal_value(marginal)  ## This computes the numeric probabilities
+        val = factorized_marginal_value(marginal, total_outcomes=outcomes)  ## This computes the numeric probabilities
         mkey = tuple(prob._lexrepr_to_names[prob.mon_to_lexrepr(marginal)])
         # mkey = tuple(tuple(x) for x in marginal)
         list_of_all_LP_variables.append("P_global("+",".join(mkey)+")")
@@ -611,8 +637,8 @@ def run_pipeline(
 # =========================
 if __name__ == "__main__":
     from inflation.lp.lp_utils import solveLP_sparse
-    # Example: n=2, outcomes=4
-    n, outcomes = 2, 3
+    # Example: n=4, outcomes=3
+    n, outcomes = 4, 3
     # One small example group on N = n^2 * outcomes = 4 * 4 = 16 coordinates:
     #   - identity
     #   - swap within each outcome block of the four operator slots (toy example)
