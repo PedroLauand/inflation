@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+from functools import cached_property
 from itertools import permutations, product
 from math import factorial
 from pathlib import Path
@@ -90,49 +91,6 @@ def ring_problem(inflation_level: int, nof_outcomes: int = 2) -> InflationProble
     return inf_prob
 
 
-# =========================
-# Integer partitions (kept public for scenario scripts)
-# =========================
-def integer_partitions(n: int) -> List[List[int]]:
-    """All integer partitions of n in nonincreasing order."""
-    out: List[List[int]] = []
-
-    def rec(rem: int, mx: int, acc: List[int]) -> None:
-        if rem == 0:
-            out.append(acc[:])
-            return
-        for p in range(min(rem, mx), 0, -1):
-            acc.append(p)
-            rec(rem - p, p, acc)
-            acc.pop()
-
-    rec(n, n, [])
-    return out
-
-
-@njit(cache=True, fastmath=True)
-def representative_perm_for_partition(parts: np.ndarray) -> np.ndarray:
-    """
-    Given partition parts of n (e.g., [3,1]), build a canonical 1-line
-    permutation J of {1..n} with that cycle structure.
-    """
-    n = 0
-    for i in range(parts.shape[0]):
-        n += parts[i]
-    J = np.arange(1, n + 1, dtype=np.int64)
-    cur = 1
-    for idx in range(parts.shape[0]):
-        L = parts[idx]
-        if L <= 1:
-            cur += L
-            continue
-        for a in range(cur, cur + L - 1):
-            J[a - 1] = a + 1
-        J[cur + L - 2] = cur
-        cur += L
-    return J
-
-
 def _prepare_group_chain(
     prob: InflationProblem,
 ) -> Tuple[int, int, int, NumbaList]:
@@ -183,60 +141,6 @@ def _marginal_from_support_key(
     if len(by_i) != n:
         raise ValueError("Invalid canonical marginal support: missing row assignment.")
     return [[1, i, by_i[i][0], 0, by_i[i][1]] for i in range(1, n + 1)]
-
-
-def _generate_canonical_marginals_with_chain(
-    n: int,
-    outcomes: int,
-    N: int,
-    level_invperms: NumbaList,
-    *,
-    marginal_filter_fn: Callable[[List[List[int]]], bool] | None,
-    show_progress: bool,
-) -> List[List[List[int]]]:
-    seen_keys: set[Tuple[int, ...]] = set()
-    marginals: List[List[List[int]]] = []
-    base_outcomes = tuple(range(outcomes))
-    perm_iter = permutations(range(1, n + 1))
-    perm_iter = tqdm(
-        perm_iter,
-        total=factorial(n),
-        desc="Canonicalizing marginals",
-        disable=not show_progress,
-    )
-    for perm in perm_iter:
-        for pat in product(base_outcomes, repeat=n):
-            support = _marginal_support_from_perm(perm, pat, n, outcomes)
-            canonical_support = canonical_leximin_support_indices(support, N, level_invperms)
-            key = tuple(int(x) for x in canonical_support.tolist())
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            marginal = _marginal_from_support_key(key, n, outcomes)
-            if marginal_filter_fn is not None and not marginal_filter_fn(marginal):
-                continue
-            marginals.append(marginal)
-    return marginals
-
-
-def generate_canonical_marginals(
-    prob: InflationProblem,
-    *,
-    marginal_filter_fn: Callable[[List[List[int]]], bool] | None = None,
-    show_progress: bool = False,
-) -> List[List[List[int]]]:
-    """
-    Generate one canonical marginal representative per orbit under prob.symmetries.
-    """
-    n, outcomes, N, level_invperms = _prepare_group_chain(prob)
-    return _generate_canonical_marginals_with_chain(
-        n,
-        outcomes,
-        N,
-        level_invperms,
-        marginal_filter_fn=marginal_filter_fn,
-        show_progress=show_progress,
-    )
 
 
 @njit(cache=True, fastmath=True)
@@ -327,24 +231,20 @@ def factorized_marginal_value(
 
 
 def compute_known_values(
-    prob: InflationProblem,
     marginals: List[List[List[int]]],
     event_prob_fn: Callable[[Iterable[int]], float],
     *,
     show_progress: bool = True,
-) -> Tuple[np.ndarray, List[str]]:
+) -> np.ndarray:
     """
-    Compute known marginal values and their LP variable labels.
+    Compute known marginal values.
     """
     known_values = np.empty(len(marginals), dtype=float)
-    known_labels: List[str] = []
     for idx, marginal in enumerate(
         tqdm(marginals, desc="Computing marginal values...", disable=not show_progress)
     ):
         known_values[idx] = factorized_marginal_value(marginal, event_prob_fn)
-        mkey = tuple(prob._lexrepr_to_names[prob.mon_to_lexrepr(marginal)])
-        known_labels.append("P_global(" + ",".join(mkey) + ")")
-    return known_values, known_labels
+    return known_values
 
 
 def representatives_of_global_extensions_uint64(
@@ -395,164 +295,219 @@ def representatives_of_global_extensions_uint64(
     return next_event_idx
 
 
-def _build_lhs_from_marginals_with_chain(
-    prob: InflationProblem,
-    marginals: List[List[List[int]]],
-    *,
-    outcomes: int,
-    level_invperms: NumbaList,
-    show_progress: bool,
-) -> Tuple[np.ndarray, np.ndarray, coo_array]:
-    nof_marginals = len(marginals)
-    n = prob.inflation_level_per_source[0]
+# =========================
+# OOP pipeline
+# =========================
+class PrepLP:
+    """
+    Prepare LP ingredients for the canonical ring pipeline.
 
-    global_event_map = NumbaDict.empty(key_type=types.uint64, value_type=types.int32)
-    list_of_all_global_keys: List[int] = []
-    next_event_idx = np.int32(1)  # 0 is reserved as "not present" sentinel
+    Main outputs:
+      - variable_names
+      - known_vars_coo_vec
+      - inflation_matrix
+    """
 
-    global_extension_count = int(pow(outcomes, n * (n - 1)))
-    total_entries = int(nof_marginals * global_extension_count)
-    sparse_matrix_rows = np.empty(total_entries, dtype=np.int32)
-    sparse_matrix_cols = np.empty(total_entries, dtype=np.int32)
-    sparse_matrix_data = np.ones(total_entries, dtype=np.int8)
+    def __init__(
+        self,
+        prob: InflationProblem,
+        *,
+        event_prob_fn: Callable[[Iterable[int]], float],
+        marginal_filter_fn: Callable[[List[List[int]]], bool] | None = None,
+        show_progress: bool = True,
+    ) -> None:
+        self.prob = prob
+        self.event_prob_fn = event_prob_fn
+        self.marginal_filter_fn = marginal_filter_fn
+        self.show_progress = show_progress
+        # Eager materialization of the main outputs.
+        _ = self.variable_names
+        _ = self.known_vars_coo_vec
+        _ = self.inflation_matrix
 
-    row_grid = np.broadcast_to(
-        np.arange(nof_marginals, dtype=np.int32)[:, None],
-        (nof_marginals, global_extension_count),
-    )
-    sparse_matrix_rows[:] = row_grid.reshape(-1)
+    @cached_property
+    def _group_chain_data(self) -> Tuple[int, int, int, NumbaList]:
+        """Tuple `(n, outcomes, N, level_invperms)` prepared from `self.prob`."""
+        return _prepare_group_chain(self.prob)
 
-    row_labels: List[Tuple[str, ...]] = []
-    for marginal in marginals:
-        mkey = tuple(prob._lexrepr_to_names[prob.mon_to_lexrepr(marginal)])
-        row_labels.append(mkey)
+    @cached_property
+    def n(self) -> int:
+        """Inflation level per source (number of copies)."""
+        return self._group_chain_data[0]
 
-    for row_num, marginal in enumerate(
-        tqdm(marginals, desc="Finding global extensions...", disable=not show_progress)
-    ):
-        start = row_num * global_extension_count
-        next_event_idx = representatives_of_global_extensions_uint64(
-            n=n,
-            outcomes=outcomes,
-            marginal=marginal,
-            level_invperms=level_invperms,
-            global_event_map=global_event_map,
-            next_event_idx=next_event_idx,
-            list_of_all_LP_variables=list_of_all_global_keys,
-            total=global_extension_count,
-            sparse_matrix_cols=sparse_matrix_cols,
-            start=start,
+    @cached_property
+    def outcomes(self) -> int:
+        """Number of outcomes per party."""
+        return self._group_chain_data[1]
+
+    @cached_property
+    def N(self) -> int:
+        """One-hot ambient dimension `n*n*outcomes` for group action."""
+        return self._group_chain_data[2]
+
+    @cached_property
+    def level_invperms(self) -> NumbaList:
+        """Schreier-Sims inverse-transversal chain used for canonicalization."""
+        return self._group_chain_data[3]
+
+    @cached_property
+    def marginals(self) -> List[List[List[int]]]:
+        """
+        Canonical marginal representatives under `self.prob.symmetries`.
+        """
+        seen_keys: set[Tuple[int, ...]] = set()
+        marginals: List[List[List[int]]] = []
+        base_outcomes = tuple(range(self.outcomes))
+        perm_iter = permutations(range(1, self.n + 1))
+        perm_iter = tqdm(
+            perm_iter,
+            total=factorial(self.n),
+            desc="Canonicalizing marginals",
+            disable=not self.show_progress,
+        )
+        for perm in perm_iter:
+            for pat in product(base_outcomes, repeat=self.n):
+                # Candidate marginal -> sparse one-hot support in ambient coordinates.
+                support = _marginal_support_from_perm(perm, pat, self.n, self.outcomes)
+                # Canonicalize and dedupe by support key.
+                canonical_support = canonical_leximin_support_indices(support, self.N, self.level_invperms)
+                key = tuple(int(x) for x in canonical_support.tolist())
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                marginal = _marginal_from_support_key(key, self.n, self.outcomes)
+                if self.marginal_filter_fn is not None and not self.marginal_filter_fn(marginal):
+                    continue
+                marginals.append(marginal)
+        return marginals
+
+    @cached_property
+    def nof_marginals(self) -> int:
+        """Number of canonical marginals."""
+        return len(self.marginals)
+
+    @cached_property
+    def row_labels(self) -> np.ndarray:
+        """Operator-name tuple labels for each marginal row."""
+        return np.asarray(
+            [tuple(self.prob._lexrepr_to_names[self.prob.mon_to_lexrepr(m)]) for m in self.marginals],
+            dtype=object,
         )
 
-    if int(next_event_idx) > np.iinfo(np.int32).max:
-        raise ValueError("next_event_idx exceeds int32 range; use wider dtype")
+    @cached_property
+    def known_labels(self) -> List[str]:
+        """String labels for known marginal variables, derived from `row_labels`."""
+        return ["P_global(" + ",".join(lbl) + ")" for lbl in self.row_labels]
 
-    lhs_matrix = coo_array(
-        (sparse_matrix_data, (sparse_matrix_rows, sparse_matrix_cols)),
-        shape=(nof_marginals, int(next_event_idx)),
-    )
-    lhs_matrix.sum_duplicates()
+    @cached_property
+    def known_values(self) -> np.ndarray:
+        """Known marginal values from factorized cycle probabilities."""
+        return compute_known_values(
+            self.marginals,
+            self.event_prob_fn,
+            show_progress=self.show_progress,
+        )
 
-    return (
-        np.asarray(row_labels, dtype=object),
-        np.asarray(list_of_all_global_keys, dtype=np.uint64),
-        lhs_matrix,
-    )
+    @cached_property
+    def _canonical_global_lhs_payload(self) -> Tuple[np.ndarray, coo_array]:
+        """
+        Pair `(global_keys, lhs_raw)` for canonical global-event extension constraints.
+        """
+        global_event_map = NumbaDict.empty(key_type=types.uint64, value_type=types.int32)
+        list_of_all_global_keys: List[int] = []
+        next_event_idx = np.int32(1)  # 0 is reserved as "not present" sentinel
 
+        global_extension_count = int(pow(self.outcomes, self.n * (self.n - 1)))
+        total_entries = int(self.nof_marginals * global_extension_count)
+        sparse_matrix_rows = np.empty(total_entries, dtype=np.int32)
+        sparse_matrix_cols = np.empty(total_entries, dtype=np.int32)
+        sparse_matrix_data = np.ones(total_entries, dtype=np.int8)
+        row_grid = np.broadcast_to(
+            np.arange(self.nof_marginals, dtype=np.int32)[:, None],
+            (self.nof_marginals, global_extension_count),
+        )
+        sparse_matrix_rows[:] = row_grid.reshape(-1)
 
-def build_lhs_from_marginals(
-    prob: InflationProblem,
-    marginals: List[List[List[int]]],
-    *,
-    show_progress: bool = True,
-) -> Tuple[np.ndarray, np.ndarray, coo_array]:
-    """
-    Build raw LHS matrix for provided marginals.
+        # Enumerate global extensions and canonicalize each extension to a column key.
+        for row_num, marginal in enumerate(
+            tqdm(self.marginals, desc="Finding global extensions...", disable=not self.show_progress)
+        ):
+            start = row_num * global_extension_count
+            next_event_idx = representatives_of_global_extensions_uint64(
+                n=self.n,
+                outcomes=self.outcomes,
+                marginal=marginal,
+                level_invperms=self.level_invperms,
+                global_event_map=global_event_map,
+                next_event_idx=next_event_idx,
+                list_of_all_LP_variables=list_of_all_global_keys,
+                total=global_extension_count,
+                sparse_matrix_cols=sparse_matrix_cols,
+                start=start,
+            )
+        if int(next_event_idx) > np.iinfo(np.int32).max:
+            raise ValueError("next_event_idx exceeds int32 range; use wider dtype")
 
-    Column 0 is reserved as sentinel and remains unused.
-    """
-    _n, outcomes, _N, level_invperms = _prepare_group_chain(prob)
-    return _build_lhs_from_marginals_with_chain(
-        prob,
-        marginals,
-        outcomes=outcomes,
-        level_invperms=level_invperms,
-        show_progress=show_progress,
-    )
+        lhs_raw = coo_array(
+            (sparse_matrix_data, (sparse_matrix_rows, sparse_matrix_cols)),
+            shape=(self.nof_marginals, int(next_event_idx)),
+        )
+        lhs_raw.sum_duplicates()
+        global_keys = np.asarray(list_of_all_global_keys, dtype=np.uint64)
+        return global_keys, lhs_raw
 
+    @cached_property
+    def global_keys(self) -> np.ndarray:
+        """Canonical uint64 keys of global-event LP columns (excluding sentinel 0)."""
+        return self._canonical_global_lhs_payload[0]
 
-# =========================
-# Top-level pipeline
-# =========================
-def run_pipeline(
-    prob: InflationProblem,
-    *,
-    event_prob_fn: Callable[[Iterable[int]], float],
-    marginal_filter_fn: Callable[[List[List[int]]], bool] | None = None,
-    show_progress: bool = True,
-) -> Tuple[np.ndarray, coo_array, coo_array]:
-    """
-    Build variable names, known-values vector, and inflation matrix.
-    """
-    n, outcomes, N, level_invperms = _prepare_group_chain(prob)
+    @cached_property
+    def lhs_raw(self) -> coo_array:
+        """Raw sparse LHS matrix with sentinel column 0 kept."""
+        return self._canonical_global_lhs_payload[1]
 
-    marginals = _generate_canonical_marginals_with_chain(
-        n,
-        outcomes,
-        N,
-        level_invperms,
-        marginal_filter_fn=marginal_filter_fn,
-        show_progress=show_progress,
-    )
-    nof_marginals = len(marginals)
+    @cached_property
+    def inflation_matrix(self) -> coo_array:
+        """Final sparse equality matrix combining known-value and extension constraints."""
+        lhs_coo = self.lhs_raw
+        shifted_cols = lhs_coo.col.astype(np.int64, copy=True)
+        mask = shifted_cols != 0
+        shifted_cols[mask] += self.nof_marginals
 
-    known_values, known_labels = compute_known_values(
-        prob,
-        marginals,
-        event_prob_fn,
-        show_progress=show_progress,
-    )
-    _row_labels, global_keys, lhs_raw = _build_lhs_from_marginals_with_chain(
-        prob,
-        marginals,
-        outcomes=outcomes,
-        level_invperms=level_invperms,
-        show_progress=show_progress,
-    )
+        known_rows = np.arange(self.nof_marginals, dtype=np.int32)
+        known_cols = np.arange(1, self.nof_marginals + 1, dtype=np.int32)
+        known_data = -np.ones(self.nof_marginals, dtype=np.int8)
 
-    lhs_coo = lhs_raw.tocoo()
-    shifted_cols = lhs_coo.col.astype(np.int64, copy=True)
-    mask = shifted_cols != 0
-    shifted_cols[mask] += nof_marginals
+        all_rows = np.concatenate([known_rows, lhs_coo.row.astype(np.int32, copy=False)])
+        all_cols = np.concatenate([known_cols, shifted_cols.astype(np.int32, copy=False)])
+        all_data = np.concatenate([known_data, lhs_coo.data.astype(np.int8, copy=False)])
 
-    known_rows = np.arange(nof_marginals, dtype=np.int32)
-    known_cols = np.arange(1, nof_marginals + 1, dtype=np.int32)
-    known_data = -np.ones(nof_marginals, dtype=np.int8)
+        total_cols = self.nof_marginals + self.lhs_raw.shape[1]
+        inflation_matrix = coo_array(
+            (all_data, (all_rows, all_cols)),
+            shape=(self.nof_marginals, total_cols),
+        )
+        inflation_matrix.sum_duplicates()
+        return inflation_matrix
 
-    all_rows = np.concatenate([known_rows, lhs_coo.row.astype(np.int32, copy=False)])
-    all_cols = np.concatenate([known_cols, shifted_cols.astype(np.int32, copy=False)])
-    all_data = np.concatenate([known_data, lhs_coo.data.astype(np.int8, copy=False)])
+    @cached_property
+    def known_vars_coo_vec(self) -> coo_array:
+        """Sparse known-variables row vector aligned with `inflation_matrix` columns."""
+        total_cols = self.nof_marginals + self.lhs_raw.shape[1]
+        known_positions = np.arange(1, self.nof_marginals + 1, dtype=np.int32)
+        known_rows0 = np.zeros(self.nof_marginals, dtype=np.int32)
+        return coo_array(
+            (self.known_values, (known_rows0, known_positions)),
+            shape=(1, total_cols),
+        )
 
-    total_cols = nof_marginals + lhs_raw.shape[1]
-    inflation_matrix = coo_array(
-        (all_data, (all_rows, all_cols)),
-        shape=(nof_marginals, total_cols),
-    )
-    inflation_matrix.sum_duplicates()
-
-    known_positions = np.arange(1, nof_marginals + 1, dtype=np.int32)
-    known_rows0 = np.zeros(nof_marginals, dtype=np.int32)
-    known_vars_coo_vec = coo_array(
-        (known_values, (known_rows0, known_positions)),
-        shape=(1, total_cols),
-    )
-
-    variable_names = np.asarray(
-        ["1", *known_labels, *[str(k) for k in global_keys.tolist()]],
-        dtype=str,
-    )
-
-    return variable_names, known_vars_coo_vec, inflation_matrix
+    @cached_property
+    def variable_names(self) -> np.ndarray:
+        """Variable names aligned with matrix columns: const, known marginals, global keys."""
+        return np.asarray(
+            ["1", *self.known_labels, *[str(k) for k in self.global_keys.tolist()]],
+            dtype=str,
+        )
 
 
 # =========================
@@ -568,8 +523,8 @@ if __name__ == "__main__":
 
     # --- Pipeline configuration ---
     n, outcomes = 3, 2
-    include_outcome_relabel_symmetries = True
-    cache_name = "lp_cache_nsi_pi_n=3.npz"
+    include_outcome_relabel_symmetries = False
+    cache_name = "lp_cache_nsi_pi_n=3_no_outcome_relabelling.npz"
 
     # Users should provide a fully configured callable, optionally via functools.partial.
     # EJM (raw):
@@ -641,10 +596,13 @@ if __name__ == "__main__":
         print(f"Loading cached LP constraints from {cache_path}")
         variable_names, known_vars_coo_vec, inflation_matrix = _load_cache(cache_path)
     else:
-        variable_names, known_vars_coo_vec, inflation_matrix = run_pipeline(
+        prep = PrepLP(
             prob,
             event_prob_fn=event_prob_fn,
         )
+        variable_names = prep.variable_names
+        known_vars_coo_vec = prep.known_vars_coo_vec
+        inflation_matrix = prep.inflation_matrix
         _save_cache(cache_path, variable_names, known_vars_coo_vec, inflation_matrix)
 
     nof_all_LP_vars = inflation_matrix.shape[1]

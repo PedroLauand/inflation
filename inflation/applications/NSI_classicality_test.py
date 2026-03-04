@@ -28,8 +28,8 @@ from inflation.lp.lp_utils import solveLP_sparse
 from scipy.sparse import coo_array
 from inflation.distributions.nsi_pr import prob_event_loop as nsi_pr_prob_event_loop
 from inflation.applications.Final_algo_numba import (
+    PrepLP,
     ring_problem,
-    run_pipeline,
     _perm_from_marginal,
     _outcomes_from_marginal,
     _cycles_from_J,
@@ -94,11 +94,14 @@ if __name__ == "__main__":
     print(f"uniform 1-body marginal P(A=0)={_P1_ZERO:.6f}")
     print("done with prob")
 
-    variable_names, known_vars_coo_vec, inflation_matrix = run_pipeline(
+    prep = PrepLP(
         prob,
         event_prob_fn=prob_zero_or_single_one_event,
         marginal_filter_fn=_marginal_supported,
     )
+    variable_names = prep.variable_names
+    known_vars_coo_vec = prep.known_vars_coo_vec
+    inflation_matrix = prep.inflation_matrix
     nof_all_LP_vars = inflation_matrix.shape[1]
 
     solution = solveLP_sparse(
