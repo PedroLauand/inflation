@@ -230,23 +230,6 @@ def factorized_marginal_value(
     return val
 
 
-def compute_known_values(
-    marginals: List[List[List[int]]],
-    event_prob_fn: Callable[[Iterable[int]], float],
-    *,
-    show_progress: bool = True,
-) -> np.ndarray:
-    """
-    Compute known marginal values.
-    """
-    known_values = np.empty(len(marginals), dtype=float)
-    for idx, marginal in enumerate(
-        tqdm(marginals, desc="Computing marginal values...", disable=not show_progress)
-    ):
-        known_values[idx] = factorized_marginal_value(marginal, event_prob_fn)
-    return known_values
-
-
 def representatives_of_global_extensions_uint64(
     n: int,
     outcomes: int,
@@ -394,19 +377,59 @@ class PrepLP:
             dtype=object,
         )
 
+    def _factorized_value_and_label(self, marginal: List[List[int]]) -> Tuple[float, str]:
+        """
+        Compute value and copy-index-free cycle-factorized label for one marginal.
+
+        Example:
+          P_global(A^{1,1}=1,A^{2,2}=1,A^{3,3}=0)
+          -> P_loop(A=1)^2*P_loop(A=0)
+        """
+        J = _perm_from_marginal(marginal)
+        cycles = _cycles_from_J(J)
+        by_i = {int(row[1]): row for row in marginal}
+        loop_counts: Dict[str, int] = {}
+        value = 1.0
+
+        for cyc in cycles:
+            cycle_mon = np.asarray([by_i[i] for i in cyc], dtype=np.intc)
+            lex = self.prob.mon_to_lexrepr(cycle_mon)
+            copy_free_names = tuple(self.prob._lexrepr_to_copy_index_free_names[lex])
+            label = "P_loop(" + ",".join(copy_free_names) + ")"
+            loop_counts[label] = loop_counts.get(label, 0) + 1
+            cyc_out = [int(by_i[i][4]) for i in cyc]
+            value *= self.event_prob_fn(cyc_out)
+
+        factors: List[str] = []
+        for label, mult in loop_counts.items():
+            if mult == 1:
+                factors.append(label)
+            else:
+                factors.append(f"{label}^{mult}")
+        return value, "*".join(factors)
+
+    @cached_property
+    def _known_payload(self) -> Tuple[np.ndarray, List[str]]:
+        """Known values and labels computed together in one marginal pass."""
+        known_values = np.empty(self.nof_marginals, dtype=float)
+        known_labels: List[str] = []
+        for idx, marginal in enumerate(
+            tqdm(self.marginals, desc="Computing marginal values...", disable=not self.show_progress)
+        ):
+            value, label = self._factorized_value_and_label(marginal)
+            known_values[idx] = value
+            known_labels.append(label)
+        return known_values, known_labels
+
     @cached_property
     def known_labels(self) -> List[str]:
-        """String labels for known marginal variables, derived from `row_labels`."""
-        return ["P_global(" + ",".join(lbl) + ")" for lbl in self.row_labels]
+        """Cycle-factorized known-variable labels using copy-index-free operator names."""
+        return self._known_payload[1]
 
     @cached_property
     def known_values(self) -> np.ndarray:
         """Known marginal values from factorized cycle probabilities."""
-        return compute_known_values(
-            self.marginals,
-            self.event_prob_fn,
-            show_progress=self.show_progress,
-        )
+        return self._known_payload[0]
 
     @cached_property
     def _canonical_global_lhs_payload(self) -> Tuple[np.ndarray, coo_array]:
@@ -523,8 +546,8 @@ if __name__ == "__main__":
 
     # --- Pipeline configuration ---
     n, outcomes = 3, 2
-    include_outcome_relabel_symmetries = False
-    cache_name = "lp_cache_nsi_pi_n=3_no_outcome_relabelling.npz"
+    include_outcome_relabel_symmetries = True
+    cache_name = "lp_cache_nsi_pi_n=3_with_outcome_relabelling.npz"
 
     # Users should provide a fully configured callable, optionally via functools.partial.
     # EJM (raw):
@@ -616,3 +639,64 @@ if __name__ == "__main__":
     )
 
     print(solution["status"])
+
+    def _evaluate_sparse_certificate_on_knowns(
+        sparse_certificate: coo_array,
+        known_vec: coo_array,
+    ) -> float:
+        """Evaluate sparse certificate on known assignments without densifying."""
+        cert_coo = sparse_certificate
+        known_cols = known_vec.col.astype(np.int64, copy=False)
+        known_vals = known_vec.data.astype(float, copy=False)
+        known_map = dict(zip(known_cols.tolist(), known_vals.tolist()))
+        value = 0.0
+        for col, coeff in zip(cert_coo.col.tolist(), cert_coo.data.tolist()):
+            value += float(coeff) * float(known_map.get(int(col), 0.0))
+        return value
+
+    def _print_infeasibility_certificate_analysis(
+        solution_dict: dict,
+        known_vec: coo_array,
+        *,
+        chop_tol: float = 1e-10,
+        top_k: int = 25,
+    ) -> None:
+        """Print a concise analysis of the dual infeasibility certificate."""
+        cert_dict = solution_dict.get("dual_certificate", {})
+        if not cert_dict:
+            print("No dual certificate entries were returned.")
+            return
+
+        # Mimic InflationLP-style coefficient cleanup by chopping tiny entries.
+        cleaned = {
+            str(var): float(coeff)
+            for var, coeff in cert_dict.items()
+            if abs(float(coeff)) > chop_tol
+        }
+        if not cleaned:
+            print(f"Dual certificate is numerically zero after chop_tol={chop_tol:g}.")
+            return
+
+        known_terms = {k: v for k, v in cleaned.items() if k.startswith("P_global(")}
+        global_terms = {k: v for k, v in cleaned.items() if (k not in known_terms and k != "1")}
+        const_coeff = cleaned.get("1", 0.0)
+
+        cert_value = _evaluate_sparse_certificate_on_knowns(
+            solution_dict["sparse_certificate"], known_vec
+        )
+
+        print("\nCertificate analysis:")
+        print(f"  nonzero terms (after chop): {len(cleaned)}")
+        print(f"  known-marginal terms: {len(known_terms)}")
+        print(f"  global-event terms: {len(global_terms)}")
+        print(f"  constant term coeff: {const_coeff:.12g}")
+        print(f"  certificate value on knowns: {cert_value:.12g}")
+        print("  incompatibility witness criterion: certificate < 0")
+
+        top_terms = sorted(cleaned.items(), key=lambda kv: abs(kv[1]), reverse=True)[:top_k]
+        print(f"  top {len(top_terms)} terms by |coefficient|:")
+        for var, coeff in top_terms:
+            print(f"    {coeff:+.12g} * {var}")
+
+    if not solution.get("success", False):
+        _print_infeasibility_certificate_analysis(solution, known_vars_coo_vec)
