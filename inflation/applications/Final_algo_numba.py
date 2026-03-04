@@ -1,119 +1,57 @@
 # final_selfcontained_pipeline.py
 # -------------------------------------------------------------------
-# Self-contained pipeline (no external imports from your project).
-# It:
-#   1) generates symmetry-reduced marginals (operator structure + outcome patterns),
-#   2) evaluates each marginal's factorized EJM loop value,
-#   3) enumerates global extensions and tallies canonical representatives under a group G.
+# Canonical generic pipeline for the ring inflation workflow.
 #
-# Output format: a list of items, each item is [e1, e2], where:
-#   e1: { <marginal-as-tuple-of-tuples> : float_value }
-#   e2: { <canonical-global-rep (tuple of length n^2)> : count }
-#
-# Example usage is at the bottom (n=2, outcomes=4).
+# Responsibilities:
+#   1) generate symmetry-canonical marginal representatives from prob.symmetries,
+#   2) evaluate factorized marginal values via injected loop-event callable,
+#   3) enumerate symmetry-canonical global extensions and build LP matrices.
 # -------------------------------------------------------------------
 
 from __future__ import annotations
-from typing import List, Tuple, Dict, Iterable, Union
-from functools import lru_cache, reduce
-from math import ldexp
+
+from itertools import permutations, product
+from math import factorial
 from pathlib import Path
-import numpy as np
+from typing import Callable, Dict, Iterable, List, Sequence, Tuple
 import sys
-from itertools import product
+
+import numpy as np
+from numba import njit, types
+from numba.typed import Dict as NumbaDict
+from numba.typed import List as NumbaList
+from scipy.sparse import coo_array
+from tqdm.auto import tqdm
 
 # Ensure repo root is on sys.path so "import inflation" works when running this file directly.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+
 from inflation import InflationProblem
-from collections import defaultdict
-from tqdm.auto import tqdm
-from scipy.sparse import coo_array
-from numba import njit, int64, uint8, types
-from numba.typed import Dict as NumbaDict
-from numba.typed import List as NumbaList
+from inflation.applications.Group_utils import (
+    build_sympy_group,
+    canonical_leximin_coset_chain_uint64,
+    canonical_leximin_support_indices,
+    prepare_group_chain,
+)
 
 ZERO_I32 = np.int32(0)
 
 
-# =========================
-# EJM distribution (4 outcomes)
-# =========================
-e0_un = np.array([[-1 - 1j, 0,     -2j,  -1 + 1j]], dtype=np.complex128).reshape(2, 2)
-e1_un = np.array([[ 1 - 1j, 2j,     0,    1 + 1j]], dtype=np.complex128).reshape(2, 2)
-e2_un = np.array([[-1 + 1j, 2j,     0,   -1 - 1j]], dtype=np.complex128).reshape(2, 2)
-e3_un = np.array([[ 1 + 1j, 0,     -2j,   1 - 1j]], dtype=np.complex128).reshape(2, 2)
-_ejm = np.stack([e0_un, e1_un, e2_un, e3_un])  # (4,2,2)
-
-_psi = np.array([[0, 1, -1, 0]], dtype=np.complex128).reshape(2, 2)
-
-@lru_cache(maxsize=None)
-def _M() -> np.ndarray:
-    """Precompute M[a] = ejm[a] @ psi, shape (4,2,2)."""
-    return np.einsum('aij,jk->aik', _ejm, _psi, optimize=True)
-
-def loop_prob_event(outcomes: Iterable[int], *, total_outcomes: int = 4) -> float:
-    """
-    Probability P[a1,...,an] on an n-site RING (n=len(outcomes)), for outcomes in {0..total_outcomes-1}.
-    Uses unnormalized objects and applies the global factor 16^{-n}.
-    Coarse graining is inferred from total_outcomes:
-      - total_outcomes=4: no coarse graining
-      - total_outcomes=3: outcome 2 represents {2,3}
-      - total_outcomes=2: outcome 1 represents {1,2,3}
-    """
-    a = tuple(int(x) for x in outcomes)
-    if not a:
-        raise ValueError("Provide at least one outcome.")
-    if total_outcomes not in (2, 3, 4):
-        raise ValueError("total_outcomes must be 2, 3, or 4.")
-    max_allowed = total_outcomes - 1
-    if any((x < 0 or x > max_allowed) for x in a):
-        raise ValueError(f"Outcomes must be in {{0,1,...,{max_allowed}}}.")
-    M = _M()
-
-    def _prob_for_tuple(a_tuple: Tuple[int, ...]) -> float:
-        Pmat = reduce(np.matmul, (M[x] for x in a_tuple), np.eye(2, dtype=np.complex128))
-        amp = np.trace(Pmat)
-        return (amp.real * amp.real + amp.imag * amp.imag) * ldexp(1.0, -4 * len(a_tuple))  # 16^{-n}
-
-    if total_outcomes == 4:
-        return float(_prob_for_tuple(a))
-
-    if total_outcomes == 3:
-        choices = [(2, 3) if x == 2 else (x,) for x in a]
-    else:
-        choices = [(1, 2, 3) if x == 1 else (x,) for x in a]
-    prob = sum(_prob_for_tuple(variant) for variant in product(*choices))
-    return float(prob)
-
-# =========================
-# Pluggable event probability (EJM or custom)
-# =========================
-def event_prob(
-    outcomes: Iterable[int],
-    *,
-    total_outcomes: int = 4,
-    EJM: bool = True,
-) -> float:
-    """
-    Return probability for an event (outcomes list).
-    If EJM is True, uses the existing EJM-based loop_prob_event.
-    If EJM is False, call your custom distribution (placeholder for now).
-    """
-    if EJM:
-        return loop_prob_event(outcomes, total_outcomes=total_outcomes)
-    # TODO: replace with your custom distribution logic
-    raise NotImplementedError("Custom event probability not yet implemented.")
-#===================================
-#Inflation Problem 
-#===================================
-def exists_shared_source_modified(inf_indices1: np.ndarray,
-                            inf_indices2: np.ndarray) -> bool:
+# ===================================
+# Inflation problem
+# ===================================
+def exists_shared_source_modified(
+    inf_indices1: np.ndarray,
+    inf_indices2: np.ndarray,
+) -> bool:
     common_sources = np.logical_and(inf_indices1, inf_indices2)
     if not np.any(common_sources):
         return False
     return not set(inf_indices1[common_sources]).isdisjoint(set(inf_indices2[common_sources]))
+
+
 def overlap_matrix(all_inflation_indxs: np.ndarray) -> np.ndarray:
     n = len(all_inflation_indxs)
     adj_mat = np.eye(n, dtype=bool)
@@ -125,54 +63,58 @@ def overlap_matrix(all_inflation_indxs: np.ndarray) -> np.ndarray:
                 adj_mat[i, j] = True
     adj_mat = np.logical_or(adj_mat, adj_mat.T)
     return adj_mat
+
+
 def ring_problem(inflation_level: int, nof_outcomes: int = 2) -> InflationProblem:
     inf_prob = InflationProblem(
-        dag={"i1": ["A"],
-             "i2": ["A"], },
+        dag={"i1": ["A"], "i2": ["A"]},
         outcomes_per_party=[nof_outcomes],
         settings_per_party=[1],
         classical_sources=None,
-        inflation_level_per_source=(inflation_level,inflation_level),
-        order=("A",))
+        inflation_level_per_source=(inflation_level, inflation_level),
+        order=("A",),
+    )
 
     to_stabilize = np.flatnonzero(inf_prob._lexorder[:, 1] == inf_prob._lexorder[:, 2])
 
-
-    #Fix factorization
+    # Fix factorization
     inf_prob._inflation_indices_overlap = overlap_matrix(inf_prob._all_unique_inflation_indices)
 
     # Fix symmetries
-    new_symmetries = np.array([
-        perm for perm in inf_prob.symmetries
-        if np.array_equal(np.sort(perm[to_stabilize]), to_stabilize)
-    ], dtype=int)
+    new_symmetries = np.array(
+        [perm for perm in inf_prob.symmetries if np.array_equal(np.sort(perm[to_stabilize]), to_stabilize)],
+        dtype=int,
+    )
     inf_prob.symmetries = new_symmetries
-    # inf_prob._interpretation_to_name = name_interpret_always_copy_indices
 
     return inf_prob
 
+
 # =========================
-# Integer partitions (conjugacy classes of S_n)
+# Integer partitions (kept public for scenario scripts)
 # =========================
 def integer_partitions(n: int) -> List[List[int]]:
     """All integer partitions of n in nonincreasing order."""
     out: List[List[int]] = []
-    def rec(rem: int, mx: int, acc: List[int]):
+
+    def rec(rem: int, mx: int, acc: List[int]) -> None:
         if rem == 0:
             out.append(acc[:])
             return
-        for p in range(min(rem, mx), 1 - 1, -1):
+        for p in range(min(rem, mx), 0, -1):
             acc.append(p)
             rec(rem - p, p, acc)
             acc.pop()
+
     rec(n, n, [])
     return out
+
 
 @njit(cache=True, fastmath=True)
 def representative_perm_for_partition(parts: np.ndarray) -> np.ndarray:
     """
-    Given partition parts of n (e.g., [3,1]), build a canonical 1-line permutation J of {1..n}
-    with that cycle structure: consecutive labels per cycle.
+    Given partition parts of n (e.g., [3,1]), build a canonical 1-line
+    permutation J of {1..n} with that cycle structure.
     """
     n = 0
     for i in range(parts.shape[0]):
@@ -190,223 +132,112 @@ def representative_perm_for_partition(parts: np.ndarray) -> np.ndarray:
         cur += L
     return J
 
-# =========================
-# Outcome patterns up to relabeling (S_outcomes)
-# =========================
-def set_partitions_indices(n: int) -> List[List[List[int]]]:
-    """All set partitions of {0,..,n-1} as list of blocks (lists)."""
-    if n == 0:
-        return [[[]]]
-    parts = [[[0]]]
-    for x in range(1, n):
-        new_parts = []
-        for part in parts:
-            new_parts.append(part + [[x]])  # new block
-            for i in range(len(part)):
-                new_part = [blk[:] for blk in part]
-                new_part[i].append(x)
-                new_parts.append(new_part)
-        parts = new_parts
-    # normalize each partition blocks
-    for p in parts:
-        p.sort(key=lambda b: min(b))
-        for b in p:
-            b.sort()
-    return parts
 
-def canonical_outcome_patterns(n: int, outcomes: int) -> List[List[int]]:
-    """
-    One representative per equivalence class under outcome relabeling.
-    Map blocks -> labels 0,1,2,... by block order (increasing min index).
-    Only keep patterns with #blocks <= outcomes.
-    """
-    vecs: List[List[int]] = []
-    for part in set_partitions_indices(n):
-        if len(part) > outcomes:
-            continue
-        v = [0] * n
-        for lbl, block in enumerate(part):
-            for idx in block:
-                v[idx] = lbl
-        vecs.append(v)
-    vecs.sort()
-    return vecs
+def _prepare_group_chain(
+    prob: InflationProblem,
+) -> Tuple[int, int, int, NumbaList]:
+    n = prob.inflation_level_per_source[0]
+    outcomes = prob.outcomes_per_party[0]
+    if outcomes >= 255:
+        raise ValueError("outcomes must be < 255 to fit in compact dtypes")
+    if n > 5:
+        raise ValueError("uint64 canonical events are only supported up to n=5")
+    max_event_count = pow(outcomes, n * n)
+    if max_event_count > np.iinfo(np.uint64).max:
+        raise ValueError("events do not fit in uint64")
 
-# =========================
-# Generate symmetry-reduced marginals
-# =========================
-def generate_minimal_marginal_events(n: int, outcomes: int) -> List[List[List[int]]]:
-    """
-    Return a list of marginals in format [[1,i,J(i),0,a_i] for i=1..n],
-    for each conjugacy-class representative J of S_n, and each canonical outcome pattern.
-    """
-    if n <= 0:
-        return []
-    all_marginals: List[List[List[int]]] = []
-    outcome_reps = canonical_outcome_patterns(n, outcomes)
-    for parts in integer_partitions(n):
-        J = representative_perm_for_partition(np.array(parts, dtype=np.int64))  # 1-line
-        for pat in outcome_reps:
-            marginal = [[1, i, J[i - 1], 0, pat[i - 1]] for i in range(1, n + 1)]
-            all_marginals.append(marginal)
-    return all_marginals
-
-# =========================
-# One-hot lex helpers (for group action on events)
-# =========================
-@njit(types.boolean[:](uint8[:], int64), cache=True, fastmath=True)
-def to_lex_representation(evt: np.ndarray, outcomes: int) -> np.ndarray:
-    """Compact event -> one-hot lex vector (length n^2 * outcomes)."""
-    n2 = evt.shape[0]
-    lex = np.zeros(n2 * outcomes, dtype=np.bool_)
-    base = np.uint16(outcomes)
-    idx = evt + base * np.arange(n2, dtype=np.uint16)
-    # Assumes 0 <= evt[s] < outcomes for all s.
-    for s in range(n2):
-        lex[idx[s]] = 1
-    return lex
-
-@njit(uint8[:](types.boolean[:], int64), cache=True, fastmath=True)
-def from_lex_representation(lex_evt: np.ndarray, outcomes: int) -> np.ndarray:
-    """One-hot lex vector -> compact event."""
-    lex_evt = np.ascontiguousarray(lex_evt)
-    n2 = lex_evt.shape[0] // outcomes
-    evt = np.empty(n2, dtype=np.uint8)
-    blocks = lex_evt.reshape(n2, outcomes)
-    # Assumes length is divisible by outcomes and blocks are one-hot.
-    for s in range(n2):
-        idx = 0
-        for j in range(outcomes):
-            if blocks[s, j] != 0:
-                idx = j
-                break
-        evt[s] = idx
-    return evt
+    N = (n * n) * outcomes
+    if N > np.iinfo(np.uint16).max:
+        raise ValueError("N exceeds uint16 range; use wider dtype for permutations")
+    G = build_sympy_group(prob.symmetries, N)
+    level_invperms = prepare_group_chain(G, N)
+    return n, outcomes, N, level_invperms
 
 
-# =========================
-# SymPy group utilities
-# =========================
-from sympy.combinatorics.permutations import Permutation
-from sympy.combinatorics.perm_groups import PermutationGroup
-
-def _normalize_perm_list(g: List[int], N: int) -> List[int]:
-    """Ensure 0-based bijection of range(N) from list (accepts 1- or 0-based)."""
-    if len(g) != N:
-        raise ValueError(f"Permutation length {len(g)} != {N}")
-    if max(g) == N:  # likely 1-based
-        g = [x - 1 for x in g]
-    if sorted(g) != list(range(N)):
-        raise ValueError("Invalid permutation (not a bijection).")
-    return g
-
-def build_sympy_group(raw_G: Union[List[List[int]], np.ndarray], N: int) -> PermutationGroup:
-    """Build group from raw list permutations (0- or 1-based)."""
-    gens = [Permutation(_normalize_perm_list(gl, N)) for gl in raw_G] or [Permutation(list(range(N)))]
-    return PermutationGroup(gens)
-
-def prepare_group_chain(G: PermutationGroup, N: int) -> NumbaList:
-    """
-    Run Schreier-Sims once. Returns inverse-transversal matrices per level
-    for use in the canonicalizer (no recomputation).
-    """
-    G.schreier_sims()
-    level_invperms = NumbaList()
-    if N <= np.iinfo(np.uint8).max:
-        perm_dtype = np.uint8
-    else:
-        perm_dtype = np.uint16
-    for orbits, trans in zip(G.basic_orbits, G.basic_transversals):
-        invperm_matrix = np.empty((len(orbits), N), dtype=perm_dtype)
-        for i, u in enumerate(orbits):
-            perm_arr = np.array(trans[u].array_form, dtype=perm_dtype)
-            invperm = np.empty_like(perm_arr)
-            invperm[perm_arr] = np.arange(perm_arr.size, dtype=perm_arr.dtype)
-            invperm_matrix[i] = invperm
-        level_invperms.append(invperm_matrix)
-    return level_invperms
-
-@njit(cache=True, fastmath=True)
-def lexmin_with_invperms(current: np.ndarray, invperms: np.ndarray) -> Tuple[np.ndarray, int]:
-    """Return lex-min vector and its index using inverse-permutation matrix."""
-    m, n = invperms.shape
-    best_idx = 0
-    for i in range(1, m):
-        for j in range(n):
-            a = current[invperms[i, j]]
-            b = current[invperms[best_idx, j]]
-            if a < b:
-                best_idx = i
-                break
-            if a > b:
-                break
-    best_vec = np.empty(n, dtype=current.dtype)
-    for j in range(n):
-        best_vec[j] = current[invperms[best_idx, j]]
-    return best_vec, best_idx
-
-@njit(cache=True, fastmath=True)
-def canonical_leximin_coset_chain_uint64(
-    evt: np.ndarray,
+def _marginal_support_from_perm(
+    perm: Sequence[int],
+    outcome_pattern: Sequence[int],
+    n: int,
     outcomes: int,
+) -> np.ndarray:
+    support = np.empty(n, dtype=np.int64)
+    for i0 in range(n):
+        j0 = int(perm[i0]) - 1
+        support[i0] = (i0 * n + j0) * outcomes + int(outcome_pattern[i0])
+    return support
+
+
+def _marginal_from_support_key(
+    support_key: Tuple[int, ...],
+    n: int,
+    outcomes: int,
+) -> List[List[int]]:
+    by_i: Dict[int, Tuple[int, int]] = {}
+    for coord in support_key:
+        slot, a = divmod(int(coord), outcomes)
+        i = slot // n + 1
+        j = slot % n + 1
+        if i in by_i:
+            raise ValueError("Invalid canonical marginal support: duplicate row assignment.")
+        by_i[i] = (j, a)
+    if len(by_i) != n:
+        raise ValueError("Invalid canonical marginal support: missing row assignment.")
+    return [[1, i, by_i[i][0], 0, by_i[i][1]] for i in range(1, n + 1)]
+
+
+def _generate_canonical_marginals_with_chain(
+    n: int,
+    outcomes: int,
+    N: int,
     level_invperms: NumbaList,
-) -> np.uint64:
+    *,
+    marginal_filter_fn: Callable[[List[List[int]]], bool] | None,
+    show_progress: bool,
+) -> List[List[List[int]]]:
+    seen_keys: set[Tuple[int, ...]] = set()
+    marginals: List[List[List[int]]] = []
+    base_outcomes = tuple(range(outcomes))
+    perm_iter = permutations(range(1, n + 1))
+    perm_iter = tqdm(
+        perm_iter,
+        total=factorial(n),
+        desc="Canonicalizing marginals",
+        disable=not show_progress,
+    )
+    for perm in perm_iter:
+        for pat in product(base_outcomes, repeat=n):
+            support = _marginal_support_from_perm(perm, pat, n, outcomes)
+            canonical_support = canonical_leximin_support_indices(support, N, level_invperms)
+            key = tuple(int(x) for x in canonical_support.tolist())
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            marginal = _marginal_from_support_key(key, n, outcomes)
+            if marginal_filter_fn is not None and not marginal_filter_fn(marginal):
+                continue
+            marginals.append(marginal)
+    return marginals
+
+
+def generate_canonical_marginals(
+    prob: InflationProblem,
+    *,
+    marginal_filter_fn: Callable[[List[List[int]]], bool] | None = None,
+    show_progress: bool = False,
+) -> List[List[List[int]]]:
     """
-    Canonical representative of 'evt' under G using the stabilizer chain.
-    Returns a uint64 key encoded directly from the lex-min one-hot vector.
+    Generate one canonical marginal representative per orbit under prob.symmetries.
     """
-    x = to_lex_representation(evt, outcomes)
-    current_invperm = np.arange(len(x), dtype=level_invperms[0].dtype)
-    best_vec = x
-    levels = len(level_invperms)
-    for k in range(levels):
-        current = x[current_invperm]
-        invperm_matrix = level_invperms[k]
-        cand_vec, cand_idx = lexmin_with_invperms(current, invperm_matrix)
-        current_invperm = current_invperm[invperm_matrix[cand_idx]]
-        best_vec = cand_vec
+    n, outcomes, N, level_invperms = _prepare_group_chain(prob)
+    return _generate_canonical_marginals_with_chain(
+        n,
+        outcomes,
+        N,
+        level_invperms,
+        marginal_filter_fn=marginal_filter_fn,
+        show_progress=show_progress,
+    )
 
-    outcomes_u64 = np.uint64(outcomes)
-    acc = np.uint64(0)
-    base = np.uint64(1)
-    n2 = best_vec.size // outcomes
-    offset = 0
-    for s in range(n2):
-        idx = 0
-        for j in range(outcomes):
-            if best_vec[offset + j] != 0:
-                idx = j
-                break
-        acc += np.uint64(idx) * base  # Base-`outcomes` accumulation from one-hot blocks.
-        if s + 1 < n2:
-            base *= outcomes_u64
-        offset += outcomes
-    return acc
-
-"""
-@njit(types.uint64(uint8[:], int64), cache=True, fastmath=True)
-def event_to_uint64(evt: np.ndarray, outcomes: int) -> np.uint64:
-    "Encode a compact event vector into a single uint64 in base `outcomes`."
-    evt_u64 = evt.astype(np.uint64)
-    outcomes_u64 = np.uint64(outcomes)
-    acc = np.uint64(0)
-    base = np.uint64(1)
-    for i in range(evt_u64.size):
-        acc += evt_u64[i] * base
-        if i + 1 < evt_u64.size:
-            base *= outcomes_u64
-    return acc
-"""
-
-"""
-def uint64_to_event_list(key: int, outcomes: int, n2: int) -> List[int]:
-    "Decode a uint64 key into a compact event list in base `outcomes`."
-    out = [0] * n2
-    for i in range(n2):
-        out[i] = key % outcomes
-        key //= outcomes
-    return out
-"""
 
 @njit(cache=True, fastmath=True)
 def _fill_cols_uint64(
@@ -439,6 +270,7 @@ def _fill_cols_uint64(
         sparse_matrix_cols[start + pos] = event_idx
     return next_event_idx
 
+
 # =========================
 # Cycle extraction & factorized value for a marginal
 # =========================
@@ -450,6 +282,7 @@ def _perm_from_marginal(marginal: List[List[int]]) -> List[int]:
         J[i - 1] = j
     return J
 
+
 def _outcomes_from_marginal(marginal: List[List[int]]) -> List[int]:
     """Extract outcome vector a_i from marginal [[1,i,j,0,a],...], in order i=1..n."""
     n = len(marginal)
@@ -458,8 +291,9 @@ def _outcomes_from_marginal(marginal: List[List[int]]) -> List[int]:
         a[i - 1] = val
     return a
 
+
 def _cycles_from_J(J: List[int]) -> List[List[int]]:
-    """Disjoint cycles of 1-line permutation J on {1..n}; each cycle as a list in cycle order (1-based)."""
+    """Disjoint cycles of 1-line permutation J on {1..n}; each cycle as list (1-based)."""
     n = len(J)
     seen = [False] * (n + 1)
     cycles: List[List[int]] = []
@@ -475,22 +309,43 @@ def _cycles_from_J(J: List[int]) -> List[List[int]]:
         cycles.append(cyc)
     return cycles
 
+
 def factorized_marginal_value(
     marginal: List[List[int]],
-    *,
-    total_outcomes: int = 4,
+    event_prob_fn: Callable[[Iterable[int]], float],
 ) -> float:
     """
-    Multiply EJM loop scalars over the disjoint cycles of J with outcomes taken in cycle order.
-    total_outcomes controls coarse-graining of outcomes in loop_prob_event.
+    Multiply loop scalars over the disjoint cycles of J with outcomes in cycle order.
     """
     J = _perm_from_marginal(marginal)
     a = _outcomes_from_marginal(marginal)
     val = 1.0
     for cyc in _cycles_from_J(J):
         cyc_out = [a[i - 1] for i in cyc]
-        val *= event_prob(cyc_out, total_outcomes=total_outcomes, EJM=True)
+        val *= event_prob_fn(cyc_out)
     return val
+
+
+def compute_known_values(
+    prob: InflationProblem,
+    marginals: List[List[List[int]]],
+    event_prob_fn: Callable[[Iterable[int]], float],
+    *,
+    show_progress: bool = True,
+) -> Tuple[np.ndarray, List[str]]:
+    """
+    Compute known marginal values and their LP variable labels.
+    """
+    known_values = np.empty(len(marginals), dtype=float)
+    known_labels: List[str] = []
+    for idx, marginal in enumerate(
+        tqdm(marginals, desc="Computing marginal values...", disable=not show_progress)
+    ):
+        known_values[idx] = factorized_marginal_value(marginal, event_prob_fn)
+        mkey = tuple(prob._lexrepr_to_names[prob.mon_to_lexrepr(marginal)])
+        known_labels.append("P_global(" + ",".join(mkey) + ")")
+    return known_values, known_labels
+
 
 def representatives_of_global_extensions_uint64(
     n: int,
@@ -499,7 +354,7 @@ def representatives_of_global_extensions_uint64(
     level_invperms: NumbaList,
     global_event_map,
     next_event_idx: int,
-    list_of_all_LP_variables: List[str],
+    list_of_all_LP_variables: List[int],
     total: int,
     sparse_matrix_cols: np.ndarray,
     start: int,
@@ -509,7 +364,7 @@ def representatives_of_global_extensions_uint64(
     Modifies global_event_map, sparse_matrix_cols, list_of_all_LP_variables.
     """
     fixed: Dict[int, int] = {}
-    for (one, i, j, zero, a) in marginal:
+    for (_one, i, j, _zero, a) in marginal:
         si = (i - 1) * n + (j - 1)
         if si in fixed and fixed[si] != a:
             return next_event_idx
@@ -540,72 +395,42 @@ def representatives_of_global_extensions_uint64(
     return next_event_idx
 
 
-# =========================
-# Top-level pipeline
-# =========================
-def run_pipeline(
+def _build_lhs_from_marginals_with_chain(
     prob: InflationProblem,
+    marginals: List[List[List[int]]],
     *,
-    show_progress: bool = True,
-) -> Tuple[np.ndarray, coo_array, coo_array]:
-    """
-    Build the inflation matrix, known values vector, and variable names
-    over all symmetry-reduced marginals for (n, outcomes).
-    """
-    n = prob.inflation_level_per_source[0]
-    outcomes = prob.outcomes_per_party[0]
-    raw_G = prob.symmetries
-    if outcomes >= 255:
-        raise ValueError("outcomes must be < 255 to fit in compact dtypes")
-    assert n <= 5, "uint64 canonical events are only supported up to n=5"
-    max_event_count = pow(outcomes, n * n)
-    assert max_event_count <= np.iinfo(np.uint64).max, "events do not fit in uint64"
-
-    # group acts on one-hot coordinates of size N = n^2 * outcomes
-    N = (n * n) * outcomes
-    if N > np.iinfo(np.uint16).max:
-        raise ValueError("N exceeds uint16 range; use wider dtype for permutations")
-    G = build_sympy_group(raw_G, N)
-    level_invperms = prepare_group_chain(G, N)
-
-    list_of_all_LP_variables = ["1"]
-    marginals = generate_minimal_marginal_events(n, outcomes)
-
+    outcomes: int,
+    level_invperms: NumbaList,
+    show_progress: bool,
+) -> Tuple[np.ndarray, np.ndarray, coo_array]:
     nof_marginals = len(marginals)
+    n = prob.inflation_level_per_source[0]
+
     global_event_map = NumbaDict.empty(key_type=types.uint64, value_type=types.int32)
-    next_event_idx = np.int32(1 + nof_marginals)
+    list_of_all_global_keys: List[int] = []
+    next_event_idx = np.int32(1)  # 0 is reserved as "not present" sentinel
+
     global_extension_count = int(pow(outcomes, n * (n - 1)))
-    total_entries = int(nof_marginals * (1 + global_extension_count))
+    total_entries = int(nof_marginals * global_extension_count)
     sparse_matrix_rows = np.empty(total_entries, dtype=np.int32)
     sparse_matrix_cols = np.empty(total_entries, dtype=np.int32)
     sparse_matrix_data = np.ones(total_entries, dtype=np.int8)
-    sparse_matrix_rows[:nof_marginals] = np.arange(nof_marginals, dtype=np.int32)
-    sparse_matrix_cols[:nof_marginals] = np.arange(1, nof_marginals + 1, dtype=np.int32)
-    sparse_matrix_data[:nof_marginals] = -1
-    # Broadcast to build row indices for all global extensions without a per-row loop.
+
     row_grid = np.broadcast_to(
         np.arange(nof_marginals, dtype=np.int32)[:, None],
         (nof_marginals, global_extension_count),
     )
-    sparse_matrix_rows[nof_marginals:] = row_grid.reshape(-1)
+    sparse_matrix_rows[:] = row_grid.reshape(-1)
 
-    # result = []
-    # LOOP 0: Compute the marginal probabilities
-    known_values = np.empty(nof_marginals, dtype=float)
-    for idx, marginal in enumerate(
-        tqdm(marginals, desc="Computing marginal values...", disable=not show_progress)
-    ):
-        # --- your existing body per marginal ---
-        val = factorized_marginal_value(marginal, total_outcomes=outcomes)  ## This computes the numeric probabilities
+    row_labels: List[Tuple[str, ...]] = []
+    for marginal in marginals:
         mkey = tuple(prob._lexrepr_to_names[prob.mon_to_lexrepr(marginal)])
-        # mkey = tuple(tuple(x) for x in marginal)
-        list_of_all_LP_variables.append("P_global("+",".join(mkey)+")")
-        known_values[idx] = val
+        row_labels.append(mkey)
 
-    # LOOP 1+2: Canonicalize globals and build sparse arrays on the fly
-    for row_num, marginal in enumerate(tqdm(marginals, desc="Finding global extensions...",
-                                           disable=not show_progress)):
-        start = nof_marginals + row_num * global_extension_count
+    for row_num, marginal in enumerate(
+        tqdm(marginals, desc="Finding global extensions...", disable=not show_progress)
+    ):
+        start = row_num * global_extension_count
         next_event_idx = representatives_of_global_extensions_uint64(
             n=n,
             outcomes=outcomes,
@@ -613,45 +438,166 @@ def run_pipeline(
             level_invperms=level_invperms,
             global_event_map=global_event_map,
             next_event_idx=next_event_idx,
-            list_of_all_LP_variables=list_of_all_LP_variables,
+            list_of_all_LP_variables=list_of_all_global_keys,
             total=global_extension_count,
             sparse_matrix_cols=sparse_matrix_cols,
             start=start,
         )
+
     if int(next_event_idx) > np.iinfo(np.int32).max:
         raise ValueError("next_event_idx exceeds int32 range; use wider dtype")
-    inflation_matrix = coo_array((sparse_matrix_data, (sparse_matrix_rows, sparse_matrix_cols)),
-                          shape=(nof_marginals, int(next_event_idx)))
+
+    lhs_matrix = coo_array(
+        (sparse_matrix_data, (sparse_matrix_rows, sparse_matrix_cols)),
+        shape=(nof_marginals, int(next_event_idx)),
+    )
+    lhs_matrix.sum_duplicates()
+
+    return (
+        np.asarray(row_labels, dtype=object),
+        np.asarray(list_of_all_global_keys, dtype=np.uint64),
+        lhs_matrix,
+    )
+
+
+def build_lhs_from_marginals(
+    prob: InflationProblem,
+    marginals: List[List[List[int]]],
+    *,
+    show_progress: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, coo_array]:
+    """
+    Build raw LHS matrix for provided marginals.
+
+    Column 0 is reserved as sentinel and remains unused.
+    """
+    _n, outcomes, _N, level_invperms = _prepare_group_chain(prob)
+    return _build_lhs_from_marginals_with_chain(
+        prob,
+        marginals,
+        outcomes=outcomes,
+        level_invperms=level_invperms,
+        show_progress=show_progress,
+    )
+
+
+# =========================
+# Top-level pipeline
+# =========================
+def run_pipeline(
+    prob: InflationProblem,
+    *,
+    event_prob_fn: Callable[[Iterable[int]], float],
+    marginal_filter_fn: Callable[[List[List[int]]], bool] | None = None,
+    show_progress: bool = True,
+) -> Tuple[np.ndarray, coo_array, coo_array]:
+    """
+    Build variable names, known-values vector, and inflation matrix.
+    """
+    n, outcomes, N, level_invperms = _prepare_group_chain(prob)
+
+    marginals = _generate_canonical_marginals_with_chain(
+        n,
+        outcomes,
+        N,
+        level_invperms,
+        marginal_filter_fn=marginal_filter_fn,
+        show_progress=show_progress,
+    )
+    nof_marginals = len(marginals)
+
+    known_values, known_labels = compute_known_values(
+        prob,
+        marginals,
+        event_prob_fn,
+        show_progress=show_progress,
+    )
+    _row_labels, global_keys, lhs_raw = _build_lhs_from_marginals_with_chain(
+        prob,
+        marginals,
+        outcomes=outcomes,
+        level_invperms=level_invperms,
+        show_progress=show_progress,
+    )
+
+    lhs_coo = lhs_raw.tocoo()
+    shifted_cols = lhs_coo.col.astype(np.int64, copy=True)
+    mask = shifted_cols != 0
+    shifted_cols[mask] += nof_marginals
+
+    known_rows = np.arange(nof_marginals, dtype=np.int32)
+    known_cols = np.arange(1, nof_marginals + 1, dtype=np.int32)
+    known_data = -np.ones(nof_marginals, dtype=np.int8)
+
+    all_rows = np.concatenate([known_rows, lhs_coo.row.astype(np.int32, copy=False)])
+    all_cols = np.concatenate([known_cols, shifted_cols.astype(np.int32, copy=False)])
+    all_data = np.concatenate([known_data, lhs_coo.data.astype(np.int8, copy=False)])
+
+    total_cols = nof_marginals + lhs_raw.shape[1]
+    inflation_matrix = coo_array(
+        (all_data, (all_rows, all_cols)),
+        shape=(nof_marginals, total_cols),
+    )
     inflation_matrix.sum_duplicates()
 
     known_positions = np.arange(1, nof_marginals + 1, dtype=np.int32)
-    known_rows = np.broadcast_to(np.int32(0), (nof_marginals,))
-    known_vars_coo_vec = coo_array((known_values, (known_rows, known_positions)),
-                                   shape=(1, int(next_event_idx)))
-    variable_names = np.asarray(list_of_all_LP_variables, dtype=str)
+    known_rows0 = np.zeros(nof_marginals, dtype=np.int32)
+    known_vars_coo_vec = coo_array(
+        (known_values, (known_rows0, known_positions)),
+        shape=(1, total_cols),
+    )
+
+    variable_names = np.asarray(
+        ["1", *known_labels, *[str(k) for k in global_keys.tolist()]],
+        dtype=str,
+    )
 
     return variable_names, known_vars_coo_vec, inflation_matrix
 
+
 # =========================
-# Example of usage
+# Example usage
 # =========================
 if __name__ == "__main__":
+    from functools import partial
+
+    from inflation.distributions.ejm import prob_event_loop as ejm_prob_event_loop
+    from inflation.distributions.nsi_pr import prob_event_loop as nsi_pr_prob_event_loop
+    from inflation.distributions.rgb import prob_event_loop as rgb_prob_event_loop
     from inflation.lp.lp_utils import solveLP_sparse
-    # Example: n=4, outcomes=3
-    n, outcomes = 4, 3
-    # One small example group on N = n^2 * outcomes = 4 * 4 = 16 coordinates:
-    #   - identity
-    #   - swap within each outcome block of the four operator slots (toy example)
+
+    # --- Pipeline configuration ---
+    n, outcomes = 3, 2
+    include_outcome_relabel_symmetries = True
+    cache_name = "lp_cache_nsi_pi_n=3.npz"
+
+    # Users should provide a fully configured callable, optionally via functools.partial.
+    # EJM (raw):
+    # event_prob_fn = ejm_prob_event_loop
+    # RGB (coarse-grained):
+    # event_prob_fn = partial(
+    #     rgb_prob_event_loop,
+    #     u=np.sqrt(0.9),
+    #     lambda0=np.sqrt(0.5),
+    #     coarsen=[[0, 3], [1], [2]],
+    # )
+    # NSI-PR:
+    # event_prob_fn = nsi_pr_prob_event_loop
+    # NSI-PI (same backend as NSI-PR module naming):
+    nsi_pi_prob_event_loop = nsi_pr_prob_event_loop
+    event_prob_fn = nsi_pi_prob_event_loop
+
     prob = ring_problem(n, outcomes)
-    prob.add_symmetries(prob._setting_specific_outcome_relabelling_symmetries)
-    
+    if include_outcome_relabel_symmetries:
+        prob.add_symmetries(prob._setting_specific_outcome_relabelling_symmetries)
     print("done with prob")
 
-    
-    def _save_cache(path: Path,
-                    variable_names: np.ndarray,
-                    known_vars_coo_vec: coo_array,
-                    inflation_matrix: coo_array) -> None:
+    def _save_cache(
+        path: Path,
+        variable_names: np.ndarray,
+        known_vars_coo_vec: coo_array,
+        inflation_matrix: coo_array,
+    ) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
             path,
@@ -681,39 +627,34 @@ if __name__ == "__main__":
                     np.array(0, dtype=known_positions.dtype),
                     known_positions.shape,
                 )
-                known_vars_coo_vec = coo_array((known_values, (known_rows, known_positions)),
-                                               shape=(1, inflation_shape[1]))
+                known_vars_coo_vec = coo_array(
+                    (known_values, (known_rows, known_positions)),
+                    shape=(1, inflation_shape[1]),
+                )
             variable_names = z["variable_names"]
             return variable_names, known_vars_coo_vec, inflation_matrix
 
     cache_dir = Path(__file__).resolve().parent / "cache"
-    cache_path = cache_dir / f"lp_cache_n{n}_o{outcomes}.npz"
+    cache_path = cache_dir / cache_name
 
     if cache_path.exists():
         print(f"Loading cached LP constraints from {cache_path}")
         variable_names, known_vars_coo_vec, inflation_matrix = _load_cache(cache_path)
     else:
-        variable_names, known_vars_coo_vec, inflation_matrix = run_pipeline(prob)
+        variable_names, known_vars_coo_vec, inflation_matrix = run_pipeline(
+            prob,
+            event_prob_fn=event_prob_fn,
+        )
         _save_cache(cache_path, variable_names, known_vars_coo_vec, inflation_matrix)
 
     nof_all_LP_vars = inflation_matrix.shape[1]
-    # # Print a small summary
-    # for idx, (e1, e2) in enumerate(out):
-    #     print(f"\nItem {idx}:")
-    #     # marginal & value
-    #     (marginal_key, val) = next(iter(e1.items()))
-    #     print("  marginal:", list(list(t) for t in marginal_key))
-    #     print("  value:   ", val)
-    #     # reps & counts
-    #     print("  reps (compact evt) -> count:")
-    #     for rep, cnt in e2.items():
-    #         print("   ", list(rep), "->", cnt)
-
-    solution = solveLP_sparse(objective=coo_array(([], ([], [])), shape=(1, nof_all_LP_vars)),
-                              known_vars=known_vars_coo_vec,
-                              equalities=inflation_matrix,
-                              default_non_negative=True,
-                              variables=variable_names,
-                              verbose=True)
+    solution = solveLP_sparse(
+        objective=coo_array(([], ([], [])), shape=(1, nof_all_LP_vars)),
+        known_vars=known_vars_coo_vec,
+        equalities=inflation_matrix,
+        default_non_negative=True,
+        variables=variable_names,
+        verbose=True,
+    )
 
     print(solution["status"])

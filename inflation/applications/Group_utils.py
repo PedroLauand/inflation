@@ -135,3 +135,65 @@ def canonical_leximin_coset_chain_uint64(
             base *= outcomes_u64
         offset += outcomes
     return acc
+
+
+@njit(cache=True, fastmath=True)
+def canonical_leximin_support_indices(
+    support_indices: np.ndarray,
+    N: int,
+    level_invperms: NumbaList,
+) -> np.ndarray:
+    """
+    Canonicalize a sparse one-hot support under the group chain.
+
+    Parameters
+    ----------
+    support_indices : np.ndarray[int64]
+        Coordinates set to True in a boolean vector of length N.
+    N : int
+        Ambient coordinate count.
+    level_invperms : NumbaList
+        Inverse-transversal matrices from prepare_group_chain.
+
+    Returns
+    -------
+    np.ndarray[int64]
+        Sorted indices of the canonical support.
+    """
+    x = np.zeros(N, dtype=np.bool_)
+    for idx in support_indices:
+        x[idx] = True
+
+    if len(level_invperms) == 0:
+        count = 0
+        for i in range(N):
+            if x[i]:
+                count += 1
+        out = np.empty(count, dtype=np.int64)
+        pos = 0
+        for i in range(N):
+            if x[i]:
+                out[pos] = i
+                pos += 1
+        return out
+
+    current_invperm = np.arange(N, dtype=level_invperms[0].dtype)
+    best_vec = x
+    for k in range(len(level_invperms)):
+        current = x[current_invperm]
+        invperm_matrix = level_invperms[k]
+        cand_vec, cand_idx = lexmin_with_invperms(current, invperm_matrix)
+        current_invperm = current_invperm[invperm_matrix[cand_idx]]
+        best_vec = cand_vec
+
+    count = 0
+    for i in range(N):
+        if best_vec[i]:
+            count += 1
+    out = np.empty(count, dtype=np.int64)
+    pos = 0
+    for i in range(N):
+        if best_vec[i]:
+            out[pos] = i
+            pos += 1
+    return out

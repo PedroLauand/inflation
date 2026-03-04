@@ -141,6 +141,11 @@ dmypy.json
 *.jtask
 *.json
 
+# Generated cache artifacts (can still be added manually with `git add -f`)
+inflation/applications/cache/
+**/cache/*.npz
+*cache*.npz
+
 #Visual Studio IDE
 .vs/
 arena.py
