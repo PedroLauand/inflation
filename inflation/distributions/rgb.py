@@ -70,7 +70,8 @@ def _native_loop_prob_cached(
     for x in canonical_native_event:
         pmat = pmat * M[x]
     amp = sp.trace(pmat)
-    prob = sp.simplify((amp * sp.conjugate(amp)) / (sp.Integer(16) ** len(canonical_native_event)))
+    # RGB uses normalized operators/state, so no global 16^{-n} scaling is needed.
+    prob = sp.simplify(amp * sp.conjugate(amp))
     return sp.simplify(prob)
 
 
