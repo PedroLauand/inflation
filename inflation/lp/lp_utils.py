@@ -49,10 +49,14 @@ def canonical_order(coo_mat: coo_array):
     return coo_mat
 
 def _signed_index_dtype(max_index: int) -> np.dtype:
-    dtype = np.dtype(np.min_scalar_type(max_index))
-    if dtype.kind == "u":
-        dtype = np.dtype(f"int{dtype.itemsize * 8}")
-    return dtype
+    # Choose the smallest signed integer dtype that can represent max_index.
+    if max_index <= np.iinfo(np.int8).max:
+        return np.dtype(np.int8)
+    if max_index <= np.iinfo(np.int16).max:
+        return np.dtype(np.int16)
+    if max_index <= np.iinfo(np.int32).max:
+        return np.dtype(np.int32)
+    return np.dtype(np.int64)
 
 def _ensure_index_dtype(coo_mat: coo_array, idx_dtype: np.dtype) -> coo_array:
     if coo_mat.row.dtype != idx_dtype:
