@@ -545,9 +545,9 @@ if __name__ == "__main__":
     from inflation.lp.lp_utils import solveLP_sparse
 
     # --- Pipeline configuration ---
-    n, outcomes = 3, 2
+    n, outcomes = 4, 2
     include_outcome_relabel_symmetries = True
-    cache_name = "lp_cache_nsi_pi_n=3_with_outcome_relabelling.npz"
+    cache_name = "lp_cache_nsi_pi_n=4_with_outcome_relabelling.npz"
 
     # Users should provide a fully configured callable, optionally via functools.partial.
     # EJM (raw):
