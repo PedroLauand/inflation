@@ -25,7 +25,7 @@ def ring_problem(inflation_level: int, nof_outcomes: int = 2) -> InflationProble
 
 def main() -> None:
     prob = ring_problem(4, 2)
-    prob.add_symmetries(prob._setting_specific_outcome_relabelling_symmetries)
+    # prob.add_symmetries(prob._setting_specific_outcome_relabelling_symmetries) # NOT SAFE TO USE ON NSI!
 
     ring_SDP = InflationSDP(prob, verbose=2, include_all_outcomes=False)
     ring_SDP.generate_relaxation("physical2")
