@@ -151,7 +151,7 @@ if __name__ == "__main__":
     prob = inf_problem(n, outcomes)
     if include_outcome_relabel_symmetries:
         prob.add_symmetries(prob._setting_specific_outcome_relabelling_symmetries)
-    print("done with prob")
+    
 
     sqrt2 = np.sqrt(2.0)
     E_line = {
