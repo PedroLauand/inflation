@@ -162,7 +162,7 @@ if __name__ == "__main__":
     E_loop = {
         1: 0.0,
         2: 1.0,
-        3: 0,
+        3: 2.0 - sqrt2,
     }
 
     sanity_check_loop_distributions(E_line, E_loop, tol=1e-9)
