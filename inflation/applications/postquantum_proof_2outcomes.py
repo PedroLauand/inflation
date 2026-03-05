@@ -15,7 +15,7 @@ def ring_problem(inflation_level: int, nof_outcomes: int = 2) -> InflationProble
         dag={"i1": ["A"], "i2": ["A"]},
         outcomes_per_party=(nof_outcomes,),
         settings_per_party=(1,),
-        classical_sources=None,
+        classical_sources="all",
         inflation_level_per_source=(inflation_level, inflation_level),
         order=["A"],
         really_just_one_source=True,
@@ -51,4 +51,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
