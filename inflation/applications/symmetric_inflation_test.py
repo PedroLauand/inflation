@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import List, Tuple
+from itertools import product
 import sys
 
 import numpy as np
@@ -69,6 +70,44 @@ def loop_prob_from_correlators(
     return total / (2**m)
 
 
+def sanity_check_loop_distributions(
+    E_line: dict[int, float],
+    E_loop: dict[int, float],
+    *,
+    tol: float = 1e-9,
+) -> None:
+    """
+    Print basic sanity checks for loop distributions implied by correlators.
+
+    For each loop length m in E_loop, we check:
+      - normalization: sum_{a in {0,1}^m} P(a) ~= 1
+      - non-negativity: min P(a) >= -tol
+    """
+    lengths = sorted(E_loop.keys())
+    if not lengths:
+        print("No loop lengths found in E_loop; skipping sanity checks.")
+        return
+
+    print("\nLoop distribution sanity checks:")
+    for m in lengths:
+        outcomes_list = list(product((0, 1), repeat=m))
+        probs = np.array(
+            [loop_prob_from_correlators(out, E_line, E_loop) for out in outcomes_list],
+            dtype=float,
+        )
+        total = float(probs.sum())
+        min_p = float(probs.min(initial=np.inf))
+        max_p = float(probs.max(initial=-np.inf))
+        neg_count = int((probs < -tol).sum())
+        over_count = int((probs > 1.0 + tol).sum())
+
+        print(f"  m={m}: sum={total:.12g} (|sum-1|={abs(total-1.0):.3g})")
+        print(
+            f"       min={min_p:.12g}, max={max_p:.12g}, "
+            f"negatives={neg_count}, >1={over_count}"
+        )
+
+
 class PrepLPExpectations(PrepLP):
     """
     Expectation-parameterized subclass of PrepLP.
@@ -125,6 +164,8 @@ if __name__ == "__main__":
         2: 1.0,
         3: 0,
     }
+
+    sanity_check_loop_distributions(E_line, E_loop, tol=1e-9)
 
     def _save_cache(
         path: Path,
