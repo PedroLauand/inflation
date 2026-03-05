@@ -561,9 +561,7 @@ if __name__ == "__main__":
     # )
     # NSI-PR:
     # event_prob_fn = nsi_pr_prob_event_loop
-    # NSI-PI (same backend as NSI-PR module naming):
-    nsi_pi_prob_event_loop = nsi_pr_prob_event_loop
-    event_prob_fn = nsi_pi_prob_event_loop
+    event_prob_fn = nsi_pr_prob_event_loop
 
     prob = ring_problem(n, outcomes)
     if include_outcome_relabel_symmetries:

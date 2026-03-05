@@ -118,12 +118,12 @@ if __name__ == "__main__":
     E_line = {
         1: 0.0,
         2: sqrt2 - 1.0,
-        3: 3.0 - 2.0 * sqrt2,
+        # 3: 3.0 - 2.0 * sqrt2,
     }
     E_loop = {
         1: 0.0,
         2: 1.0,
-        3: 2.0 - sqrt2,
+        3: 0,
     }
 
     def _save_cache(
