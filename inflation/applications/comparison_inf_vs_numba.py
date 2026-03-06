@@ -23,8 +23,9 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from inflation import InflationProblem, InflationSDP
-from postquantum_2outcomes import prob_line, prob_loop
-from symmetric_inflation_test import inf_problem, build_eq_system
+from inflation.applications.ring_utils import build_off_diagonal_ring_problem
+from inflation.applications.symmetric_inflation_test import build_eq_system, inf_problem
+from inflation.distributions import NSIPRDistribution
 
 
 # --------------------------------------------------------------------
@@ -32,28 +33,24 @@ from symmetric_inflation_test import inf_problem, build_eq_system
 # --------------------------------------------------------------------
 
 def _ring_problem_classical(inflation_level: int, nof_outcomes: int = 2) -> InflationProblem:
-    return InflationProblem(
-        dag={"i1": ["A"], "i2": ["A"]},
-        outcomes_per_party=(nof_outcomes,),
-        settings_per_party=(1,),
+    return build_off_diagonal_ring_problem(
+        inflation_level,
+        nof_outcomes,
         classical_sources="all",
-        inflation_level_per_source=(inflation_level, inflation_level),
-        order=["A"],
-        really_just_one_source=True,
     )
 
 
 def _collect_postquantum_system() -> Tuple[coo_array, np.ndarray, np.ndarray]:
     prob = _ring_problem_classical(3, 2)
+    distribution = NSIPRDistribution()
     sdp = InflationSDP(prob, verbose=0, include_all_outcomes=False)
     sdp.generate_relaxation("physical2")
 
     values = {
-        "P[A^{1,1}=0]": prob_loop(1),
-        "P[A^{1,2}=0]": prob_line(1),
-        "P[A^{1,2}=0 A^{2,1}=0]": prob_loop(2),
-        "P[A^{1,2}=0 A^{2,3}=0]": prob_line(2),
-        "P[A^{1,2}=0 A^{2,3}=0 A^{3,1}=0]": prob_loop(3),
+        "P[A^{1,2}=0]": float(distribution.prob_event_line([0])),
+        "P[A^{1,2}=0 A^{2,1}=0]": float(distribution.prob_event_loop([0, 0])),
+        "P[A^{1,2}=0 A^{2,3}=0]": float(distribution.prob_event_line([0, 0])),
+        "P[A^{1,2}=0 A^{2,3}=0 A^{3,1}=0]": float(distribution.prob_event_loop([0, 0, 0])),
     }
     sdp.update_values(values=values, only_specified_values=False)
 

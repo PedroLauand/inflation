@@ -12,10 +12,9 @@ from __future__ import annotations
 
 from collections import Counter
 from functools import cached_property
-from itertools import permutations, product
-from math import factorial
+from itertools import combinations, permutations, product
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Sequence, Tuple
 import sys
 
 import numpy as np
@@ -38,11 +37,12 @@ from inflation.applications.Group_utils import (
     canonical_leximin_support_indices,
     prepare_group_chain,
 )
+from inflation.applications.ring_utils import build_off_diagonal_ring_problem
 from inflation.distributions.protocols import RingDistributionProtocol
 from inflation.symmetry_utils import discovery_symmetries_from_predicate
 
 ZERO_I32 = np.int32(0)
-CACHE_FORMAT_VERSION = np.int64(2)
+CACHE_FORMAT_VERSION = np.int64(4)
 
 
 def _min_signed_dtype(bound: int) -> np.dtype:
@@ -58,56 +58,12 @@ def _min_signed_dtype(bound: int) -> np.dtype:
     return np.dtype(np.int64)
 
 
-# ===================================
-# Inflation problem
-# ===================================
-def exists_shared_source_modified(
-    inf_indices1: np.ndarray,
-    inf_indices2: np.ndarray,
-) -> bool:
-    common_sources = np.logical_and(inf_indices1, inf_indices2)
-    if not np.any(common_sources):
-        return False
-    return not set(inf_indices1[common_sources]).isdisjoint(set(inf_indices2[common_sources]))
-
-
-def overlap_matrix(all_inflation_indxs: np.ndarray) -> np.ndarray:
-    n = len(all_inflation_indxs)
-    adj_mat = np.eye(n, dtype=bool)
-    for i in range(1, n):
-        inf_indices_i = all_inflation_indxs[i]
-        for j in range(i):
-            inf_indices_j = all_inflation_indxs[j]
-            if exists_shared_source_modified(inf_indices_i, inf_indices_j):
-                adj_mat[i, j] = True
-    adj_mat = np.logical_or(adj_mat, adj_mat.T)
-    return adj_mat
-
-
 def ring_problem(inflation_level: int, distribution: RingDistributionProtocol) -> InflationProblem:
-    nof_outcomes = int(distribution.nof_outcomes)
-    inf_prob = InflationProblem(
-        dag={"i1": ["A"], "i2": ["A"]},
-        outcomes_per_party=[nof_outcomes],
-        settings_per_party=[1],
-        classical_sources=None,
-        inflation_level_per_source=(inflation_level, inflation_level),
-        order=("A",),
+    return build_off_diagonal_ring_problem(
+        inflation_level,
+        int(distribution.nof_outcomes),
+        classical_sources="all",
     )
-
-    to_stabilize = np.flatnonzero(inf_prob._lexorder[:, 1] == inf_prob._lexorder[:, 2])
-
-    # Fix factorization
-    inf_prob._inflation_indices_overlap = overlap_matrix(inf_prob._all_unique_inflation_indices)
-
-    # Fix symmetries
-    new_symmetries = np.array(
-        [perm for perm in inf_prob.symmetries if np.array_equal(np.sort(perm[to_stabilize]), to_stabilize)],
-        dtype=int,
-    )
-    inf_prob.symmetries = new_symmetries
-
-    return inf_prob
 
 
 def _prepare_group_chain(
@@ -120,11 +76,14 @@ def _prepare_group_chain(
         raise ValueError("outcomes must be < 255 to fit in compact dtypes")
     if n > 5:
         raise ValueError("uint64 canonical events are only supported up to n=5")
-    max_event_count = pow(outcomes, n * n)
+    if prob._nr_operators % outcomes != 0:
+        raise ValueError("Ring lexorder width must be divisible by the number of outcomes")
+    slot_count = prob._nr_operators // outcomes
+    max_event_count = pow(outcomes, slot_count)
     if max_event_count > np.iinfo(np.uint64).max:
         raise ValueError("events do not fit in uint64")
 
-    N = (n * n) * outcomes
+    N = prob._nr_operators
     if N > np.iinfo(np.uint16).max:
         raise ValueError("N exceeds uint16 range; use wider dtype for permutations")
     if symmetries is None:
@@ -134,16 +93,37 @@ def _prepare_group_chain(
     return n, outcomes, N, level_invperms
 
 
-def _marginal_support_from_perm(
-    perm: Sequence[int],
+def _offdiag_slot_index(i: int, j: int, n: int) -> int:
+    if i == j:
+        raise ValueError("Off-diagonal ring slots do not support self-loops")
+    i0 = i - 1
+    j0 = j - 1
+    return i0 * (n - 1) + j0 - int(j0 > i0)
+
+
+def _slot_index_to_pair(slot: int, n: int) -> Tuple[int, int]:
+    i0, pos = divmod(int(slot), n - 1)
+    j0 = pos if pos < i0 else pos + 1
+    return i0 + 1, j0 + 1
+
+
+def _derangements(labels: Sequence[int]) -> Iterator[Tuple[int, ...]]:
+    for perm in permutations(labels):
+        if all(src != dst for src, dst in zip(labels, perm)):
+            yield perm
+
+
+def _marginal_support_from_cycle_cover(
+    domain: Sequence[int],
+    image: Sequence[int],
     outcome_pattern: Sequence[int],
     n: int,
     outcomes: int,
 ) -> np.ndarray:
-    support = np.empty(n, dtype=np.int64)
-    for i0 in range(n):
-        j0 = int(perm[i0]) - 1
-        support[i0] = (i0 * n + j0) * outcomes + int(outcome_pattern[i0])
+    support = np.empty(len(domain), dtype=np.int64)
+    for idx, (i, j, outcome) in enumerate(zip(domain, image, outcome_pattern)):
+        slot = _offdiag_slot_index(int(i), int(j), n)
+        support[idx] = slot * outcomes + int(outcome)
     return support
 
 
@@ -153,16 +133,23 @@ def _marginal_from_support_key(
     outcomes: int,
 ) -> List[List[int]]:
     by_i: Dict[int, Tuple[int, int]] = {}
+    incoming: Dict[int, int] = {}
     for coord in support_key:
         slot, a = divmod(int(coord), outcomes)
-        i = slot // n + 1
-        j = slot % n + 1
+        i, j = _slot_index_to_pair(slot, n)
         if i in by_i:
             raise ValueError("Invalid canonical marginal support: duplicate row assignment.")
+        if j in incoming:
+            raise ValueError("Invalid canonical marginal support: duplicate column assignment.")
+        if i == j:
+            raise ValueError("Invalid canonical marginal support: self-loops are forbidden.")
         by_i[i] = (j, a)
-    if len(by_i) != n:
-        raise ValueError("Invalid canonical marginal support: missing row assignment.")
-    return [[1, i, by_i[i][0], 0, by_i[i][1]] for i in range(1, n + 1)]
+        incoming[j] = i
+    if not by_i:
+        raise ValueError("Invalid canonical marginal support: empty support.")
+    if set(by_i) != set(incoming):
+        raise ValueError("Invalid canonical marginal support: support is not a cycle cover.")
+    return [[1, i, by_i[i][0], 0, by_i[i][1]] for i in sorted(by_i)]
 
 
 def _average_orbit_label(labels: Sequence[str]) -> str:
@@ -214,38 +201,56 @@ def _fill_cols_uint64(
 # =========================
 # Cycle extraction & factorized value for a marginal
 # =========================
-def _perm_from_marginal(marginal: List[List[int]]) -> List[int]:
-    """Extract 1-line permutation J (1..n) from marginal [[1,i,j,0,a],...]."""
-    n = len(marginal)
-    J = [0] * n
-    for (_, i, j, _, _) in marginal:
-        J[i - 1] = j
+def _perm_from_marginal(marginal: List[List[int]]) -> Dict[int, int]:
+    """Extract the participating partial permutation `i -> j` from a marginal."""
+    J: Dict[int, int] = {}
+    incoming: set[int] = set()
+    for (_one, i, j, _zero, _a) in marginal:
+        i_int = int(i)
+        j_int = int(j)
+        if i_int == j_int:
+            raise ValueError("Ring marginals cannot contain self-loops.")
+        if i_int in J:
+            raise ValueError("Marginal has duplicate outgoing assignments.")
+        if j_int in incoming:
+            raise ValueError("Marginal has duplicate incoming assignments.")
+        J[i_int] = j_int
+        incoming.add(j_int)
+    if set(J) != incoming:
+        raise ValueError("Marginal is not a disjoint union of cycles.")
     return J
 
 
-def _outcomes_from_marginal(marginal: List[List[int]]) -> List[int]:
-    """Extract outcome vector a_i from marginal [[1,i,j,0,a],...], in order i=1..n."""
-    n = len(marginal)
-    a = [0] * n
-    for (_, i, _j, _, val) in marginal:
-        a[i - 1] = val
+def _outcomes_from_marginal(marginal: List[List[int]]) -> Dict[int, int]:
+    """Extract the outcome assignment for the participating copy labels."""
+    a: Dict[int, int] = {}
+    for (_one, i, _j, _zero, val) in marginal:
+        i_int = int(i)
+        if i_int in a:
+            raise ValueError("Marginal has duplicate outcome assignments.")
+        a[i_int] = int(val)
     return a
 
 
-def _cycles_from_J(J: List[int]) -> List[List[int]]:
-    """Disjoint cycles of 1-line permutation J on {1..n}; each cycle as list (1-based)."""
-    n = len(J)
-    seen = [False] * (n + 1)
+def _cycles_from_J(J: Dict[int, int]) -> List[List[int]]:
+    """Disjoint cycles of a partial permutation on its participating subset."""
+    if set(J) != set(J.values()):
+        raise ValueError("Partial permutation is not a cycle cover.")
+    seen: set[int] = set()
     cycles: List[List[int]] = []
-    for start in range(1, n + 1):
-        if seen[start]:
+    for start in sorted(J):
+        if start in seen:
             continue
         cyc = []
         v = start
-        while not seen[v]:
-            seen[v] = True
+        while v not in seen:
+            seen.add(v)
             cyc.append(v)
-            v = J[v - 1]
+            v = J[v]
+        if v != start:
+            raise ValueError("Partial permutation orbit does not close to a cycle.")
+        if len(cyc) == 1:
+            raise ValueError("Ring marginals cannot contain 1-cycles.")
         cycles.append(cyc)
     return cycles
 
@@ -255,13 +260,13 @@ def factorized_marginal_value(
     distribution: RingDistributionProtocol,
 ) -> sp.Expr:
     """
-    Multiply loop scalars over the disjoint cycles of J with outcomes in cycle order.
+    Multiply loop scalars over the disjoint cycles on the participating subset.
     """
     J = _perm_from_marginal(marginal)
     a = _outcomes_from_marginal(marginal)
     val = sp.Integer(1)
     for cyc in _cycles_from_J(J):
-        cyc_out = [a[i - 1] for i in cyc]
+        cyc_out = [a[i] for i in cyc]
         val *= distribution.prob_event_loop(cyc_out)
     return val
 
@@ -284,11 +289,11 @@ def representatives_of_global_extensions_uint64(
     """
     fixed: Dict[int, int] = {}
     for (_one, i, j, _zero, a) in marginal:
-        si = (i - 1) * n + (j - 1)
+        si = _offdiag_slot_index(int(i), int(j), n)
         if si in fixed and fixed[si] != a:
             return next_event_idx
         fixed[si] = a
-    Nslots = n * n
+    Nslots = n * (n - 1)
     fixed_idx = np.fromiter(fixed.keys(), dtype=np.int64)
     fixed_val = np.fromiter(fixed.values(), dtype=np.uint8)
     mask = np.ones(Nslots, dtype=bool)
@@ -530,8 +535,13 @@ class PrepLP:
 
     @property
     def N(self) -> int:
-        """One-hot ambient dimension `n*n*outcomes` for group action."""
+        """One-hot ambient dimension `n*(n-1)*outcomes` for group action."""
         return self._core_group_chain_data[2]
+
+    @property
+    def nof_off_diagonal_slots(self) -> int:
+        """Number of off-diagonal copy-index slots in the ring global event."""
+        return self.n * (self.n - 1)
 
     @property
     def core_level_invperms(self) -> NumbaList:
@@ -552,28 +562,32 @@ class PrepLP:
         marginals: List[List[List[int]]] = []
         support_keys: List[Tuple[int, ...]] = []
         base_outcomes = tuple(range(self.outcomes))
-        perm_iter = permutations(range(1, self.n + 1))
-        perm_iter = tqdm(
-            perm_iter,
-            total=factorial(self.n),
+        copy_labels = tuple(range(1, self.n + 1))
+        total_candidates = sum(
+            sum(1 for _ in _derangements(subset)) * (self.outcomes ** len(subset))
+            for subset_size in range(2, self.n + 1)
+            for subset in combinations(copy_labels, subset_size)
+        )
+        progress = tqdm(
+            total=total_candidates,
             desc="Canonicalizing marginals",
             disable=not self.show_progress,
         )
-        for perm in perm_iter:
-            for pat in product(base_outcomes, repeat=self.n):
-                # Candidate marginal -> sparse one-hot support in ambient coordinates.
-                support = _marginal_support_from_perm(perm, pat, self.n, self.outcomes)
-                # Canonicalize and dedupe by support key.
-                canonical_support = canonical_leximin_support_indices(support, self.N, self.core_level_invperms)
-                key = tuple(int(x) for x in canonical_support.tolist())
-                if key in seen_keys:
-                    continue
-                seen_keys.add(key)
-                marginal = _marginal_from_support_key(key, self.n, self.outcomes)
-                if self.marginal_filter_fn is not None and not self.marginal_filter_fn(marginal):
-                    continue
-                marginals.append(marginal)
-                support_keys.append(key)
+        for subset_size in range(2, self.n + 1):
+            for subset in combinations(copy_labels, subset_size):
+                for image in _derangements(subset):
+                    for pat in product(base_outcomes, repeat=subset_size):
+                        support = _marginal_support_from_cycle_cover(subset, image, pat, self.n, self.outcomes)
+                        canonical_support = canonical_leximin_support_indices(support, self.N, self.core_level_invperms)
+                        key = tuple(int(x) for x in canonical_support.tolist())
+                        if key not in seen_keys:
+                            marginal = _marginal_from_support_key(key, self.n, self.outcomes)
+                            if self.marginal_filter_fn is None or self.marginal_filter_fn(marginal):
+                                seen_keys.add(key)
+                                marginals.append(marginal)
+                                support_keys.append(key)
+                        progress.update(1)
+        progress.close()
         return marginals, support_keys
 
     @property
@@ -604,8 +618,8 @@ class PrepLP:
         Compute value and copy-index-free cycle-factorized label for one marginal.
 
         Example:
-          P_global(A^{1,1}=1,A^{2,2}=1,A^{3,3}=0)
-          -> P_loop(A=1)^2*P_loop(A=0)
+          P_global(A^{1,2}=1,A^{2,3}=0,A^{3,1}=1)
+          -> P_loop(A=1,A=0,A=1)
         """
         J = _perm_from_marginal(marginal)
         cycles = _cycles_from_J(J)
@@ -614,6 +628,8 @@ class PrepLP:
         value = sp.Integer(1)
 
         for cyc in cycles:
+            if len(cyc) < 2:
+                raise ValueError("Ring marginals cannot contain 1-cycles.")
             cycle_mon = np.asarray([by_i[i] for i in cyc], dtype=np.intc)
             lex = self.prob.mon_to_lexrepr(cycle_mon)
             copy_free_names = tuple(self.prob._lexrepr_to_copy_index_free_names[lex])
@@ -830,6 +846,17 @@ class PrepLP:
         return len(self.marginals)
 
     @cached_property
+    def row_extension_counts(self) -> np.ndarray:
+        """Number of compatible global extensions for each final marginal row."""
+        counts = np.empty(self.nof_marginals, dtype=np.int64)
+        for row_num, marginal in enumerate(self.marginals):
+            free_slots = self.nof_off_diagonal_slots - len(marginal)
+            if free_slots < 0:
+                raise ValueError("Marginal fixes more slots than the off-diagonal ring supports.")
+            counts[row_num] = pow(self.outcomes, free_slots)
+        return counts
+
+    @cached_property
     def _canonical_global_lhs_payload(self) -> Tuple[coo_array, int, np.dtype, np.ndarray]:
         """
         Tuple `(inflation_matrix, nof_caonical_global_events, min_dtype, global_keys)`
@@ -839,9 +866,17 @@ class PrepLP:
         list_of_all_global_keys: List[int] = []
         next_event_idx = np.int32(1 + self.nof_marginals)
 
-        global_extension_count = int(pow(self.outcomes, self.n * (self.n - 1)))
-        total_entries = int(self.nof_marginals * global_extension_count)
-        sparse_matrix_rows = np.repeat(np.arange(self.nof_marginals, dtype=np.int32), global_extension_count)
+        row_extension_counts = self.row_extension_counts
+        row_starts = np.empty(self.nof_marginals, dtype=np.int64)
+        if self.nof_marginals > 0:
+            row_starts[0] = 0
+        if self.nof_marginals > 1:
+            row_starts[1:] = np.cumsum(row_extension_counts[:-1], dtype=np.int64)
+        total_entries = int(row_extension_counts.sum(dtype=np.int64))
+        sparse_matrix_rows = np.repeat(
+            np.arange(self.nof_marginals, dtype=np.int32),
+            row_extension_counts,
+        )
         sparse_matrix_cols = np.empty(total_entries, dtype=np.int32)
         sparse_matrix_data = np.ones(total_entries, dtype=np.int8)
 
@@ -849,7 +884,7 @@ class PrepLP:
         for row_num, marginal in enumerate(
             tqdm(self.marginals, desc="Finding global extensions...", disable=not self.show_progress)
         ):
-            start = row_num * global_extension_count
+            start = int(row_starts[row_num])
             next_event_idx = representatives_of_global_extensions_uint64(
                 n=self.n,
                 outcomes=self.outcomes,
@@ -858,7 +893,7 @@ class PrepLP:
                 global_event_map=global_event_map,
                 next_event_idx=next_event_idx,
                 list_of_all_LP_variables=list_of_all_global_keys,
-                total=global_extension_count,
+                total=int(row_extension_counts[row_num]),
                 sparse_matrix_cols=sparse_matrix_cols,
                 start=start,
             )
@@ -963,10 +998,10 @@ if __name__ == "__main__":
     n = 4
 
     demos = [
-        ("NSI-PR", NSIPRDistribution()),
         ("EJM", EJMDistribution()),
         ("EJM coarse [[0],[1],[2,3]]", EJMDistribution(coarsen=[[0], [1], [2, 3]])),
         ("RGB", RGBDistribution()),
+        ("NSI-PR", NSIPRDistribution()),
     ]
 
     demo_preps: dict[str, PrepLP] = {}

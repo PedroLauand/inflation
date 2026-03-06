@@ -7,20 +7,16 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from inflation import InflationProblem, InflationSDP
+from inflation.applications.ring_utils import build_off_diagonal_ring_problem
 from inflation.distributions import NSIPRDistribution
 
 
 def ring_problem(inflation_level: int, nof_outcomes: int = 2) -> InflationProblem:
-    inf_prob = InflationProblem(
-        dag={"i1": ["A"], "i2": ["A"]},
-        outcomes_per_party=(nof_outcomes,),
-        settings_per_party=(1,),
+    return build_off_diagonal_ring_problem(
+        inflation_level,
+        nof_outcomes,
         classical_sources="all",
-        inflation_level_per_source=(inflation_level, inflation_level),
-        order=["A"],
-        really_just_one_source=True,
     )
-    return inf_prob
 
 
 def main() -> None:
@@ -35,7 +31,6 @@ def main() -> None:
     print(ring_SDP.physical_atoms)
 
     values = {
-        "P[A^{1,1}=0]": float(distribution.prob_event_loop([0])),
         "P[A^{1,2}=0]": float(distribution.prob_event_line([0])),
         "P[A^{1,2}=0 A^{2,1}=0]": float(distribution.prob_event_loop([0, 0])),
         "P[A^{1,2}=0 A^{2,3}=0]": float(distribution.prob_event_line([0, 0])),

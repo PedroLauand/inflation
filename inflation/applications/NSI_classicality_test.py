@@ -1,16 +1,15 @@
 """
 NSI_classicality_test.py
 --------------------------------------------------------------------
-Example test for classicality constraints using all-zero loop
-probabilities, random 1-body marginals, and single-1 loop events set to 0
-in the binary-output case.
+Example test for classicality constraints in the off-diagonal ring
+semantics, using all-zero loop probabilities and single-1 loop events set
+to 0 in the binary-output case.
 
 Setup:
   - outcomes = 2
   - n = 4
   - impose P(0...0) via the NSI-PR loop constructor
-  - impose random 1-body marginal P(A=0)=p for single-site loops
-  - impose P(0...1...0)=0 for loop length >= 3 (all positions of the 1)
+  - impose P(0...1...0)=0 for loop length >= 2 (all positions of the 1)
 --------------------------------------------------------------------
 """
 
@@ -31,15 +30,12 @@ from scipy.sparse import coo_array
 from inflation.distributions import NSIPRDistribution
 from inflation.applications.Final_algo_numba import (
     PrepLP,
+    _cycles_from_J,
     _perm_from_marginal,
     _outcomes_from_marginal,
-    _cycles_from_J,
 )
 
 
-# Uniform 1-body marginal: P(A=0)=P(A=1)=1/2 for any single-site loop.
-_P1_ZERO = sp.Rational(1, 2)
-_P1_ONE = sp.Rational(1, 2)
 _NSI = NSIPRDistribution()
 
 
@@ -47,19 +43,14 @@ def prob_zero_or_single_one_event(outcomes: Iterable[int]) -> sp.Expr:
     """
     Event probability for a cycle:
       - all zeros: NSI-PR prob_event_loop([0] * len(outcomes))
-      - length 1: random 1-body marginal (P(0)=_P1_ZERO, P(1)=_P1_ONE)
-      - exactly one '1' and length >= 3: 0
+      - exactly one '1' and length >= 2: 0
     """
     out = tuple(int(x) for x in outcomes)
-    if len(out) == 1:
-        if out[0] == 0:
-            return _P1_ZERO
-        if out[0] == 1:
-            return _P1_ONE
-        raise ValueError("Binary outcomes only for length-1 cycles.")
+    if len(out) < 2:
+        raise ValueError("Off-diagonal ring cycles must have length at least 2.")
     if all(x == 0 for x in out):
         return _NSI.prob_event_loop([0] * len(out))
-    if len(out) >= 3 and sum(out) == 1 and all(x in (0, 1) for x in out):
+    if sum(out) == 1 and all(x in (0, 1) for x in out):
         return sp.Integer(0)
     raise ValueError("Unsupported outcome pattern for this test.")
 
@@ -80,20 +71,15 @@ def _marginal_supported(marginal) -> bool:
     """
     Keep marginals whose cycle outcomes are either:
       - all zeros, or
-      - any single-bit outcome for cycles of length 1, or
-      - exactly one 1 for cycles of length >= 3.
+      - exactly one 1 for cycles of length >= 2.
     """
     J = _perm_from_marginal(marginal)
     a = _outcomes_from_marginal(marginal)
     for cyc in _cycles_from_J(J):
-        cyc_out = [a[i - 1] for i in cyc]
-        if len(cyc_out) == 1:
-            if cyc_out[0] in (0, 1):
-                continue
-            return False
+        cyc_out = [a[i] for i in cyc]
         if all(x == 0 for x in cyc_out):
             continue
-        if len(cyc_out) >= 3 and sum(cyc_out) == 1 and all(x in (0, 1) for x in cyc_out):
+        if sum(cyc_out) == 1 and all(x in (0, 1) for x in cyc_out):
             continue
         return False
     return True
@@ -102,7 +88,6 @@ def _marginal_supported(marginal) -> bool:
 if __name__ == "__main__":
     n = 4
     distribution = ZeroSingleOneDistribution()
-    print(f"uniform 1-body marginal P(A=0)={float(_P1_ZERO):.6f}")
 
     prep = PrepLP(
         n,
