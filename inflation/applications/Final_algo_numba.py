@@ -42,6 +42,20 @@ from inflation.distributions.protocols import RingDistributionProtocol
 from inflation.symmetry_utils import discovery_symmetries_from_predicate
 
 ZERO_I32 = np.int32(0)
+CACHE_FORMAT_VERSION = np.int64(2)
+
+
+def _min_signed_dtype(bound: int) -> np.dtype:
+    """Choose the smallest signed integer dtype that can represent ``bound``."""
+    if bound < 0:
+        raise ValueError("bound must be non-negative")
+    if bound <= np.iinfo(np.int8).max:
+        return np.dtype(np.int8)
+    if bound <= np.iinfo(np.int16).max:
+        return np.dtype(np.int16)
+    if bound <= np.iinfo(np.int32).max:
+        return np.dtype(np.int32)
+    return np.dtype(np.int64)
 
 
 # ===================================
@@ -340,8 +354,11 @@ class PrepLP:
         self._cached_variable_names: np.ndarray | None = None
         self._cached_known_vars: coo_array | None = None
         self._cached_inflation_matrix: coo_array | None = None
+        self._cached_global_keys: np.ndarray | None = None
+        self._cached_nof_caonical_global_events: int | None = None
+        self._cached_min_dtype: np.dtype | None = None
         self._cache_written = False
-        self._load_cache_if_available()
+        self._initialize_cache()
 
     @cached_property
     def cache_path(self) -> Path | None:
@@ -350,36 +367,106 @@ class PrepLP:
         cache_dir = Path(__file__).resolve().parent / "cache"
         return cache_dir / self.cache_name
 
+    @staticmethod
+    def _incompatible_cache_error() -> ValueError:
+        return ValueError("Incompatible cache already exists with that name")
+
+    def _initialize_cache(self) -> None:
+        if self.cache_path is None:
+            return
+        # Cache compatibility depends on live distribution-induced symmetries.
+        _ = self.known_labels
+        if self.cache_path.exists():
+            self._load_cache_if_available()
+            return
+        inflation_matrix = self.inflation_matrix
+        variable_names = self.variable_names
+        self._save_cache(variable_names, inflation_matrix)
+
     def _load_cache_if_available(self) -> None:
         if self.cache_path is None or not self.cache_path.exists():
             return
-        with np.load(self.cache_path, allow_pickle=False) as z:
-            row_idx = z["inflation_matrix_row_indices"]
-            col_idx = z["inflation_matrix_columns_indices"]
-            data = z["inflation_matrix_data_entries"]
-            n_rows = int(np.max(row_idx)) + 1 if row_idx.size else 0
-            n_cols = int(np.max(col_idx)) + 1 if col_idx.size else 0
-            inflation_shape = (n_rows, n_cols)
-            self._cached_inflation_matrix = coo_array((data, (row_idx, col_idx)), shape=inflation_shape)
+        live_known_prefix = np.asarray(["1", *self.known_labels], dtype=str)
+        try:
+            with np.load(self.cache_path, allow_pickle=False) as z:
+                required = {
+                    "cache_format_version",
+                    "requested_n",
+                    "outcomes",
+                    "ambient_dimension",
+                    "original_symmetry_generators",
+                    "discovered_symmetry_generators",
+                    "inflation_matrix_shape",
+                    "inflation_matrix_row_indices",
+                    "inflation_matrix_columns_indices",
+                    "inflation_matrix_data_entries",
+                    "variable_names",
+                }
+                if any(key not in z.files for key in required):
+                    raise self._incompatible_cache_error()
+                if int(z["cache_format_version"]) != int(CACHE_FORMAT_VERSION):
+                    raise self._incompatible_cache_error()
+                if int(z["requested_n"]) != self._requested_n:
+                    raise self._incompatible_cache_error()
+                if int(z["outcomes"]) != self.outcomes:
+                    raise self._incompatible_cache_error()
+                if int(z["ambient_dimension"]) != self.N:
+                    raise self._incompatible_cache_error()
 
-            known_positions = z["known_positions"]
-            known_values = z["known_values"]
-            if known_values.size == 0:
-                self._cached_known_vars = coo_array((1, inflation_shape[1]), dtype=float)
-            else:
-                known_rows = np.broadcast_to(np.array(0, dtype=known_positions.dtype), known_positions.shape)
-                self._cached_known_vars = coo_array(
-                    (known_values, (known_rows, known_positions)),
-                    shape=(1, inflation_shape[1]),
-                )
-            self._cached_variable_names = z["variable_names"]
+                cached_core_symmetries = np.asarray(z["original_symmetry_generators"], dtype=int)
+                if not np.array_equal(cached_core_symmetries, self.core_symmetries):
+                    raise self._incompatible_cache_error()
+
+                cached_discovered_symmetries = np.asarray(z["discovered_symmetry_generators"], dtype=int)
+                if not np.array_equal(cached_discovered_symmetries, self.discovered_symmetries):
+                    raise self._incompatible_cache_error()
+
+                variable_names = np.asarray(z["variable_names"], dtype=str)
+                if variable_names.size < live_known_prefix.size:
+                    raise self._incompatible_cache_error()
+                if not np.array_equal(variable_names[: live_known_prefix.size], live_known_prefix):
+                    raise self._incompatible_cache_error()
+
+                inflation_shape_raw = np.asarray(z["inflation_matrix_shape"], dtype=np.int64)
+                if inflation_shape_raw.shape != (2,):
+                    raise self._incompatible_cache_error()
+                inflation_shape = tuple(int(x) for x in inflation_shape_raw.tolist())
+                if inflation_shape[0] != self.nof_marginals:
+                    raise self._incompatible_cache_error()
+                if inflation_shape[1] != variable_names.size:
+                    raise self._incompatible_cache_error()
+
+                nof_caonical_global_events = inflation_shape[1] - live_known_prefix.size
+                if nof_caonical_global_events < 0:
+                    raise self._incompatible_cache_error()
+                global_name_slice = variable_names[live_known_prefix.size :]
+                if global_name_slice.size != nof_caonical_global_events:
+                    raise self._incompatible_cache_error()
+                try:
+                    global_keys = np.asarray(global_name_slice, dtype=np.uint64)
+                except (TypeError, ValueError) as exc:
+                    raise self._incompatible_cache_error() from exc
+
+                row_idx = np.asarray(z["inflation_matrix_row_indices"])
+                col_idx = np.asarray(z["inflation_matrix_columns_indices"])
+                data = np.asarray(z["inflation_matrix_data_entries"])
+                self._cached_inflation_matrix = coo_array((data, (row_idx, col_idx)), shape=inflation_shape)
+                self._cached_variable_names = variable_names
+                self._cached_global_keys = global_keys
+                self._cached_nof_caonical_global_events = nof_caonical_global_events
+                self._cached_min_dtype = _min_signed_dtype(inflation_shape[1])
+        except ValueError as exc:
+            if str(exc) == str(self._incompatible_cache_error()):
+                raise
+            raise self._incompatible_cache_error() from exc
+        except (OSError, TypeError, KeyError) as exc:
+            raise self._incompatible_cache_error() from exc
         if self.verbose_cache:
             print(f"Loaded cached LP constraints from {self.cache_path}")
 
     def _save_cache(
         self,
         variable_names: np.ndarray,
-        known_vars: coo_array,
         inflation_matrix: coo_array,
     ) -> None:
         if self.cache_path is None or self._cache_written:
@@ -387,12 +474,17 @@ class PrepLP:
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
             self.cache_path,
+            cache_format_version=CACHE_FORMAT_VERSION,
+            requested_n=np.int64(self._requested_n),
+            outcomes=np.int64(self.outcomes),
+            ambient_dimension=np.int64(self.N),
+            original_symmetry_generators=np.asarray(self.core_symmetries, dtype=int),
+            discovered_symmetry_generators=np.asarray(self.discovered_symmetries, dtype=int),
+            inflation_matrix_shape=np.asarray(inflation_matrix.shape, dtype=np.int64),
             inflation_matrix_columns_indices=inflation_matrix.col,
             inflation_matrix_row_indices=inflation_matrix.row,
             inflation_matrix_data_entries=inflation_matrix.data,
             variable_names=variable_names,
-            known_values=known_vars.data,
-            known_positions=known_vars.col,
         )
         self._cache_written = True
         if self.verbose_cache:
@@ -738,24 +830,20 @@ class PrepLP:
         return len(self.marginals)
 
     @cached_property
-    def _canonical_global_lhs_payload(self) -> Tuple[np.ndarray, coo_array]:
+    def _canonical_global_lhs_payload(self) -> Tuple[coo_array, int, np.dtype, np.ndarray]:
         """
-        Pair `(global_keys, lhs_raw)` for canonical global-event extension constraints.
+        Tuple `(inflation_matrix, nof_caonical_global_events, min_dtype, global_keys)`
+        for canonical global-event extension constraints.
         """
         global_event_map = NumbaDict.empty(key_type=types.uint64, value_type=types.int32)
         list_of_all_global_keys: List[int] = []
-        next_event_idx = np.int32(1)  # 0 is reserved as "not present" sentinel
+        next_event_idx = np.int32(1 + self.nof_marginals)
 
         global_extension_count = int(pow(self.outcomes, self.n * (self.n - 1)))
         total_entries = int(self.nof_marginals * global_extension_count)
-        sparse_matrix_rows = np.empty(total_entries, dtype=np.int32)
+        sparse_matrix_rows = np.repeat(np.arange(self.nof_marginals, dtype=np.int32), global_extension_count)
         sparse_matrix_cols = np.empty(total_entries, dtype=np.int32)
         sparse_matrix_data = np.ones(total_entries, dtype=np.int8)
-        row_grid = np.broadcast_to(
-            np.arange(self.nof_marginals, dtype=np.int32)[:, None],
-            (self.nof_marginals, global_extension_count),
-        )
-        sparse_matrix_rows[:] = row_grid.reshape(-1)
 
         # Enumerate global extensions and canonicalize each extension to a column key.
         for row_num, marginal in enumerate(
@@ -776,58 +864,60 @@ class PrepLP:
             )
         if int(next_event_idx) > np.iinfo(np.int32).max:
             raise ValueError("next_event_idx exceeds int32 range; use wider dtype")
+        nof_caonical_global_events = int(next_event_idx) - (1 + self.nof_marginals)
+        min_dtype = _min_signed_dtype(int(next_event_idx))
+        sparse_matrix_cols = sparse_matrix_cols.astype(min_dtype, copy=False)
 
-        lhs_raw = coo_array(
-            (sparse_matrix_data, (sparse_matrix_rows, sparse_matrix_cols)),
+        known_rows = np.arange(self.nof_marginals, dtype=np.int32)
+        known_cols = np.arange(1, self.nof_marginals + 1, dtype=min_dtype)
+        known_data = -np.ones(self.nof_marginals, dtype=np.int8)
+
+        all_rows = np.concatenate([known_rows, sparse_matrix_rows])
+        all_cols = np.concatenate([known_cols, sparse_matrix_cols])
+        all_data = np.concatenate([known_data, sparse_matrix_data])
+        inflation_matrix = coo_array(
+            (all_data, (all_rows, all_cols)),
             shape=(self.nof_marginals, int(next_event_idx)),
         )
-        lhs_raw.sum_duplicates()
+        inflation_matrix.sum_duplicates()
         global_keys = np.asarray(list_of_all_global_keys, dtype=np.uint64)
-        return global_keys, lhs_raw
+        if global_keys.size != nof_caonical_global_events:
+            raise ValueError("global_keys count does not match the number of canonical global events")
+        return inflation_matrix, nof_caonical_global_events, min_dtype, global_keys
 
     @property
     def global_keys(self) -> np.ndarray:
-        """Canonical uint64 keys of global-event LP columns (excluding sentinel 0)."""
-        return self._canonical_global_lhs_payload[0]
+        """Canonical uint64 keys of global-event LP columns."""
+        if self._cached_global_keys is not None:
+            return self._cached_global_keys
+        return self._canonical_global_lhs_payload[3]
 
     @property
-    def lhs_raw(self) -> coo_array:
-        """Raw sparse LHS matrix with sentinel column 0 kept."""
+    def nof_caonical_global_events(self) -> int:
+        """Number of canonical global-event LP columns beyond `1` and known marginals."""
+        if self._cached_nof_caonical_global_events is not None:
+            return self._cached_nof_caonical_global_events
         return self._canonical_global_lhs_payload[1]
 
-    @cached_property
+    @property
+    def min_dtype(self) -> np.dtype:
+        """Smallest signed integer dtype that can represent all LP column indices."""
+        if self._cached_min_dtype is not None:
+            return self._cached_min_dtype
+        return self._canonical_global_lhs_payload[2]
+
+    @property
     def inflation_matrix(self) -> coo_array:
         """Final sparse equality matrix combining known-value and extension constraints."""
         if self._cached_inflation_matrix is not None:
             return self._cached_inflation_matrix
-        lhs_coo = self.lhs_raw
-        shifted_cols = lhs_coo.col.astype(np.int64, copy=True)
-        mask = shifted_cols != 0
-        shifted_cols[mask] += self.nof_marginals
-
-        known_rows = np.arange(self.nof_marginals, dtype=np.int32)
-        known_cols = np.arange(1, self.nof_marginals + 1, dtype=np.int32)
-        known_data = -np.ones(self.nof_marginals, dtype=np.int8)
-
-        all_rows = np.concatenate([known_rows, lhs_coo.row.astype(np.int32, copy=False)])
-        all_cols = np.concatenate([known_cols, shifted_cols.astype(np.int32, copy=False)])
-        all_data = np.concatenate([known_data, lhs_coo.data.astype(np.int8, copy=False)])
-
-        total_cols = self.nof_marginals + self.lhs_raw.shape[1]
-        inflation_matrix = coo_array(
-            (all_data, (all_rows, all_cols)),
-            shape=(self.nof_marginals, total_cols),
-        )
-        inflation_matrix.sum_duplicates()
-        self._cached_inflation_matrix = inflation_matrix
-        self._save_cache(self.variable_names, self.known_vars, inflation_matrix)
-        return inflation_matrix
+        return self._canonical_global_lhs_payload[0]
 
     @cached_property
     def known_vars_symbolic(self) -> coo_array:
         """Sparse symbolic known-variables row vector aligned with `inflation_matrix` columns."""
-        total_cols = self.nof_marginals + self.lhs_raw.shape[1]
-        known_positions = np.arange(1, self.nof_marginals + 1, dtype=np.int32)
+        total_cols = self.inflation_matrix.shape[1]
+        known_positions = np.arange(1, self.nof_marginals + 1, dtype=self.min_dtype)
         known_rows0 = np.zeros(self.nof_marginals, dtype=np.int32)
         return coo_array(
             (self.known_values_symbolic, (known_rows0, known_positions)),
@@ -840,8 +930,8 @@ class PrepLP:
         """Sparse float known-variables row vector aligned with `inflation_matrix` columns."""
         if self._cached_known_vars is not None:
             return self._cached_known_vars
-        total_cols = self.nof_marginals + self.lhs_raw.shape[1]
-        known_positions = np.arange(1, self.nof_marginals + 1, dtype=np.int32)
+        total_cols = self.inflation_matrix.shape[1]
+        known_positions = np.arange(1, self.nof_marginals + 1, dtype=self.min_dtype)
         known_rows0 = np.zeros(self.nof_marginals, dtype=np.int32)
         known_vars = coo_array(
             (self.known_values, (known_rows0, known_positions)),

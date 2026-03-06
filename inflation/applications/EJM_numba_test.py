@@ -11,7 +11,6 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
-import numpy as np
 import mosek
 from scipy.sparse import coo_array
 
@@ -23,22 +22,6 @@ if str(_REPO_ROOT) not in sys.path:
 from inflation.applications.Final_algo_numba import PrepLP
 from inflation.distributions import EJMDistribution
 from inflation.lp.lp_utils import solveLP_sparse
-
-
-def _min_index_dtype(n_constraints: int, n_variables: int, n_known: int) -> np.dtype:
-    """
-    Match solveLP_sparse index sizing: max over (constraints, variables, 2*known).
-    Returns the smallest signed integer dtype that can hold that max index.
-    """
-    max_size = max(n_constraints, n_variables, n_known * 2, 1)
-    max_index = max_size - 1
-    if max_index <= np.iinfo(np.int8).max:
-        return np.dtype(np.int8)
-    if max_index <= np.iinfo(np.int16).max:
-        return np.dtype(np.int16)
-    if max_index <= np.iinfo(np.int32).max:
-        return np.dtype(np.int32)
-    return np.dtype(np.int64)
 
 
 def main(*, n: int) -> None:
@@ -53,14 +36,9 @@ def main(*, n: int) -> None:
     variable_names = prep.variable_names
     known_vars = prep.known_vars
     inflation_matrix = prep.inflation_matrix
-    min_dtype = _min_index_dtype(
-        n_constraints=inflation_matrix.shape[0] + known_vars.nnz,
-        n_variables=inflation_matrix.shape[1],
-        n_known=int(known_vars.nnz),
-    )
     print(
         "Index dtype (min signed):",
-        min_dtype.name,
+        prep.min_dtype.name,
         "| constraints:", inflation_matrix.shape[0] + known_vars.nnz,
         "| variables:", inflation_matrix.shape[1],
         "| known:", int(known_vars.nnz),
