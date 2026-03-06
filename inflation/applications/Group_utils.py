@@ -62,11 +62,12 @@ def prepare_group_chain(G: PermutationGroup, N: int) -> NumbaList:
     for use in the canonicalizer (no recomputation).
     """
     G.schreier_sims()
-    level_invperms = NumbaList()
     if N <= np.iinfo(np.uint8).max:
         perm_dtype = np.uint8
+        level_invperms = NumbaList.empty_list(types.uint8[:, :])
     else:
         perm_dtype = np.uint16
+        level_invperms = NumbaList.empty_list(types.uint16[:, :])
     for orbits, trans in zip(G.basic_orbits, G.basic_transversals):
         invperm_matrix = np.empty((len(orbits), N), dtype=perm_dtype)
         for i, u in enumerate(orbits):
@@ -109,15 +110,16 @@ def canonical_leximin_coset_chain_uint64(
     Returns a uint64 key encoded directly from the lex-min one-hot vector.
     """
     x = to_lex_representation(evt, outcomes)
-    current_invperm = np.arange(len(x), dtype=level_invperms[0].dtype)
     best_vec = x
     levels = len(level_invperms)
-    for k in range(levels):
-        current = x[current_invperm]
-        invperm_matrix = level_invperms[k]
-        cand_vec, cand_idx = lexmin_with_invperms(current, invperm_matrix)
-        current_invperm = current_invperm[invperm_matrix[cand_idx]]
-        best_vec = cand_vec
+    if levels > 0:
+        current_invperm = np.arange(len(x), dtype=level_invperms[0].dtype)
+        for k in range(levels):
+            current = x[current_invperm]
+            invperm_matrix = level_invperms[k]
+            cand_vec, cand_idx = lexmin_with_invperms(current, invperm_matrix)
+            current_invperm = current_invperm[invperm_matrix[cand_idx]]
+            best_vec = cand_vec
 
     outcomes_u64 = np.uint64(outcomes)
     acc = np.uint64(0)

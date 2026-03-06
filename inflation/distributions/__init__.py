@@ -1,5 +1,13 @@
-"""Standardized event-probability distributions."""
+"""Standardized ring-distribution classes."""
 
-from . import ejm, nsi_pr, rgb
+from .ejm import EJMDistribution
+from .nsi_pr import NSIPRDistribution
+from .protocols import RingDistributionProtocol
+from .rgb import RGBDistribution
 
-__all__ = ["ejm", "rgb", "nsi_pr"]
+__all__ = [
+    "RingDistributionProtocol",
+    "EJMDistribution",
+    "RGBDistribution",
+    "NSIPRDistribution",
+]

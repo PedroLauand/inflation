@@ -32,11 +32,11 @@ def _native_M() -> tuple[sp.Matrix, ...]:
 
 @lru_cache(maxsize=None)
 def _native_loop_prob_cached(canonical_native_event: tuple[int, ...]) -> sp.Expr:
-    M = _native_M()
-    pmat = sp.eye(2)
+    mats = _native_M()
+    product_mat = sp.eye(2)
     for x in canonical_native_event:
-        pmat = pmat * M[x]
-    amp = sp.trace(pmat)
+        product_mat = product_mat * mats[x]
+    amp = sp.trace(product_mat)
     prob = sp.simplify((amp * sp.conjugate(amp)) / (sp.Integer(16) ** len(canonical_native_event)))
     return sp.simplify(prob)
 
@@ -57,49 +57,30 @@ def _coarsened_line_prob_cached(
     event: tuple[int, ...],
     coarsen_key: NativeCoarsen,
 ) -> sp.Expr:
-    alphabet = len(coarsen_key)
     return line_from_loop(
         event,
-        loop_prob_fn=lambda ext: _coarsened_loop_prob_cached(
-            cyclic_canonical(ext),
-            coarsen_key,
-        ),
-        alphabet_size=alphabet,
+        loop_prob_fn=lambda ext: _coarsened_loop_prob_cached(cyclic_canonical(ext), coarsen_key),
+        alphabet_size=len(coarsen_key),
     )
 
 
-def prob_event_loop(
-    outcomes: Iterable[int],
-    *,
-    coarsen: Sequence[Sequence[int]] | None = None,
-) -> float:
-    """
-    Probability P[a1,...,an] on an n-site ring for the EJM distribution.
+class EJMDistribution:
+    """Exact EJM distribution with optional coarse-graining set at construction."""
 
-    Parameters
-    ----------
-    outcomes
-        Event outcome list in the coarsened alphabet.
-    coarsen
-        Strict partition of native outcomes {0,1,2,3}. Group order defines
-        the coarse labels. Example: [[0, 1], [2], [3]].
-    """
-    coarsen_key = normalize_coarsen(coarsen, native_outcomes=4)
-    event = cyclic_canonical(parse_outcomes(outcomes, max_outcome=len(coarsen_key) - 1))
-    return float(_coarsened_loop_prob_cached(event, coarsen_key))
+    def __init__(self, *, coarsen: Sequence[Sequence[int]] | None = None) -> None:
+        self._coarsen_key = normalize_coarsen(coarsen, native_outcomes=4)
+
+    @property
+    def nof_outcomes(self) -> int:
+        return len(self._coarsen_key)
+
+    def prob_event_loop(self, outcomes: Iterable[int]) -> sp.Expr:
+        event = cyclic_canonical(parse_outcomes(outcomes, max_outcome=self.nof_outcomes - 1))
+        return _coarsened_loop_prob_cached(event, self._coarsen_key)
+
+    def prob_event_line(self, outcomes: Iterable[int]) -> sp.Expr:
+        event = parse_outcomes(outcomes, max_outcome=self.nof_outcomes - 1)
+        return _coarsened_line_prob_cached(event, self._coarsen_key)
 
 
-def prob_event_line(
-    outcomes: Iterable[int],
-    *,
-    coarsen: Sequence[Sequence[int]] | None = None,
-) -> float:
-    """
-    Probability P[a1,...,an] on an n-site open chain for the EJM distribution.
-    """
-    coarsen_key = normalize_coarsen(coarsen, native_outcomes=4)
-    event = parse_outcomes(outcomes, max_outcome=len(coarsen_key) - 1)
-    return float(_coarsened_line_prob_cached(event, coarsen_key))
-
-
-__all__ = ["prob_event_loop", "prob_event_line"]
+__all__ = ["EJMDistribution"]

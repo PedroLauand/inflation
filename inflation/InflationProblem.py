@@ -1205,7 +1205,7 @@ class InflationProblem:
         return np.unique(group_generators, axis=0)
 
     @cached_property
-    def _all_possible_symmetries(self) -> np.ndarray:
+    def all_possible_symmetries(self) -> np.ndarray:
         group_elements = group_elements_from_generators(self.all_possible_symmetry_generators)
         return group_elements
 

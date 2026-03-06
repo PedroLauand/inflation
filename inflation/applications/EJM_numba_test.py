@@ -20,8 +20,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from inflation.applications.Final_algo_numba import PrepLP, ring_problem
-from inflation.distributions.ejm import prob_event_loop as ejm_prob_event_loop
+from inflation.applications.Final_algo_numba import PrepLP
+from inflation.distributions import EJMDistribution
 from inflation.lp.lp_utils import solveLP_sparse
 
 
@@ -41,30 +41,29 @@ def _min_index_dtype(n_constraints: int, n_variables: int, n_known: int) -> np.d
     return np.dtype(np.int64)
 
 
-def main(*, n: int, outcomes: int) -> None:
-    prob = ring_problem(n, outcomes)
-    print("done with prob")
-
+def main(*, n: int) -> None:
+    distribution = EJMDistribution()
     prep = PrepLP(
-        prob,
-        event_prob_fn=ejm_prob_event_loop,
+        n,
+        distribution,
+        cache_name=None,
         auto_discover_symmetries=True,
         compress_rows_under_discovered_group=True,
     )
     variable_names = prep.variable_names
-    known_vars_coo_vec = prep.known_vars_coo_vec
+    known_vars = prep.known_vars
     inflation_matrix = prep.inflation_matrix
     min_dtype = _min_index_dtype(
-        n_constraints=inflation_matrix.shape[0] + known_vars_coo_vec.nnz,
+        n_constraints=inflation_matrix.shape[0] + known_vars.nnz,
         n_variables=inflation_matrix.shape[1],
-        n_known=int(known_vars_coo_vec.nnz),
+        n_known=int(known_vars.nnz),
     )
     print(
         "Index dtype (min signed):",
         min_dtype.name,
-        "| constraints:", inflation_matrix.shape[0] + known_vars_coo_vec.nnz,
+        "| constraints:", inflation_matrix.shape[0] + known_vars.nnz,
         "| variables:", inflation_matrix.shape[1],
-        "| known:", int(known_vars_coo_vec.nnz),
+        "| known:", int(known_vars.nnz),
     )
 
     nof_all_LP_vars = inflation_matrix.shape[1]
@@ -73,7 +72,7 @@ def main(*, n: int, outcomes: int) -> None:
     }
     solution = solveLP_sparse(
         objective=coo_array(([], ([], [])), shape=(1, nof_all_LP_vars)),
-        known_vars=known_vars_coo_vec,
+        known_vars=known_vars,
         equalities=inflation_matrix,
         default_non_negative=True,
         variables=variable_names,
@@ -84,5 +83,5 @@ def main(*, n: int, outcomes: int) -> None:
 
 
 if __name__ == "__main__":
-    n, outcomes = 4, 4
-    main(n=n, outcomes=outcomes)
+    n = 4
+    main(n=n)

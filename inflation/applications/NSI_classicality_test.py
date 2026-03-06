@@ -19,6 +19,8 @@ from typing import Iterable
 from pathlib import Path
 import sys
 
+import sympy as sp
+
 # Ensure repo root is on sys.path so "import inflation" works when running this file directly.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
@@ -26,10 +28,9 @@ if str(_REPO_ROOT) not in sys.path:
 
 from inflation.lp.lp_utils import solveLP_sparse
 from scipy.sparse import coo_array
-from inflation.distributions.nsi_pr import prob_event_loop as nsi_pr_prob_event_loop
+from inflation.distributions import NSIPRDistribution
 from inflation.applications.Final_algo_numba import (
     PrepLP,
-    ring_problem,
     _perm_from_marginal,
     _outcomes_from_marginal,
     _cycles_from_J,
@@ -37,11 +38,12 @@ from inflation.applications.Final_algo_numba import (
 
 
 # Uniform 1-body marginal: P(A=0)=P(A=1)=1/2 for any single-site loop.
-_P1_ZERO = 0.5
-_P1_ONE = 0.5
+_P1_ZERO = sp.Rational(1, 2)
+_P1_ONE = sp.Rational(1, 2)
+_NSI = NSIPRDistribution()
 
 
-def prob_zero_or_single_one_event(outcomes: Iterable[int]) -> float:
+def prob_zero_or_single_one_event(outcomes: Iterable[int]) -> sp.Expr:
     """
     Event probability for a cycle:
       - all zeros: NSI-PR prob_event_loop([0] * len(outcomes))
@@ -56,10 +58,22 @@ def prob_zero_or_single_one_event(outcomes: Iterable[int]) -> float:
             return _P1_ONE
         raise ValueError("Binary outcomes only for length-1 cycles.")
     if all(x == 0 for x in out):
-        return nsi_pr_prob_event_loop([0] * len(out))
+        return _NSI.prob_event_loop([0] * len(out))
     if len(out) >= 3 and sum(out) == 1 and all(x in (0, 1) for x in out):
-        return 0.0
+        return sp.Integer(0)
     raise ValueError("Unsupported outcome pattern for this test.")
+
+
+class ZeroSingleOneDistribution:
+    @property
+    def nof_outcomes(self) -> int:
+        return 2
+
+    def prob_event_loop(self, outcomes: Iterable[int]) -> sp.Expr:
+        return prob_zero_or_single_one_event(outcomes)
+
+    def prob_event_line(self, outcomes: Iterable[int]) -> sp.Expr:
+        raise NotImplementedError("This test only uses loop-event probabilities.")
 
 
 def _marginal_supported(marginal) -> bool:
@@ -86,27 +100,24 @@ def _marginal_supported(marginal) -> bool:
 
 
 if __name__ == "__main__":
-    n, outcomes = 4, 2
-
-    prob = ring_problem(n, outcomes)
-    # Optional: add outcome relabeling symmetries
-    # prob.add_symmetries(prob._setting_specific_outcome_relabelling_symmetries)
-    print(f"uniform 1-body marginal P(A=0)={_P1_ZERO:.6f}")
-    print("done with prob")
+    n = 4
+    distribution = ZeroSingleOneDistribution()
+    print(f"uniform 1-body marginal P(A=0)={float(_P1_ZERO):.6f}")
 
     prep = PrepLP(
-        prob,
-        event_prob_fn=prob_zero_or_single_one_event,
+        n,
+        distribution,
+        cache_name=None,
         marginal_filter_fn=_marginal_supported,
     )
     variable_names = prep.variable_names
-    known_vars_coo_vec = prep.known_vars_coo_vec
+    known_vars = prep.known_vars
     inflation_matrix = prep.inflation_matrix
     nof_all_LP_vars = inflation_matrix.shape[1]
 
     solution = solveLP_sparse(
         objective=coo_array(([], ([], [])), shape=(1, nof_all_LP_vars)),
-        known_vars=known_vars_coo_vec,
+        known_vars=known_vars,
         equalities=inflation_matrix,
         default_non_negative=True,
         variables=variable_names,

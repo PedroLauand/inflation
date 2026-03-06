@@ -7,7 +7,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from inflation import InflationProblem, InflationSDP
-from inflation.distributions.nsi_pr import prob_event_line, prob_event_loop
+from inflation.distributions import NSIPRDistribution
 
 
 def ring_problem(inflation_level: int, nof_outcomes: int = 2) -> InflationProblem:
@@ -24,6 +24,7 @@ def ring_problem(inflation_level: int, nof_outcomes: int = 2) -> InflationProble
 
 
 def main() -> None:
+    distribution = NSIPRDistribution()
     prob = ring_problem(4, 2)
     # prob.add_symmetries(prob._setting_specific_outcome_relabelling_symmetries) # NOT SAFE TO USE ON NSI!
 
@@ -34,13 +35,13 @@ def main() -> None:
     print(ring_SDP.physical_atoms)
 
     values = {
-        "P[A^{1,1}=0]": prob_event_loop([0]),
-        "P[A^{1,2}=0]": prob_event_line([0]),
-        "P[A^{1,2}=0 A^{2,1}=0]": prob_event_loop([0, 0]),
-        "P[A^{1,2}=0 A^{2,3}=0]": prob_event_line([0, 0]),
-        "P[A^{1,2}=0 A^{2,3}=0 A^{3,1}=0]": prob_event_loop([0, 0, 0]),
-        "P[A^{1,2}=0 A^{2,3}=0 A^{3,4}=0]": prob_event_line([0, 0, 0]),
-        "P[A^{1,2}=0 A^{2,3}=0 A^{3,4}=0 A^{4,1}=0]": prob_event_loop([0, 0, 0, 0]),
+        "P[A^{1,1}=0]": float(distribution.prob_event_loop([0])),
+        "P[A^{1,2}=0]": float(distribution.prob_event_line([0])),
+        "P[A^{1,2}=0 A^{2,1}=0]": float(distribution.prob_event_loop([0, 0])),
+        "P[A^{1,2}=0 A^{2,3}=0]": float(distribution.prob_event_line([0, 0])),
+        "P[A^{1,2}=0 A^{2,3}=0 A^{3,1}=0]": float(distribution.prob_event_loop([0, 0, 0])),
+        "P[A^{1,2}=0 A^{2,3}=0 A^{3,4}=0]": float(distribution.prob_event_line([0, 0, 0])),
+        "P[A^{1,2}=0 A^{2,3}=0 A^{3,4}=0 A^{4,1}=0]": float(distribution.prob_event_loop([0, 0, 0, 0])),
     }
     ring_SDP.update_values(values=values, only_specified_values=False)
     print(ring_SDP.known_moments)
