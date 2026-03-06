@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from functools import cached_property
 from itertools import permutations, product
 from math import factorial
@@ -36,6 +37,7 @@ from inflation.applications.Group_utils import (
     canonical_leximin_support_indices,
     prepare_group_chain,
 )
+from inflation.symmetry_utils import discover_distribution_symmetries
 
 ZERO_I32 = np.int32(0)
 
@@ -93,6 +95,7 @@ def ring_problem(inflation_level: int, nof_outcomes: int = 2) -> InflationProble
 
 def _prepare_group_chain(
     prob: InflationProblem,
+    symmetries: np.ndarray | None = None,
 ) -> Tuple[int, int, int, NumbaList]:
     n = prob.inflation_level_per_source[0]
     outcomes = prob.outcomes_per_party[0]
@@ -107,7 +110,9 @@ def _prepare_group_chain(
     N = (n * n) * outcomes
     if N > np.iinfo(np.uint16).max:
         raise ValueError("N exceeds uint16 range; use wider dtype for permutations")
-    G = build_sympy_group(prob.symmetries, N)
+    if symmetries is None:
+        symmetries = np.asarray(prob.symmetries, dtype=int)
+    G = build_sympy_group(symmetries, N)
     level_invperms = prepare_group_chain(G, N)
     return n, outcomes, N, level_invperms
 
@@ -141,6 +146,24 @@ def _marginal_from_support_key(
     if len(by_i) != n:
         raise ValueError("Invalid canonical marginal support: missing row assignment.")
     return [[1, i, by_i[i][0], 0, by_i[i][1]] for i in range(1, n + 1)]
+
+
+def _is_setwise_stabilized(perm: np.ndarray, subset: np.ndarray) -> bool:
+    return np.array_equal(np.sort(perm[subset]), subset)
+
+
+def _average_orbit_label(labels: Sequence[str]) -> str:
+    if len(labels) == 1:
+        return labels[0]
+    counts = Counter(labels)
+    weighted_terms = []
+    for label in sorted(counts):
+        mult = counts[label]
+        if mult == 1:
+            weighted_terms.append(label)
+        else:
+            weighted_terms.append(f"{mult}*{label}")
+    return f"({' + '.join(weighted_terms)})/{len(labels)}"
 
 
 @njit(cache=True, fastmath=True)
@@ -298,48 +321,94 @@ class PrepLP:
         event_prob_fn: Callable[[Iterable[int]], float],
         marginal_filter_fn: Callable[[List[List[int]]], bool] | None = None,
         show_progress: bool = True,
+        auto_discover_symmetries: bool = True,
+        symmetry_atol: float = 1e-9,
+        symmetry_rtol: float = 1e-8,
+        compress_rows_under_discovered_group: bool = True,
+        verbose_symmetry_discovery: bool = True,
     ) -> None:
         self.prob = prob
         self.event_prob_fn = event_prob_fn
         self.marginal_filter_fn = marginal_filter_fn
         self.show_progress = show_progress
+        self.auto_discover_symmetries = auto_discover_symmetries
+        self.symmetry_atol = symmetry_atol
+        self.symmetry_rtol = symmetry_rtol
+        self.compress_rows_under_discovered_group = compress_rows_under_discovered_group
+        self.verbose_symmetry_discovery = verbose_symmetry_discovery
         # Eager materialization of the main outputs.
         _ = self.variable_names
         _ = self.known_vars_coo_vec
         _ = self.inflation_matrix
 
     @cached_property
-    def _group_chain_data(self) -> Tuple[int, int, int, NumbaList]:
-        """Tuple `(n, outcomes, N, level_invperms)` prepared from `self.prob`."""
-        return _prepare_group_chain(self.prob)
+    def core_symmetries(self) -> np.ndarray:
+        """Initial ring-minimal symmetry elements used for base marginal discovery."""
+        return np.asarray(self.prob.symmetries, dtype=int)
+
+    @cached_property
+    def candidate_symmetry_generators(self) -> np.ndarray:
+        """
+        Candidate generator set for automatic symmetry expansion.
+
+        This starts from all structural generators and keeps only those that
+        preserve the ring stabilizer subset (if present).
+        """
+        candidates = np.asarray(self.prob.all_possible_symmetry_generators, dtype=int)
+        if candidates.ndim == 1:
+            candidates = candidates[np.newaxis, :]
+        if self.prob._lexorder.shape[1] >= 3:
+            to_stabilize = np.flatnonzero(self.prob._lexorder[:, 1] == self.prob._lexorder[:, 2])
+            if to_stabilize.size:
+                keep = np.array([_is_setwise_stabilized(perm, to_stabilize) for perm in candidates], dtype=bool)
+                candidates = candidates[keep]
+        if candidates.size == 0:
+            candidates = np.arange(self.prob._nr_operators, dtype=int)[np.newaxis, :]
+        return np.unique(candidates, axis=0)
+
+    @cached_property
+    def _core_group_chain_data(self) -> Tuple[int, int, int, NumbaList]:
+        """Tuple `(n, outcomes, N, level_invperms)` prepared from core symmetries."""
+        return _prepare_group_chain(self.prob, self.core_symmetries)
+
+    @cached_property
+    def _effective_group_chain_data(self) -> Tuple[int, int, int, NumbaList]:
+        """Tuple `(n, outcomes, N, level_invperms)` prepared from discovered symmetries."""
+        return _prepare_group_chain(self.prob, self.discovered_symmetries)
 
     @cached_property
     def n(self) -> int:
         """Inflation level per source (number of copies)."""
-        return self._group_chain_data[0]
+        return self._core_group_chain_data[0]
 
     @cached_property
     def outcomes(self) -> int:
         """Number of outcomes per party."""
-        return self._group_chain_data[1]
+        return self._core_group_chain_data[1]
 
     @cached_property
     def N(self) -> int:
         """One-hot ambient dimension `n*n*outcomes` for group action."""
-        return self._group_chain_data[2]
+        return self._core_group_chain_data[2]
+
+    @cached_property
+    def core_level_invperms(self) -> NumbaList:
+        """Schreier-Sims inverse-transversal chain for the core symmetry group."""
+        return self._core_group_chain_data[3]
 
     @cached_property
     def level_invperms(self) -> NumbaList:
-        """Schreier-Sims inverse-transversal chain used for canonicalization."""
-        return self._group_chain_data[3]
+        """Schreier-Sims inverse-transversal chain for the discovered symmetry group."""
+        return self._effective_group_chain_data[3]
 
     @cached_property
-    def marginals(self) -> List[List[List[int]]]:
+    def _base_marginal_payload(self) -> Tuple[List[List[List[int]]], List[Tuple[int, ...]]]:
         """
-        Canonical marginal representatives under `self.prob.symmetries`.
+        Canonical marginal representatives under the initial core symmetries.
         """
         seen_keys: set[Tuple[int, ...]] = set()
         marginals: List[List[List[int]]] = []
+        support_keys: List[Tuple[int, ...]] = []
         base_outcomes = tuple(range(self.outcomes))
         perm_iter = permutations(range(1, self.n + 1))
         perm_iter = tqdm(
@@ -353,7 +422,7 @@ class PrepLP:
                 # Candidate marginal -> sparse one-hot support in ambient coordinates.
                 support = _marginal_support_from_perm(perm, pat, self.n, self.outcomes)
                 # Canonicalize and dedupe by support key.
-                canonical_support = canonical_leximin_support_indices(support, self.N, self.level_invperms)
+                canonical_support = canonical_leximin_support_indices(support, self.N, self.core_level_invperms)
                 key = tuple(int(x) for x in canonical_support.tolist())
                 if key in seen_keys:
                     continue
@@ -362,18 +431,29 @@ class PrepLP:
                 if self.marginal_filter_fn is not None and not self.marginal_filter_fn(marginal):
                     continue
                 marginals.append(marginal)
-        return marginals
+                support_keys.append(key)
+        return marginals, support_keys
 
     @cached_property
-    def nof_marginals(self) -> int:
-        """Number of canonical marginals."""
-        return len(self.marginals)
+    def base_marginals(self) -> List[List[List[int]]]:
+        """Canonical marginals under core symmetries before automatic compression."""
+        return self._base_marginal_payload[0]
 
     @cached_property
-    def row_labels(self) -> np.ndarray:
-        """Operator-name tuple labels for each marginal row."""
+    def base_support_keys(self) -> List[Tuple[int, ...]]:
+        """Sorted support keys for base marginals."""
+        return self._base_marginal_payload[1]
+
+    @cached_property
+    def base_nof_marginals(self) -> int:
+        """Number of base canonical marginals."""
+        return len(self.base_marginals)
+
+    @cached_property
+    def base_row_labels(self) -> np.ndarray:
+        """Operator-name tuple labels for each base marginal row."""
         return np.asarray(
-            [tuple(self.prob._lexrepr_to_names[self.prob.mon_to_lexrepr(m)]) for m in self.marginals],
+            [tuple(self.prob._lexrepr_to_names[self.prob.mon_to_lexrepr(m)]) for m in self.base_marginals],
             dtype=object,
         )
 
@@ -409,12 +489,12 @@ class PrepLP:
         return value, "*".join(factors)
 
     @cached_property
-    def _known_payload(self) -> Tuple[np.ndarray, List[str]]:
-        """Known values and labels computed together in one marginal pass."""
-        known_values = np.empty(self.nof_marginals, dtype=float)
+    def _base_known_payload(self) -> Tuple[np.ndarray, List[str]]:
+        """Known values and labels computed on base marginals."""
+        known_values = np.empty(self.base_nof_marginals, dtype=float)
         known_labels: List[str] = []
         for idx, marginal in enumerate(
-            tqdm(self.marginals, desc="Computing marginal values...", disable=not self.show_progress)
+            tqdm(self.base_marginals, desc="Computing marginal values...", disable=not self.show_progress)
         ):
             value, label = self._factorized_value_and_label(marginal)
             known_values[idx] = value
@@ -422,14 +502,178 @@ class PrepLP:
         return known_values, known_labels
 
     @cached_property
-    def known_labels(self) -> List[str]:
-        """Cycle-factorized known-variable labels using copy-index-free operator names."""
-        return self._known_payload[1]
+    def base_known_labels(self) -> List[str]:
+        """Base cycle-factorized known labels before orbit compression."""
+        return self._base_known_payload[1]
+
+    @cached_property
+    def base_known_values(self) -> np.ndarray:
+        """Base known marginal values before orbit compression."""
+        return self._base_known_payload[0]
+
+    @cached_property
+    def discovered_symmetries(self) -> np.ndarray:
+        """Largest discovered stabilizing subgroup used for final canonicalization."""
+        if not self.auto_discover_symmetries:
+            return self.core_symmetries
+        support_to_idx = {key: idx for idx, key in enumerate(self.base_support_keys)}
+        values = self.base_known_values
+
+        def _stabilizer_predicate(perm: np.ndarray) -> bool:
+            for idx, key in enumerate(self.base_support_keys):
+                mapped = tuple(sorted(int(perm[pos]) for pos in key))
+                mapped_idx = support_to_idx.get(mapped)
+                if mapped_idx is None:
+                    return False
+                if not np.isclose(
+                    values[idx],
+                    values[mapped_idx],
+                    atol=self.symmetry_atol,
+                    rtol=self.symmetry_rtol,
+                ):
+                    return False
+            return True
+
+        discovered, _group = discover_distribution_symmetries(
+            distribution=None,
+            scenario=self.prob,
+            initial_generators=self.core_symmetries,
+            candidate_generators=self.candidate_symmetry_generators,
+            stabilizer_predicate=_stabilizer_predicate,
+            atol=self.symmetry_atol,
+            rtol=self.symmetry_rtol,
+            verbose=self.verbose_symmetry_discovery,
+            return_group=True,
+            progress_desc="Discovering ring stabilizing symmetries",
+        )
+        if discovered.size == 0:
+            return self.core_symmetries
+        return np.asarray(discovered, dtype=int)
+
+    @cached_property
+    def _row_compression_payload(
+        self,
+    ) -> Tuple[
+        List[List[List[int]]],
+        np.ndarray,
+        List[str],
+        np.ndarray,
+        List[Tuple[int, ...]],
+        np.ndarray,
+        List[str],
+        List[Tuple[str, ...]],
+    ]:
+        """Compress base rows by discovered symmetry orbits and keep orbit metadata."""
+        if not self.compress_rows_under_discovered_group:
+            orbit_members = [(idx,) for idx in range(self.base_nof_marginals)]
+            multiplicities = np.ones(self.base_nof_marginals, dtype=np.int64)
+            member_labels = [(self.base_known_labels[idx],) for idx in range(self.base_nof_marginals)]
+            row_labels = np.asarray([" ".join(label) for label in self.base_row_labels.tolist()], dtype=object)
+            return (
+                self.base_marginals,
+                self.base_known_values,
+                self.base_known_labels,
+                row_labels,
+                orbit_members,
+                multiplicities,
+                self.base_known_labels,
+                member_labels,
+            )
+
+        orbit_map: Dict[Tuple[int, ...], List[int]] = {}
+        orbit_order: List[Tuple[int, ...]] = []
+        for idx, key in enumerate(self.base_support_keys):
+            support = np.asarray(key, dtype=np.int64)
+            canon = canonical_leximin_support_indices(support, self.N, self.level_invperms)
+            canon_key = tuple(int(x) for x in canon.tolist())
+            if canon_key not in orbit_map:
+                orbit_map[canon_key] = []
+                orbit_order.append(canon_key)
+            orbit_map[canon_key].append(idx)
+
+        marginals: List[List[List[int]]] = []
+        known_values = np.empty(len(orbit_order), dtype=float)
+        known_labels: List[str] = []
+        row_labels_list: List[str] = []
+        orbit_members: List[Tuple[int, ...]] = []
+        multiplicities = np.empty(len(orbit_order), dtype=np.int64)
+        orbit_average_labels: List[str] = []
+        orbit_member_labels: List[Tuple[str, ...]] = []
+
+        for orbit_idx, canon_key in enumerate(orbit_order):
+            members = tuple(orbit_map[canon_key])
+            orbit_members.append(members)
+            multiplicities[orbit_idx] = len(members)
+            rep = members[0]
+            marginals.append(self.base_marginals[rep])
+            member_values = self.base_known_values[list(members)]
+            known_values[orbit_idx] = float(np.mean(member_values))
+
+            member_known_labels = tuple(self.base_known_labels[m] for m in members)
+            avg_known_label = _average_orbit_label(member_known_labels)
+            known_labels.append(avg_known_label)
+            orbit_average_labels.append(avg_known_label)
+            orbit_member_labels.append(member_known_labels)
+
+            member_row_labels = [" ".join(self.base_row_labels[m]) for m in members]
+            row_labels_list.append(_average_orbit_label(member_row_labels))
+
+        row_labels = np.asarray(row_labels_list, dtype=object)
+        return (
+            marginals,
+            known_values,
+            known_labels,
+            row_labels,
+            orbit_members,
+            multiplicities,
+            orbit_average_labels,
+            orbit_member_labels,
+        )
+
+    @cached_property
+    def marginals(self) -> List[List[List[int]]]:
+        """Final marginals after optional discovered-group row compression."""
+        return self._row_compression_payload[0]
 
     @cached_property
     def known_values(self) -> np.ndarray:
-        """Known marginal values from factorized cycle probabilities."""
-        return self._known_payload[0]
+        """Known marginal values aligned with final marginals."""
+        return self._row_compression_payload[1]
+
+    @cached_property
+    def known_labels(self) -> List[str]:
+        """Known labels aligned with final marginals."""
+        return self._row_compression_payload[2]
+
+    @cached_property
+    def row_labels(self) -> np.ndarray:
+        """Human-readable row labels aligned with final marginals."""
+        return self._row_compression_payload[3]
+
+    @cached_property
+    def row_orbit_members(self) -> List[Tuple[int, ...]]:
+        """For each final row, indices of base rows in its discovered-group orbit."""
+        return self._row_compression_payload[4]
+
+    @cached_property
+    def row_orbit_multiplicities(self) -> np.ndarray:
+        """Orbit multiplicities for each compressed row."""
+        return self._row_compression_payload[5]
+
+    @cached_property
+    def row_orbit_average_labels(self) -> List[str]:
+        """Orbit-average known labels used as compressed row names."""
+        return self._row_compression_payload[6]
+
+    @cached_property
+    def row_orbit_member_labels(self) -> List[Tuple[str, ...]]:
+        """Per-orbit list of known labels from base rows."""
+        return self._row_compression_payload[7]
+
+    @cached_property
+    def nof_marginals(self) -> int:
+        """Number of final canonical marginals."""
+        return len(self.marginals)
 
     @cached_property
     def _canonical_global_lhs_payload(self) -> Tuple[np.ndarray, coo_array]:
@@ -546,7 +790,6 @@ if __name__ == "__main__":
 
     # --- Pipeline configuration ---
     n, outcomes = 5, 2
-    include_outcome_relabel_symmetries = False
     cache_name = "lp_cache_nsi_pi_n=5_no_outcome_relabelling.npz"
 
     # Users should provide a fully configured callable, optionally via functools.partial.
@@ -564,8 +807,6 @@ if __name__ == "__main__":
     event_prob_fn = nsi_pr_prob_event_loop
 
     prob = ring_problem(n, outcomes)
-    if include_outcome_relabel_symmetries:
-        prob.add_symmetries(prob._setting_specific_outcome_relabelling_symmetries)
     print("done with prob")
 
     def _save_cache(
@@ -620,6 +861,8 @@ if __name__ == "__main__":
         prep = PrepLP(
             prob,
             event_prob_fn=event_prob_fn,
+            auto_discover_symmetries=True,
+            compress_rows_under_discovered_group=True,
         )
         variable_names = prep.variable_names
         known_vars_coo_vec = prep.known_vars_coo_vec

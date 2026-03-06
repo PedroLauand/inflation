@@ -125,6 +125,11 @@ class PrepLPExpectations(PrepLP):
         add_normalization: bool = True,
         show_progress: bool = True,
         marginal_filter_fn=None,
+        auto_discover_symmetries: bool = True,
+        symmetry_atol: float = 1e-9,
+        symmetry_rtol: float = 1e-8,
+        compress_rows_under_discovered_group: bool = True,
+        verbose_symmetry_discovery: bool = True,
     ) -> None:
         self.E_line = E_line
         self.E_loop = E_loop
@@ -134,6 +139,11 @@ class PrepLPExpectations(PrepLP):
             event_prob_fn=self._event_prob_from_expectations,
             marginal_filter_fn=marginal_filter_fn,
             show_progress=show_progress,
+            auto_discover_symmetries=auto_discover_symmetries,
+            symmetry_atol=symmetry_atol,
+            symmetry_rtol=symmetry_rtol,
+            compress_rows_under_discovered_group=compress_rows_under_discovered_group,
+            verbose_symmetry_discovery=verbose_symmetry_discovery,
         )
 
     def _event_prob_from_expectations(self, cycle_outcomes: Tuple[int, ...] | List[int]) -> float:
@@ -145,12 +155,9 @@ if __name__ == "__main__":
     from inflation.lp.lp_utils import solveLP_sparse
 
     n, outcomes = 3, 2
-    include_outcome_relabel_symmetries = False
     cache_name = "lp_cache_expectations_n=3_no_outcome_relabelling.npz"
 
     prob = inf_problem(n, outcomes)
-    if include_outcome_relabel_symmetries:
-        prob.add_symmetries(prob._setting_specific_outcome_relabelling_symmetries)
     print("done with prob")
 
     sqrt2 = np.sqrt(2.0)
@@ -222,6 +229,8 @@ if __name__ == "__main__":
             E_loop,
             add_normalization=True,
             show_progress=True,
+            auto_discover_symmetries=True,
+            compress_rows_under_discovered_group=True,
         )
         variable_names = prep.variable_names
         known_vars_coo_vec = prep.known_vars_coo_vec

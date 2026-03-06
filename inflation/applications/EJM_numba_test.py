@@ -42,16 +42,14 @@ def _min_index_dtype(n_constraints: int, n_variables: int, n_known: int) -> np.d
 
 
 def main(*, n: int, outcomes: int) -> None:
-    include_outcome_relabel_symmetries = False
-
     prob = ring_problem(n, outcomes)
-    if include_outcome_relabel_symmetries:
-        prob.add_symmetries(prob._setting_specific_outcome_relabelling_symmetries)
     print("done with prob")
 
     prep = PrepLP(
         prob,
         event_prob_fn=ejm_prob_event_loop,
+        auto_discover_symmetries=True,
+        compress_rows_under_discovered_group=True,
     )
     variable_names = prep.variable_names
     known_vars_coo_vec = prep.known_vars_coo_vec

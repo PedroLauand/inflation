@@ -18,6 +18,7 @@ import networkx as nx
 import numpy as np
 from networkx.algorithms import isomorphism
 from sympy import Symbol
+from sympy.combinatorics import Permutation, PermutationGroup
 from tqdm import tqdm
 from .sdp.fast_npa import (nb_classify_disconnected_components,
                            nb_overlap_matrix,
@@ -1020,6 +1021,30 @@ class InflationProblem:
         """
         self.symmetries = self.inflation_symmetries
 
+    def bsgs_group_from_perms(
+        self,
+        perms: Union[np.ndarray, List[np.ndarray]],
+    ) -> PermutationGroup:
+        """Build a Schreier-Sims group from permutations of the lexorder."""
+        arr = np.asarray(perms, dtype=int)
+        if arr.ndim == 1:
+            arr = arr[np.newaxis, :]
+        if arr.size == 0:
+            arr = np.arange(self._nr_operators, dtype=int)[np.newaxis, :]
+        if arr.shape[1] != self._nr_operators:
+            raise ValueError(
+                f"Permutation width {arr.shape[1]} does not match lexorder length {self._nr_operators}."
+            )
+        arr = np.unique(arr, axis=0)
+        group = PermutationGroup([Permutation(perm) for perm in arr])
+        group.schreier_sims()
+        return group
+
+    @property
+    def symmetries_bsgs_group(self) -> PermutationGroup:
+        """Current symmetry group in BSGS form (freshly built on access)."""
+        return self.bsgs_group_from_perms(self.symmetries)
+
     @cached_property
     def _lexorder_hashable_interpretation_decoder(self):
         return {self._make_interpretation_hashable(op_as_dict): i for
@@ -1171,12 +1196,17 @@ class InflationProblem:
         return np.array(sym_generators)
 
     @cached_property
-    def _all_possible_symmetries(self) -> np.ndarray:
+    def all_possible_symmetry_generators(self) -> np.ndarray:
+        """Generators for all symmetry types beyond inflation-copy symmetries."""
         group_generators = np.vstack((
             self._party_relabelling_symmetries,
             self._party_specific_setting_relabelling_symmetries,
             self._setting_specific_outcome_relabelling_symmetries))
-        group_elements = group_elements_from_generators(group_generators)
+        return np.unique(group_generators, axis=0)
+
+    @cached_property
+    def _all_possible_symmetries(self) -> np.ndarray:
+        group_elements = group_elements_from_generators(self.all_possible_symmetry_generators)
         return group_elements
 
     ###########################################################################
