@@ -1,0 +1,129 @@
+SYMMETRY / SLURM JOB-BUILD INFO (for later bash generation)
+
+Status checks from local repo:
+- Target script exists: inflation/applications/Final_algo_numba.py (case-sensitive)
+- No requirements.txt, pyproject.toml, or setup.py found in repo root
+- Scripts add repo root to sys.path, so running from repo root is fine
+
+User intent: run a Python script from repo https://github.com/PedroLauand/inflation.git
+Target script (verified path): inflation/applications/Final_algo_numba.py
+
+0) WHERE TO RUN
+- Login/head node: submit jobs from mn003 (do not run heavy compute there)
+- Compute nodes: Slurm runs your job on cnXXX nodes
+- Prefer /gpfs/$USER for large data, environments, and outputs (faster than home)
+
+1) REPO SETUP ON CLUSTER
+- Recommended WORKDIR=/gpfs/$USER/projects/inflation
+Commands:
+mkdir -p "$WORKDIR"
+cd "$WORKDIR"
+git clone https://github.com/PedroLauand/inflation.git
+cd inflation
+Optional updates later:
+git pull
+
+2) PYTHON ENVIRONMENT (pick ONE)
+Option A: Module python + venv (recommended)
+- module avail python
+- module load python/<VERSION> (example: python/3.12)
+- VENV=/gpfs/$USER/venvs/inflation-env
+Commands:
+python -m venv "$VENV"
+source "$VENV/bin/activate"
+python -m pip install --upgrade pip
+Dependency install (no requirements file in repo):
+pip install numpy numba scipy pandas matplotlib sympy tqdm mosek
+Quick check:
+python -c "import numba, numpy; print('ok')"
+
+Option B: Conda / mamba (only if the cluster supports it)
+- module load miniconda (or similar)
+Commands:
+conda create -n inflation-env python=3.12
+conda activate inflation-env
+pip/conda install dependencies
+
+Numba cache (recommended):
+export NUMBA_CACHE_DIR=/gpfs/$USER/.numba_cache
+
+3) VERIFY SCRIPT ENTRYPOINT
+From repo root ($WORKDIR/inflation):
+find . -maxdepth 4 -type f -iname "*final*algo*numba*.py"
+python inflation/applications/Final_algo_numba.py --help
+Record:
+SCRIPT_PATH=inflation/applications/Final_algo_numba.py
+ARGS="<full argument string>"
+
+4) STANDARD SLURM BATCH (SBATCH) PARAMETERS TO DECIDE
+- job-name: inflation-numba (or descriptive)
+- partition/queue: debugq (<=1h), defq (<=1d), longq (<=7d), gpu (if needed)
+- time limit: HH:MM:SS
+- nodes: usually 1 for numba CPU workloads
+- cpus-per-task: 1, 4, 8, 16 (depending on parallelism)
+- memory: 4G, 16G, 64G (depending on problem size)
+- output log path: logs/%x-%j.out
+- error log path: logs/%x-%j.err (optional)
+- working directory: repo root
+- optional email notifications (if configured)
+
+If the code uses multithreading (NumPy/BLAS/OpenMP), set:
+export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+export MKL_NUM_THREADS=$SLURM_CPUS_PER_TASK
+export OPENBLAS_NUM_THREADS=$SLURM_CPUS_PER_TASK
+
+5) RECOMMENDED DIRECTORY LAYOUT
+In /gpfs/$USER/projects/inflation/inflation (repo root):
+- logs/    (slurm outputs)
+- outputs/ (results)
+- data/    (input data or symlink to shared location)
+- configs/ (config files, if any)
+- scripts/ (slurm .sbatch files, optional)
+
+6) RUN COMMAND TEMPLATE (inside job)
+Assume you cd into repo root and activate env.
+Run:
+python "$SCRIPT_PATH" $ARGS
+If outputs need a directory:
+OUTDIR=/gpfs/$USER/projects/inflation/outputs/<run-name>/
+mkdir -p "$OUTDIR"
+pass --out "$OUTDIR" (or script-specific arg)
+
+7) SUBMIT / MONITOR / DEBUG
+Submit:
+sbatch <jobfile>.sbatch
+Monitor:
+squeue --me
+Check resources used (after completion):
+sacct -j <JOBID> --format=JobID,JobName,Partition,Elapsed,MaxRSS,AllocCPUS,State
+Interactive debug (optional):
+srun -p debugq -t 1:00:00 --cpus-per-task=4 --mem=8G --pty bash
+module load python/<VERSION>
+source "$VENV/bin/activate"
+python "$SCRIPT_PATH" $ARGS
+
+8) COMMON PITFALLS / CHECKLIST
+- Do NOT run long computations on mn003; use sbatch/srun
+- Ensure the job script uses /gpfs paths for big I/O
+- Ensure environment activation happens inside the job
+- If using relative paths, set:
+  cd /gpfs/$USER/projects/inflation/inflation
+- Create logs/ before running
+- Confirm Python and package versions
+- Numba compilation on first run is normal; caching helps
+
+9) PLACEHOLDERS FOR THE MODEL THAT WILL GENERATE BASH
+Fill these before generating final .sbatch:
+WORKDIR=
+REPO_ROOT=
+PYTHON_MODULE=
+VENV_PATH=
+SCRIPT_PATH=
+ARGS=
+PARTITION=
+TIME=
+CPUS=
+MEM=
+OUT_LOG=
+ERR_LOG=
+OUTDIR=
