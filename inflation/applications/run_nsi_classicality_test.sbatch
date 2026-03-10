@@ -15,7 +15,8 @@ set -euo pipefail
 # module load python
 # source /path/to/venv/bin/activate
 
-cd "$(dirname "$0")"
+#cd "$(dirname "$0")"
 
+echo "running in directory $(pwd)"
 export PYTHONUNBUFFERED=1
-srun python -u NSI_classicality_test.py
+python -u NSI_classicality_test.py
