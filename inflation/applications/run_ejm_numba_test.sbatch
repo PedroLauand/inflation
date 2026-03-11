@@ -14,8 +14,8 @@ set -euo pipefail
 # If your cluster uses modules/conda, load/activate here, e.g.:
 # module load python
 # source /path/to/venv/bin/activate
-
-cd "$(dirname "$0")"
+module load python/3.12
+echo "running in directory $(pwd)"
 
 export PYTHONUNBUFFERED=1
-srun python -u EJM_numba_test.py
+ python -u EJM_numba_test.py
