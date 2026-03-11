@@ -338,7 +338,7 @@ class PrepLP:
         n: int,
         distribution: RingDistributionProtocol,
         *,
-        cache_name: str | None = None,
+        problem_name: str | None = None,
         marginal_filter_fn=None,
         show_progress: bool = True,
         auto_discover_symmetries: bool = True,
@@ -348,7 +348,7 @@ class PrepLP:
     ) -> None:
         self._requested_n = int(n)
         self.distribution = distribution
-        self.cache_name = cache_name
+        self._problem_name = self._normalize_problem_name(problem_name)
         self.marginal_filter_fn = marginal_filter_fn
         self.show_progress = show_progress
         self.auto_discover_symmetries = auto_discover_symmetries
@@ -365,12 +365,46 @@ class PrepLP:
         self._cache_written = False
         self._initialize_cache()
 
+    @staticmethod
+    def _normalize_problem_name(problem_name: str | None) -> str | None:
+        if problem_name is None:
+            return None
+        normalized = str(problem_name).strip()
+        if not normalized:
+            return None
+        if normalized.lower().endswith(".npz"):
+            return normalized[:-4]
+        return normalized
+
+    @property
+    def problem_name(self) -> str | None:
+        return self._problem_name
+
+    @property
+    def cache_name(self) -> str | None:
+        if self.problem_name is None:
+            return None
+        return f"{self.problem_name}_lp_input_cache.npz"
+
+    @property
+    def output_name(self) -> str | None:
+        if self.problem_name is None:
+            return None
+        return f"{self.problem_name}_lp_solution_output.npz"
+
     @cached_property
     def cache_path(self) -> Path | None:
         if self.cache_name is None:
             return None
         cache_dir = Path(__file__).resolve().parent / "cache"
         return cache_dir / self.cache_name
+
+    @cached_property
+    def output_path(self) -> Path | None:
+        if self.output_name is None:
+            return None
+        output_dir = Path(__file__).resolve().parent / "outputs"
+        return output_dir / self.output_name
 
     @staticmethod
     def _incompatible_cache_error() -> ValueError:
@@ -379,14 +413,9 @@ class PrepLP:
     def _initialize_cache(self) -> None:
         if self.cache_path is None:
             return
-        # Cache compatibility depends on live distribution-induced symmetries.
-        _ = self.known_labels
         if self.cache_path.exists():
             self._load_cache_if_available()
-            return
-        inflation_matrix = self.inflation_matrix
-        variable_names = self.variable_names
-        self._save_cache(variable_names, inflation_matrix)
+        return
 
     def _load_cache_if_available(self) -> None:
         if self.cache_path is None or not self.cache_path.exists():
@@ -477,7 +506,7 @@ class PrepLP:
         if self.cache_path is None or self._cache_written:
             return
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(
+        np.savez(
             self.cache_path,
             cache_format_version=CACHE_FORMAT_VERSION,
             requested_n=np.int64(self._requested_n),
@@ -946,7 +975,19 @@ class PrepLP:
         """Final sparse equality matrix combining known-value and extension constraints."""
         if self._cached_inflation_matrix is not None:
             return self._cached_inflation_matrix
-        return self._canonical_global_lhs_payload[0]
+        inflation_matrix = self._canonical_global_lhs_payload[0]
+        self._save_cache(self.variable_names, inflation_matrix)
+        return inflation_matrix
+
+    @property
+    def nof_lp_vars(self):
+        """Number of LP variables in the final LP."""
+        return self.inflation_matrix.shape[1]
+
+    @property
+    def blank_objective(self):
+        """Objective function of the final LP."""
+        return coo_array(([], ([], [])), shape=(1, self.nof_lp_vars), dtype=self.min_dtype)
 
     @cached_property
     def known_vars_symbolic(self) -> coo_array:
@@ -993,7 +1034,7 @@ class PrepLP:
 # =========================
 if __name__ == "__main__":
     from inflation.distributions import EJMDistribution, NSIPRDistribution, RGBDistribution
-    from inflation.lp.lp_utils import solveLP_sparse
+    from inflation.lp.lp_utils import save_lp_solution, solveLP_sparse
 
     n = 4
 
@@ -1010,7 +1051,7 @@ if __name__ == "__main__":
         prep = PrepLP(
             n,
             distribution,
-            cache_name=None,
+            problem_name=f"NSI-PR_n={n}" if label == "NSI-PR" else None,
             show_progress=True,
             auto_discover_symmetries=True,
             compress_rows_under_discovered_group=True,
@@ -1035,6 +1076,9 @@ if __name__ == "__main__":
     )
 
     print(solution["status"])
+    if prep_nsi.output_path is not None:
+        save_lp_solution(solution, prep_nsi.output_path)
+        print(f"Saved LP solution archive to {prep_nsi.output_path}")
 
     def _evaluate_sparse_certificate_on_knowns(
         sparse_certificate: coo_array,

@@ -5,6 +5,7 @@ This file contains functions to interact with LP solvers.
 """
 
 import sys
+from pathlib import Path
 import mosek
 import numpy as np
 
@@ -64,6 +65,86 @@ def _ensure_index_dtype(coo_mat: coo_array, idx_dtype: np.dtype) -> coo_array:
     if coo_mat.col.dtype != idx_dtype:
         coo_mat.col = coo_mat.col.astype(idx_dtype, copy=False)
     return coo_mat
+
+
+def _normalize_npz_path(path: Union[str, Path]) -> Path:
+    archive_path = Path(path)
+    if archive_path.suffix == "":
+        return archive_path.with_suffix(".npz")
+    if archive_path.suffix.lower() == ".npz":
+        return archive_path
+    raise ValueError("Archive path must omit the extension or end with '.npz'.")
+
+
+def save_lp_solution(
+    solution: Dict,
+    path: Union[str, Path],
+    *,
+    compression: bool = False,
+) -> Path:
+    """Save the array-serializable subset of an LP solution to an NPZ archive."""
+    archive_path = _normalize_npz_path(path)
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+
+    variable_names = np.asarray(list(solution["x"].keys()), dtype=str)
+    x_values = np.asarray([float(solution["x"][name]) for name in variable_names], dtype=float)
+    sparse_certificate = canonical_order(solution["sparse_certificate"].tocoo(copy=False))
+    nonzero_mask = ~np.isclose(sparse_certificate.data, 0.0)
+    certificate_col = sparse_certificate.col[nonzero_mask].astype(np.int64, copy=False)
+    certificate_data = sparse_certificate.data[nonzero_mask].astype(float, copy=False)
+    term_code, term_desc = solution["term_code"]
+
+    save_fn = np.savez_compressed if compression else np.savez
+    save_fn(
+        archive_path,
+        status=np.asarray(str(solution["status"])),
+        success=np.asarray(bool(solution["success"])),
+        primal_value=np.asarray(float(solution["primal_value"])),
+        dual_value=np.asarray(float(solution["dual_value"])),
+        term_code=np.asarray(str(term_code)),
+        term_desc=np.asarray(str(term_desc)),
+        variable_names=variable_names,
+        x_values=x_values,
+        certificate_col=certificate_col,
+        certificate_data=certificate_data,
+    )
+    return archive_path
+
+
+def read_lp_solution(path: Union[str, Path]) -> Dict:
+    """Read an LP solution archive and reconstruct the solveLP_sparse() solution dictionary."""
+    archive_path = _normalize_npz_path(path)
+    with np.load(archive_path, allow_pickle=False) as z:
+        variable_names = np.asarray(z["variable_names"], dtype=str)
+        x_values = np.asarray(z["x_values"], dtype=float)
+        certificate_col = np.asarray(z["certificate_col"], dtype=np.int64)
+        certificate_data = np.asarray(z["certificate_data"], dtype=float)
+        cert_row = np.zeros(certificate_col.shape[0], dtype=np.int32)
+        sparse_certificate = coo_array(
+            (certificate_data, (cert_row, certificate_col)),
+            shape=(1, variable_names.size),
+        )
+        dual_certificate = dict(
+            zip(variable_names[certificate_col].tolist(), certificate_data.tolist())
+        )
+        return {
+            "primal_value": float(np.asarray(z["primal_value"]).item()),
+            "dual_value": float(np.asarray(z["dual_value"]).item()),
+            "status": str(np.asarray(z["status"]).item()),
+            "success": bool(np.asarray(z["success"]).item()),
+            "dual_certificate": dual_certificate,
+            "sparse_certificate": sparse_certificate,
+            "x": dict(zip(variable_names.tolist(), x_values.tolist())),
+            "term_code": (
+                str(np.asarray(z["term_code"]).item()),
+                str(np.asarray(z["term_desc"]).item()),
+            ),
+        }
+
+
+def load_lp_solution(path: Union[str, Path]) -> Dict:
+    """Compatibility alias for read_lp_solution()."""
+    return read_lp_solution(path)
 
 def solveLP(objective: Union[coo_array, Dict] = None,
             known_vars: Union[coo_array, Dict] = None,

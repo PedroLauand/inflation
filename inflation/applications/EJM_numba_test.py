@@ -12,16 +12,15 @@ from pathlib import Path
 import sys
 
 import mosek
-from scipy.sparse import coo_array
 
 # Ensure repo root is on sys.path so "import inflation" works when running directly.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from inflation.applications.Final_algo_numba import PrepLP
 from inflation.distributions import EJMDistribution
-from inflation.lp.lp_utils import solveLP_sparse
+from inflation.applications.Final_algo_numba import PrepLP
+from inflation.lp.lp_utils import save_lp_solution, solveLP_sparse
 
 
 def main(*, n: int) -> None:
@@ -29,35 +28,28 @@ def main(*, n: int) -> None:
     prep = PrepLP(
         n,
         distribution,
-        cache_name=None,
+        problem_name=f"EJM_n={n}",
         auto_discover_symmetries=True,
         compress_rows_under_discovered_group=True,
     )
-    variable_names = prep.variable_names
-    known_vars = prep.known_vars
-    inflation_matrix = prep.inflation_matrix
-    print(
-        "Index dtype (min signed):",
-        prep.min_dtype.name,
-        "| constraints:", inflation_matrix.shape[0] + known_vars.nnz,
-        "| variables:", inflation_matrix.shape[1],
-        "| known:", int(known_vars.nnz),
-    )
+    print(f"LP preparation complete for n={n}, now loading Mosek solver and solving.")
 
-    nof_all_LP_vars = inflation_matrix.shape[1]
     solverparameters = {
         mosek.iparam.optimizer: mosek.optimizertype.intpnt,
     }
     solution = solveLP_sparse(
-        objective=coo_array(([], ([], [])), shape=(1, nof_all_LP_vars)),
-        known_vars=known_vars,
-        equalities=inflation_matrix,
+        objective=prep.blank_objective,
+        known_vars=prep.known_vars,
+        equalities=prep.inflation_matrix,
         default_non_negative=True,
-        variables=variable_names,
+        variables=prep.variable_names,
         verbose=True,
         solverparameters=solverparameters,
     )
-    print(solution["status"])
+    print(f"Solution status for n={n}: {solution['status']}")
+    if prep.output_path is not None:
+        save_lp_solution(solution, prep.output_path)
+        print(f"Saved LP solution archive to {prep.output_path}")
 
 
 if __name__ == "__main__":
