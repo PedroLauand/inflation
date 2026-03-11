@@ -422,7 +422,7 @@ class PrepLP:
             return
         live_known_prefix = np.asarray(["1", *self.known_labels], dtype=str)
         try:
-            with np.load(self.cache_path, allow_pickle=False) as z:
+            with np.load(self.cache_path, allow_pickle=True) as z:
                 required = {
                     "cache_format_version",
                     "requested_n",
@@ -506,7 +506,7 @@ class PrepLP:
         if self.cache_path is None or self._cache_written:
             return
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez(
+        np.savez_compressed(
             self.cache_path,
             cache_format_version=CACHE_FORMAT_VERSION,
             requested_n=np.int64(self._requested_n),

@@ -80,7 +80,8 @@ def save_lp_solution(
     solution: Dict,
     path: Union[str, Path],
     *,
-    compression: bool = False,
+    compression: bool = True,
+    allow_pickle: bool = True,
 ) -> Path:
     """Save the array-serializable subset of an LP solution to an NPZ archive."""
     archive_path = _normalize_npz_path(path)
@@ -108,13 +109,14 @@ def save_lp_solution(
         certificate_col=certificate_col,
         certificate_data=certificate_data,
     )
+    _ = allow_pickle
     return archive_path
 
 
-def read_lp_solution(path: Union[str, Path]) -> Dict:
+def read_lp_solution(path: Union[str, Path], *, allow_pickle: bool = True) -> Dict:
     """Read an LP solution archive and reconstruct the solveLP_sparse() solution dictionary."""
     archive_path = _normalize_npz_path(path)
-    with np.load(archive_path, allow_pickle=False) as z:
+    with np.load(archive_path, allow_pickle=allow_pickle) as z:
         variable_names = np.asarray(z["variable_names"], dtype=str)
         x_values = np.asarray(z["x_values"], dtype=float)
         certificate_col = np.asarray(z["certificate_col"], dtype=np.int64)
@@ -142,9 +144,9 @@ def read_lp_solution(path: Union[str, Path]) -> Dict:
         }
 
 
-def load_lp_solution(path: Union[str, Path]) -> Dict:
+def load_lp_solution(path: Union[str, Path], *, allow_pickle: bool = True) -> Dict:
     """Compatibility alias for read_lp_solution()."""
-    return read_lp_solution(path)
+    return read_lp_solution(path, allow_pickle=allow_pickle)
 
 def solveLP(objective: Union[coo_array, Dict] = None,
             known_vars: Union[coo_array, Dict] = None,
