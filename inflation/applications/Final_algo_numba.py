@@ -74,8 +74,6 @@ def _prepare_group_chain(
     outcomes = prob.outcomes_per_party[0]
     if outcomes >= 255:
         raise ValueError("outcomes must be < 255 to fit in compact dtypes")
-    if n > 5:
-        raise ValueError("uint64 canonical events are only supported up to n=5")
     if prob._nr_operators % outcomes != 0:
         raise ValueError("Ring lexorder width must be divisible by the number of outcomes")
     slot_count = prob._nr_operators // outcomes
