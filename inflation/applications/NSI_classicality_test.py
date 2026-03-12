@@ -22,8 +22,8 @@ from inflation.applications.Final_algo_numba import PrepLP
 from inflation.lp.lp_utils import save_lp_solution, solveLP_sparse
 
 
-if __name__ == "__main__":
-    for n in [6,7,8]:
+def main(*, inflation_levels=(6, 7, 8)) -> None:
+    for n in inflation_levels:
         print(f"\n\n New problem: exploring NSI with inflation level {n}.")
         distribution = NSIPRDistribution()
         prep = PrepLP(
@@ -33,21 +33,33 @@ if __name__ == "__main__":
             auto_discover_symmetries=True,
             compress_rows_under_discovered_group=True,
         )
-        print(f"LP preparation complete for n={n}, now loading Mosek solver and solving.")
+        print(f"PrepLP initialized for n={n}; materializing LP inputs before Mosek.")
+        variable_names = prep.variable_names
+        known_vars = prep.known_vars
+        inflation_matrix = prep.inflation_matrix
+        print(
+            f"LP inputs ready for n={n}: "
+            f"rows={inflation_matrix.shape[0]}, cols={inflation_matrix.shape[1]}. "
+            "Starting Mosek setup."
+        )
 
         solverparameters = {
             mosek.iparam.optimizer: mosek.optimizertype.intpnt,
         }
         solution = solveLP_sparse(
             objective=prep.blank_objective,
-            known_vars=prep.known_vars,
-            equalities=prep.inflation_matrix,
+            known_vars=known_vars,
+            equalities=inflation_matrix,
             default_non_negative=True,
-            variables=prep.variable_names,
-            verbose=True,
+            variables=variable_names,
+            verbose=2,
             solverparameters=solverparameters,
         )
         print(f"Solution status for n={n}: {solution['status']}")
         if prep.output_path is not None:
             save_lp_solution(solution, prep.output_path)
             print(f"Saved LP solution archive to {prep.output_path}")
+
+
+if __name__ == "__main__":
+    main()

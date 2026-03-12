@@ -14,6 +14,7 @@ from scipy.sparse import coo_array, issparse
 from time import perf_counter
 from gc import collect
 from ..utils import partsextractor, expand_sparse_vec, vstack
+from ..progress_utils import progress_stage
 from array import array
 
 
@@ -408,14 +409,16 @@ def solveLP_sparse(objective: coo_array = blank_coo_array,
                 print(f"Size of constraint matrix: {constraints.shape}")
 
 
+            constraints = _ensure_index_dtype(constraints, idx_dtype)
             if verbose > 1:
                 print("Proceeding with primal initialization...")
-
-            constraints = _ensure_index_dtype(constraints, idx_dtype)
-            matrix = constraints.tocsc(copy=False)
-
-            if verbose > 1:
-                print("Sparse matrix reformat complete...")
+                with progress_stage(
+                    "Converting constraint matrix to CSC format...",
+                    end_message=lambda elapsed: f"CSC conversion complete in {elapsed:.2f}s",
+                ):
+                    matrix = constraints.tocsc(copy=False)
+            else:
+                matrix = constraints.tocsc(copy=False)
 
             if relax_known_vars or relax_inequalities:
                 # Maximize lambda
@@ -434,97 +437,183 @@ def solveLP_sparse(objective: coo_array = blank_coo_array,
             numcon = nof_primal_constraints
             numvar = nof_primal_variables
             if verbose > 1:
-                print("Starting task.inputdata in Mosek...")
-            int32_max = np.iinfo(np.int32).max
-            indptr_max = int(matrix.indptr[-1]) if matrix.indptr.size else 0
-            indices_max = int(matrix.indices.max()) if matrix.indices.size else 0
-            use_64 = (
-                numcon > int32_max
-                or numvar > int32_max
-                or indptr_max > int32_max
-                or indices_max > int32_max
-            )
-            int_dtype = np.int64 if use_64 else np.int32
+                with progress_stage(
+                    "Starting task.inputdata in Mosek...",
+                    end_message=lambda elapsed: f"Mosek input data loaded in {elapsed:.2f}s",
+                ):
+                    int32_max = np.iinfo(np.int32).max
+                    indptr_max = int(matrix.indptr[-1]) if matrix.indptr.size else 0
+                    indices_max = int(matrix.indices.max()) if matrix.indices.size else 0
+                    use_64 = (
+                        numcon > int32_max
+                        or numvar > int32_max
+                        or indptr_max > int32_max
+                        or indices_max > int32_max
+                    )
+                    int_dtype = np.int64 if use_64 else np.int32
 
-            # Set bound keys and values for constraints
-            # Ax >= b where b is 0
-            bkc = np.hstack((np.broadcast_to(mosek.boundkey.lo, nof_primal_inequalities),
-                             np.broadcast_to(mosek.boundkey.fx,
-                                             nof_primal_equalities)
-                             )).astype(int_dtype, copy=False)
-            if relax_known_vars:
-                bkc = np.hstack((bkc,
-                                 np.repeat([mosek.boundkey.lo, mosek.boundkey.up],
-                                                 nof_known_vars)
+                    # Set bound keys and values for constraints
+                    # Ax >= b where b is 0
+                    bkc = np.hstack((np.broadcast_to(mosek.boundkey.lo, nof_primal_inequalities),
+                                     np.broadcast_to(mosek.boundkey.fx,
+                                                     nof_primal_equalities)
+                                     )).astype(int_dtype, copy=False)
+                    if relax_known_vars:
+                        bkc = np.hstack((bkc,
+                                         np.repeat([mosek.boundkey.lo, mosek.boundkey.up],
+                                                         nof_known_vars)
+                                         )).astype(int_dtype, copy=False)
+                    blc = buc = b
+
+                    ub_col = upper_bounds.col
+                    ub_data = np.zeros(nof_primal_variables)
+                    ub_data[ub_col] = upper_bounds.data
+                    lb_col = lower_bounds.col
+                    lb_data = np.zeros(nof_primal_variables)
+                    lb_data[lb_col] = lower_bounds.data
+
+                    # Set bound keys and bound values for variables
+                    blx = np.zeros(nof_primal_variables)
+                    bux = np.zeros(nof_primal_variables)
+                    ub_col = np.asarray(upper_bounds.col)
+                    lb_col = np.asarray(lower_bounds.col)
+                    lb_data = lower_bounds.data
+                    if default_non_negative:
+                        bkx = np.repeat(mosek.boundkey.lo, nof_primal_variables).astype(int_dtype, copy=False)
+                        bkx[ub_col] = mosek.boundkey.ra
+                    else:
+                        bkx = np.repeat(mosek.boundkey.fr, nof_primal_variables).astype(int_dtype, copy=False)
+                        bkx[np.setdiff1d(lb_col, ub_col)] = mosek.boundkey.lo
+                        bkx[np.setdiff1d(ub_col, lb_col)] = mosek.boundkey.up
+                        bkx[np.intersect1d(ub_col, lb_col)] = mosek.boundkey.ra
+                    blx[lb_col] = lb_data
+                    bux[ub_col] = upper_bounds.data
+
+                    if relax_known_vars or relax_inequalities:
+                        bkx[-1] = mosek.boundkey.fr
+                    if use_64:
+                        aptrb = array("q", matrix.indptr[:-1].astype(np.int64, copy=False))
+                        aptre = array("q", matrix.indptr[1:].astype(np.int64, copy=False))
+                        asub = array("q", matrix.indices.astype(np.int64, copy=False))
+                    else:
+                        aptrb = array("i", matrix.indptr[:-1].astype(np.int32, copy=False))
+                        aptre = array("i", matrix.indptr[1:].astype(np.int32, copy=False))
+                        asub = array("i", matrix.indices.astype(np.int32, copy=False))
+                    task.inputdata(# maxnumcon=
+                                   numcon,
+                                   # maxnumvar=
+                                   numvar,
+                                   # c=
+                                   array("d", objective_vector),
+                                   # cfix=
+                                   0,
+                                   # aptrb=
+                                   aptrb,
+                                   # aptre=
+                                   aptre,
+                                   # asub=
+                                   asub,
+                                   # aval=
+                                   matrix.data,
+                                   bkc,
+                                   blc,
+                                   buc,
+                                   bkx,
+                                   blx,
+                                   bux)
+            else:
+                int32_max = np.iinfo(np.int32).max
+                indptr_max = int(matrix.indptr[-1]) if matrix.indptr.size else 0
+                indices_max = int(matrix.indices.max()) if matrix.indices.size else 0
+                use_64 = (
+                    numcon > int32_max
+                    or numvar > int32_max
+                    or indptr_max > int32_max
+                    or indices_max > int32_max
+                )
+                int_dtype = np.int64 if use_64 else np.int32
+
+                # Set bound keys and values for constraints
+                # Ax >= b where b is 0
+                bkc = np.hstack((np.broadcast_to(mosek.boundkey.lo, nof_primal_inequalities),
+                                 np.broadcast_to(mosek.boundkey.fx,
+                                                 nof_primal_equalities)
                                  )).astype(int_dtype, copy=False)
-            blc = buc = b
+                if relax_known_vars:
+                    bkc = np.hstack((bkc,
+                                     np.repeat([mosek.boundkey.lo, mosek.boundkey.up],
+                                                     nof_known_vars)
+                                     )).astype(int_dtype, copy=False)
+                blc = buc = b
 
-            ub_col = upper_bounds.col
-            ub_data = np.zeros(nof_primal_variables)
-            ub_data[ub_col] = upper_bounds.data
-            lb_col = lower_bounds.col
-            lb_data = np.zeros(nof_primal_variables)
-            lb_data[lb_col] = lower_bounds.data
+                ub_col = upper_bounds.col
+                ub_data = np.zeros(nof_primal_variables)
+                ub_data[ub_col] = upper_bounds.data
+                lb_col = lower_bounds.col
+                lb_data = np.zeros(nof_primal_variables)
+                lb_data[lb_col] = lower_bounds.data
 
-            # Set bound keys and bound values for variables
-            blx = np.zeros(nof_primal_variables)
-            bux = np.zeros(nof_primal_variables)
-            ub_col = np.asarray(upper_bounds.col)
-            lb_col = np.asarray(lower_bounds.col)
-            lb_data = lower_bounds.data
-            if default_non_negative:
-                bkx = np.repeat(mosek.boundkey.lo, nof_primal_variables).astype(int_dtype, copy=False)
-                bkx[ub_col] = mosek.boundkey.ra
-            else:
-                bkx = np.repeat(mosek.boundkey.fr, nof_primal_variables).astype(int_dtype, copy=False)
-                bkx[np.setdiff1d(lb_col, ub_col)] = mosek.boundkey.lo
-                bkx[np.setdiff1d(ub_col, lb_col)] = mosek.boundkey.up
-                bkx[np.intersect1d(ub_col, lb_col)] = mosek.boundkey.ra
-            blx[lb_col] = lb_data
-            bux[ub_col] = upper_bounds.data
+                # Set bound keys and bound values for variables
+                blx = np.zeros(nof_primal_variables)
+                bux = np.zeros(nof_primal_variables)
+                ub_col = np.asarray(upper_bounds.col)
+                lb_col = np.asarray(lower_bounds.col)
+                lb_data = lower_bounds.data
+                if default_non_negative:
+                    bkx = np.repeat(mosek.boundkey.lo, nof_primal_variables).astype(int_dtype, copy=False)
+                    bkx[ub_col] = mosek.boundkey.ra
+                else:
+                    bkx = np.repeat(mosek.boundkey.fr, nof_primal_variables).astype(int_dtype, copy=False)
+                    bkx[np.setdiff1d(lb_col, ub_col)] = mosek.boundkey.lo
+                    bkx[np.setdiff1d(ub_col, lb_col)] = mosek.boundkey.up
+                    bkx[np.intersect1d(ub_col, lb_col)] = mosek.boundkey.ra
+                blx[lb_col] = lb_data
+                bux[ub_col] = upper_bounds.data
 
-
-            if relax_known_vars or relax_inequalities:
-                bkx[-1] = mosek.boundkey.fr
-            if use_64:
-                aptrb = array("q", matrix.indptr[:-1].astype(np.int64, copy=False))
-                aptre = array("q", matrix.indptr[1:].astype(np.int64, copy=False))
-                asub = array("q", matrix.indices.astype(np.int64, copy=False))
-            else:
-                aptrb = array("i", matrix.indptr[:-1].astype(np.int32, copy=False))
-                aptre = array("i", matrix.indptr[1:].astype(np.int32, copy=False))
-                asub = array("i", matrix.indices.astype(np.int32, copy=False))
-            task.inputdata(# maxnumcon=
-                           numcon,
-                           # maxnumvar=
-                           numvar,
-                           # c=
-                           array("d", objective_vector),
-                           # cfix=
-                           0,
-                           # aptrb=
-                           aptrb,
-                           # aptre=
-                           aptre,
-                           # asub=
-                           asub,
-                           # aval=
-                           matrix.data,
-                           bkc,
-                           blc,
-                           buc,
-                           bkx,
-                           blx,
-                           bux)
+                if relax_known_vars or relax_inequalities:
+                    bkx[-1] = mosek.boundkey.fr
+                if use_64:
+                    aptrb = array("q", matrix.indptr[:-1].astype(np.int64, copy=False))
+                    aptre = array("q", matrix.indptr[1:].astype(np.int64, copy=False))
+                    asub = array("q", matrix.indices.astype(np.int64, copy=False))
+                else:
+                    aptrb = array("i", matrix.indptr[:-1].astype(np.int32, copy=False))
+                    aptre = array("i", matrix.indptr[1:].astype(np.int32, copy=False))
+                    asub = array("i", matrix.indices.astype(np.int32, copy=False))
+                task.inputdata(# maxnumcon=
+                               numcon,
+                               # maxnumvar=
+                               numvar,
+                               # c=
+                               array("d", objective_vector),
+                               # cfix=
+                               0,
+                               # aptrb=
+                               aptrb,
+                               # aptre=
+                               aptre,
+                               # asub=
+                               asub,
+                               # aval=
+                               matrix.data,
+                               bkc,
+                               blc,
+                               buc,
+                               bkx,
+                               blx,
+                               bux)
             collect()
             if verbose > 1:
                 print("Pre-processing took",
                       format(perf_counter() - t0, ".4f"), "seconds.\n")
                 t0 = perf_counter()
 
-            if verbose > 1:
-                print("Writing problem to debug_lp.ptf...")
-                task.writedata("debug_lp.ptf")
+            if verbose > 2:
+                with progress_stage(
+                    "Writing problem to debug_lp.ptf...",
+                    end_message=lambda elapsed: f"Wrote debug_lp.ptf in {elapsed:.2f}s",
+                ):
+                    task.writedata("debug_lp.ptf")
 
             # Solve the problem
             if verbose > 0:

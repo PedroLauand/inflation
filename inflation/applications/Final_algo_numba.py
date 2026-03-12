@@ -23,7 +23,7 @@ from numba import njit, types
 from numba.typed import Dict as NumbaDict
 from numba.typed import List as NumbaList
 from scipy.sparse import coo_array
-from inflation.progress_utils import make_tqdm as tqdm
+from inflation.progress_utils import make_tqdm as tqdm, progress_stage
 
 # Ensure repo root is on sys.path so "import inflation" works when running this file directly.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -412,7 +412,17 @@ class PrepLP:
         if self.cache_path is None:
             return
         if self.cache_path.exists():
-            self._load_cache_if_available()
+            with progress_stage(
+                f"Checking LP input cache at {self.cache_path}",
+                enabled=self.verbose_cache,
+                end_message=lambda elapsed: (
+                    "Loaded cached LP constraints from "
+                    f"{self.cache_path} in {elapsed:.2f}s "
+                    f"(rows={self._cached_inflation_matrix.shape[0]}, "
+                    f"cols={self._cached_inflation_matrix.shape[1]})"
+                ),
+            ):
+                self._load_cache_if_available()
         return
 
     def _load_cache_if_available(self) -> None:
@@ -493,9 +503,6 @@ class PrepLP:
             raise self._incompatible_cache_error() from exc
         except (OSError, TypeError, KeyError) as exc:
             raise self._incompatible_cache_error() from exc
-        if self.verbose_cache:
-            print(f"Loaded cached LP constraints from {self.cache_path}")
-
     def _save_cache(
         self,
         variable_names: np.ndarray,
@@ -504,23 +511,28 @@ class PrepLP:
         if self.cache_path is None or self._cache_written:
             return
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(
-            self.cache_path,
-            cache_format_version=CACHE_FORMAT_VERSION,
-            requested_n=np.int64(self._requested_n),
-            outcomes=np.int64(self.outcomes),
-            ambient_dimension=np.int64(self.N),
-            original_symmetry_generators=np.asarray(self.core_symmetries, dtype=int),
-            discovered_symmetry_generators=np.asarray(self.discovered_symmetries, dtype=int),
-            inflation_matrix_shape=np.asarray(inflation_matrix.shape, dtype=np.int64),
-            inflation_matrix_columns_indices=inflation_matrix.col,
-            inflation_matrix_row_indices=inflation_matrix.row,
-            inflation_matrix_data_entries=inflation_matrix.data,
-            variable_names=variable_names,
-        )
+        with progress_stage(
+            f"Saving LP input cache to {self.cache_path}",
+            enabled=self.verbose_cache,
+            end_message=lambda elapsed: (
+                f"Saved LP constraints cache to {self.cache_path} in {elapsed:.2f}s"
+            ),
+        ):
+            np.savez_compressed(
+                self.cache_path,
+                cache_format_version=CACHE_FORMAT_VERSION,
+                requested_n=np.int64(self._requested_n),
+                outcomes=np.int64(self.outcomes),
+                ambient_dimension=np.int64(self.N),
+                original_symmetry_generators=np.asarray(self.core_symmetries, dtype=int),
+                discovered_symmetry_generators=np.asarray(self.discovered_symmetries, dtype=int),
+                inflation_matrix_shape=np.asarray(inflation_matrix.shape, dtype=np.int64),
+                inflation_matrix_columns_indices=inflation_matrix.col,
+                inflation_matrix_row_indices=inflation_matrix.row,
+                inflation_matrix_data_entries=inflation_matrix.data,
+                variable_names=variable_names,
+            )
         self._cache_written = True
-        if self.verbose_cache:
-            print(f"Saved LP constraints cache to {self.cache_path}")
 
     @cached_property
     def core_symmetries(self) -> np.ndarray:
@@ -924,27 +936,38 @@ class PrepLP:
                 sparse_matrix_cols=sparse_matrix_cols,
                 start=start,
             )
-        if int(next_event_idx) > np.iinfo(np.int32).max:
-            raise ValueError("next_event_idx exceeds int32 range; use wider dtype")
-        nof_caonical_global_events = int(next_event_idx) - (1 + self.nof_marginals)
-        min_dtype = _min_signed_dtype(int(next_event_idx))
-        sparse_matrix_cols = sparse_matrix_cols.astype(min_dtype, copy=False)
+        with progress_stage(
+            "Finalizing sparse extension matrix...",
+            enabled=self.show_progress,
+            end_message=lambda elapsed: (
+                "Constraint matrix finalized: "
+                f"rows={inflation_matrix.shape[0]}, "
+                f"cols={inflation_matrix.shape[1]}, "
+                f"nnz={inflation_matrix.nnz} "
+                f"in {elapsed:.2f}s"
+            ),
+        ):
+            if int(next_event_idx) > np.iinfo(np.int32).max:
+                raise ValueError("next_event_idx exceeds int32 range; use wider dtype")
+            nof_caonical_global_events = int(next_event_idx) - (1 + self.nof_marginals)
+            min_dtype = _min_signed_dtype(int(next_event_idx))
+            sparse_matrix_cols = sparse_matrix_cols.astype(min_dtype, copy=False)
 
-        known_rows = np.arange(self.nof_marginals, dtype=np.int32)
-        known_cols = np.arange(1, self.nof_marginals + 1, dtype=min_dtype)
-        known_data = -np.ones(self.nof_marginals, dtype=np.int8)
+            known_rows = np.arange(self.nof_marginals, dtype=np.int32)
+            known_cols = np.arange(1, self.nof_marginals + 1, dtype=min_dtype)
+            known_data = -np.ones(self.nof_marginals, dtype=np.int8)
 
-        all_rows = np.concatenate([known_rows, sparse_matrix_rows])
-        all_cols = np.concatenate([known_cols, sparse_matrix_cols])
-        all_data = np.concatenate([known_data, sparse_matrix_data])
-        inflation_matrix = coo_array(
-            (all_data, (all_rows, all_cols)),
-            shape=(self.nof_marginals, int(next_event_idx)),
-        )
-        inflation_matrix.sum_duplicates()
-        global_keys = np.asarray(list_of_all_global_keys, dtype=np.uint64)
-        if global_keys.size != nof_caonical_global_events:
-            raise ValueError("global_keys count does not match the number of canonical global events")
+            all_rows = np.concatenate([known_rows, sparse_matrix_rows])
+            all_cols = np.concatenate([known_cols, sparse_matrix_cols])
+            all_data = np.concatenate([known_data, sparse_matrix_data])
+            inflation_matrix = coo_array(
+                (all_data, (all_rows, all_cols)),
+                shape=(self.nof_marginals, int(next_event_idx)),
+            )
+            inflation_matrix.sum_duplicates()
+            global_keys = np.asarray(list_of_all_global_keys, dtype=np.uint64)
+            if global_keys.size != nof_caonical_global_events:
+                raise ValueError("global_keys count does not match the number of canonical global events")
         return inflation_matrix, nof_caonical_global_events, min_dtype, global_keys
 
     @property
@@ -1059,9 +1082,15 @@ if __name__ == "__main__":
         demo_preps[label] = prep
 
     prep_nsi = demo_preps["NSI-PR"]
+    print("PrepLP initialized for NSI-PR demo; materializing LP inputs before Mosek.")
     variable_names = prep_nsi.variable_names
     known_vars = prep_nsi.known_vars
     inflation_matrix = prep_nsi.inflation_matrix
+    print(
+        "LP inputs ready for NSI-PR demo: "
+        f"rows={inflation_matrix.shape[0]}, cols={inflation_matrix.shape[1]}. "
+        "Starting Mosek setup."
+    )
 
     nof_all_LP_vars = inflation_matrix.shape[1]
     solution = solveLP_sparse(
@@ -1070,7 +1099,7 @@ if __name__ == "__main__":
         equalities=inflation_matrix,
         default_non_negative=True,
         variables=variable_names,
-        verbose=True,
+        verbose=2,
     )
 
     print(solution["status"])

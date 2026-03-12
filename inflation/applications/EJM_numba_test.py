@@ -32,18 +32,26 @@ def main(*, n: int) -> None:
         auto_discover_symmetries=True,
         compress_rows_under_discovered_group=True,
     )
-    print(f"LP preparation complete for n={n}, now loading Mosek solver and solving.")
+    print(f"PrepLP initialized for n={n}; materializing LP inputs before Mosek.")
+    variable_names = prep.variable_names
+    known_vars = prep.known_vars
+    inflation_matrix = prep.inflation_matrix
+    print(
+        f"LP inputs ready for n={n}: "
+        f"rows={inflation_matrix.shape[0]}, cols={inflation_matrix.shape[1]}. "
+        "Starting Mosek setup."
+    )
 
     solverparameters = {
         mosek.iparam.optimizer: mosek.optimizertype.intpnt,
     }
     solution = solveLP_sparse(
         objective=prep.blank_objective,
-        known_vars=prep.known_vars,
-        equalities=prep.inflation_matrix,
+        known_vars=known_vars,
+        equalities=inflation_matrix,
         default_non_negative=True,
-        variables=prep.variable_names,
-        verbose=True,
+        variables=variable_names,
+        verbose=2,
         solverparameters=solverparameters,
     )
     print(f"Solution status for n={n}: {solution['status']}")

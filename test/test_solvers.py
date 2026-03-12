@@ -1,8 +1,12 @@
 import unittest
+import io
+import os
+import tempfile
 import numpy as np
 import warnings
 from scipy.sparse import lil_matrix, coo_matrix, vstack
 from copy import deepcopy
+from contextlib import redirect_stdout
 
 from inflation.sdp.sdp_utils import solveSDP_MosekFUSION
 from inflation.lp.lp_utils import solveLP_sparse, to_sparse, convert_dicts, \
@@ -441,3 +445,53 @@ class TestTools(unittest.TestCase):
                                      f"{arg} is not equal: "
                                      f"{exp_arg.toarray()} != "
                                      f"{act_arg.toarray()}.")
+
+
+class TestSolverVerbosity(unittest.TestCase):
+    def test_verbose_two_reports_preprocessing_without_debug_dump(self):
+        stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cwd = os.getcwd()
+            try:
+                os.chdir(tmpdir)
+                with redirect_stdout(stdout):
+                    solveLP_sparse(
+                        **simple_lp_mat,
+                        variables=var,
+                        solve_dual=False,
+                        verbose=2,
+                    )
+            finally:
+                os.chdir(cwd)
+
+            self.assertFalse(os.path.exists(os.path.join(tmpdir, "debug_lp.ptf")))
+
+        output = stdout.getvalue()
+        self.assertIn("Starting pre-processing for the LP solver...", output)
+        self.assertIn("Converting constraint matrix to CSC format...", output)
+        self.assertIn("CSC conversion complete in", output)
+        self.assertIn("Starting task.inputdata in Mosek...", output)
+        self.assertIn("Mosek input data loaded in", output)
+        self.assertNotIn("Writing problem to debug_lp.ptf...", output)
+
+    def test_verbose_three_writes_debug_dump(self):
+        stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cwd = os.getcwd()
+            try:
+                os.chdir(tmpdir)
+                with redirect_stdout(stdout):
+                    solveLP_sparse(
+                        **simple_lp_mat,
+                        variables=var,
+                        solve_dual=False,
+                        verbose=3,
+                    )
+            finally:
+                os.chdir(cwd)
+
+            self.assertTrue(os.path.exists(os.path.join(tmpdir, "debug_lp.ptf")))
+
+        output = stdout.getvalue()
+        self.assertIn("Writing problem to debug_lp.ptf...", output)
+        self.assertIn("Wrote debug_lp.ptf in", output)
