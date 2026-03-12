@@ -93,9 +93,10 @@ class Sparse2DBitArray:
     def extend(self, other: Union[np.ndarray, "Sparse2DBitArray"]) -> None:
         if isinstance(other, Sparse2DBitArray):
             assert self.num_cols == other.num_cols, "Cannot add Sparse2DBitArray with different number of columns"
+            offset = self.size
+            self._bm.update(other._bm.shift(offset))
             self.num_rows += other.num_rows
-            self._bm.update(other._bm.shift(self.size))
-        if isinstance(other, np.ndarray):
+        elif isinstance(other, np.ndarray):
             self.extend(self.from_array(other))
 
     def __repr__(self):
