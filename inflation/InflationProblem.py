@@ -50,7 +50,7 @@ class InflationProblem:
                  nonclassical_intermediate_latents: Union[Tuple[str,...], List[str]]=tuple(),
                  classical_intermediate_latents: Union[Tuple[str,...], List[str]]=tuple(),
                  order: Union[Tuple[str,...], List[str]]=tuple(),
-                 really_just_one_source: bool=True,
+                 really_just_one_source: bool=False,
                  verbose=0):
         """Class for encoding relevant details concerning the causal compatibility
         scenario.
