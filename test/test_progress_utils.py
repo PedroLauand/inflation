@@ -36,20 +36,20 @@ class _FakeMatrix:
 class _FakePrep:
     def __init__(self, *args, **kwargs):
         self.output_path = None
-        self._variable_names = ["1", "known"]
-        self._known_vars = "known-vars"
+        self._global_keys = [101, 202]
+        self._known_values = [0.5, 0.5]
         self._inflation_matrix = _FakeMatrix((7, 11))
         self.solve_calls = []
 
     @property
-    def variable_names(self):
+    def global_keys(self):
         print("Canonicalizing marginals")
-        return self._variable_names
+        return self._global_keys
 
     @property
-    def known_vars(self):
+    def known_values(self):
         print("Computing marginal values...")
-        return self._known_vars
+        return self._known_values
 
     @property
     def inflation_matrix(self):
@@ -68,7 +68,11 @@ class _FakePrep:
         self.solve_calls.append(kwargs)
         print("Starting pre-processing for the LP solver...")
         print("Optimizer started.")
-        return {"status": "optimal"}
+        return {
+            "status": "optimal",
+            "success": True,
+            "incompatible_fraction": 0.0,
+        }
 
 
 class TestProgressUtils(unittest.TestCase):
@@ -133,8 +137,8 @@ class TestProgressUtils(unittest.TestCase):
                     verbose_symmetry_discovery=True,
                     verbose_cache=True,
                 )
-                _ = prep.variable_names
-                _ = prep.known_vars
+                _ = prep.global_keys
+                _ = prep.known_values
                 _ = prep.inflation_matrix
 
             stdout_output = stdout_stream.getvalue()
@@ -204,6 +208,7 @@ class TestProgressUtils(unittest.TestCase):
             "LP inputs ready for n=3: rows=7, cols=11. Starting Mosek setup.",
             "Starting pre-processing for the LP solver...",
             "Optimizer started.",
+            "Exact feasibility for n=3: True. Incompatible fraction: 0",
         ]
         positions = [output.index(marker) for marker in expected_markers]
         self.assertEqual(positions, sorted(positions))

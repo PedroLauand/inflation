@@ -19,7 +19,7 @@ class _UniformBinaryDistribution:
 
 
 class TestRingSymmetryDiscovery(unittest.TestCase):
-    def test_lazy_materialization_and_symbolic_known_vars(self):
+    def test_lazy_materialization_and_symbolic_known_values(self):
         distribution = _UniformBinaryDistribution()
         prep = PrepLP(
             3,
@@ -31,19 +31,15 @@ class TestRingSymmetryDiscovery(unittest.TestCase):
             verbose_cache=False,
         )
         self.assertNotIn("variable_names", prep.__dict__)
-        self.assertNotIn("known_vars_symbolic", prep.__dict__)
         self.assertNotIn("inflation_matrix", prep.__dict__)
+        self.assertFalse(hasattr(prep, "known_vars"))
+        self.assertFalse(hasattr(prep, "known_vars_symbolic"))
+        self.assertFalse(hasattr(prep, "blank_objective"))
 
         symbolic = prep.known_values_symbolic
-        numeric = prep.known_vars
-        self.assertEqual(len(symbolic), numeric.nnz)
-        self.assertTrue(
-            np.array_equal(
-                numeric.col,
-                np.arange(1, prep.nof_marginals + 1, dtype=np.int64),
-            )
-        )
-        for sym_val, num_val in zip(symbolic.tolist(), numeric.data.tolist()):
+        numeric = prep.known_values
+        self.assertEqual(len(symbolic), len(numeric))
+        for sym_val, num_val in zip(symbolic.tolist(), numeric.tolist()):
             self.assertAlmostEqual(float(sp.N(sym_val)), float(num_val), places=12)
 
     def test_row_orbit_metadata_consistency(self):

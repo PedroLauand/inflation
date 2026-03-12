@@ -41,7 +41,7 @@ from inflation.applications.ring_utils import build_off_diagonal_ring_problem
 from inflation.distributions.protocols import RingDistributionProtocol
 from inflation.symmetry_utils import discovery_symmetries_from_predicate
 
-CACHE_FORMAT_VERSION = np.int64(5)
+CACHE_FORMAT_VERSION = np.int64(6)
 
 
 def ring_problem(inflation_level: int, distribution: RingDistributionProtocol) -> InflationProblem:
@@ -214,25 +214,22 @@ def _sort_rows_and_count_unique(
                     prev = col
         else:
             unique_cols = 0
-        row_nnz[row_num] = 1 + unique_cols
+        row_nnz[row_num] = unique_cols
     return row_nnz
 
 
 @njit(cache=True, parallel=True, fastmath=True)
-def _fill_full_csr_from_sorted_rows(
+def _fill_direct_csr_from_sorted_rows(
     sparse_matrix_cols: np.ndarray,
     row_entry_ptr: np.ndarray,
-    nof_marginals: int,
     indptr: np.ndarray,
     indices: np.ndarray,
     data: np.ndarray,
 ) -> None:
-    """Fill the full solver CSR matrix, including appended known-value rows."""
+    """Fill the direct marginal-form CSR matrix from sorted per-row column ids."""
+    nof_marginals = row_entry_ptr.size - 1
     for row_num in prange(nof_marginals):
         write_pos = int(indptr[row_num])
-        indices[write_pos] = np.int64(1 + row_num)
-        data[write_pos] = -1.0
-        write_pos += 1
         start = int(row_entry_ptr[row_num])
         end = int(row_entry_ptr[row_num + 1])
         if end > start:
@@ -250,12 +247,6 @@ def _fill_full_csr_from_sorted_rows(
                     multiplicity = 1
             indices[write_pos] = current
             data[write_pos] = float(multiplicity)
-
-    for marginal_idx in prange(nof_marginals):
-        row_num = nof_marginals + marginal_idx
-        write_pos = int(indptr[row_num])
-        indices[write_pos] = np.int64(1 + marginal_idx)
-        data[write_pos] = 1.0
 
 
 @njit(cache=True, fastmath=True)
@@ -292,6 +283,26 @@ def _csr_to_column_payload(
             aval[write_pos] = data[pos]
             next_pos[col] = write_pos + 1
     return aptrb, aptre, asub, aval
+
+
+@njit(cache=True, fastmath=True)
+def _csr_weighted_column_sums(
+    indptr: np.ndarray,
+    indices: np.ndarray,
+    data: np.ndarray,
+    row_weights: np.ndarray,
+    nof_cols: int,
+) -> np.ndarray:
+    """Compute weighted column sums for a CSR matrix without format conversion."""
+    result = np.zeros(nof_cols, dtype=np.float64)
+    nof_rows = indptr.size - 1
+    for row_num in range(nof_rows):
+        weight = row_weights[row_num]
+        start = int(indptr[row_num])
+        end = int(indptr[row_num + 1])
+        for pos in range(start, end):
+            result[int(indices[pos])] += weight * data[pos]
+    return result
 
 def _stable_unique_inverse(keys: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """Return first-appearance unique keys and inverse indices preserving row-major order."""
@@ -333,6 +344,118 @@ def _resolve_mosek_optimizer(name: str):
             "Unknown optimizer choice. Expected one of: "
             "simplex, free_simplex, primal_simplex, dual_simplex, interior_point, intpnt."
         ) from exc
+
+
+def _resolve_ring_solve_mode(mode: str) -> str:
+    """Normalize the supported direct ring LP solve modes."""
+    normalized = str(mode).strip().lower()
+    if normalized not in {"feasibility", "incompatible_fraction", "generalized_robustness"}:
+        raise ValueError(
+            "Unknown solve mode. Expected one of: "
+            "feasibility, incompatible_fraction, generalized_robustness."
+        )
+    return normalized
+
+
+def _normalize_prep_solution_path(path: str | Path) -> Path:
+    """Normalize a PrepLP solution archive path to `.npz`."""
+    archive_path = Path(path)
+    if archive_path.suffix == "":
+        return archive_path.with_suffix(".npz")
+    if archive_path.suffix.lower() == ".npz":
+        return archive_path
+    raise ValueError("Archive path must omit the extension or end with '.npz'.")
+
+
+def save_prep_lp_solution(
+    solution: Dict,
+    path: str | Path,
+    *,
+    compression: bool = True,
+) -> Path:
+    """Save the direct-basis PrepLP solution dictionary to an NPZ archive."""
+    archive_path = _normalize_prep_solution_path(path)
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+
+    global_keys = np.asarray(list(solution["x"].keys()), dtype=np.uint64)
+    x_values = np.asarray([float(solution["x"][key]) for key in global_keys.tolist()], dtype=np.float64)
+    constraint_names = np.asarray(solution["constraint_names"], dtype=str)
+    sparse_certificate = solution["sparse_certificate"].tocoo(copy=False)
+    if sparse_certificate.nnz:
+        order = np.argsort(sparse_certificate.col, kind="stable")
+        certificate_col = sparse_certificate.col[order].astype(np.int64, copy=False)
+        certificate_data = sparse_certificate.data[order].astype(np.float64, copy=False)
+    else:
+        certificate_col = np.empty(0, dtype=np.int64)
+        certificate_data = np.empty(0, dtype=np.float64)
+    term_code, term_desc = solution["term_code"]
+
+    save_fn = np.savez_compressed if compression else np.savez
+    save_fn(
+        archive_path,
+        status=np.asarray(str(solution["status"])),
+        success=np.asarray(bool(solution["success"])),
+        solver_success=np.asarray(bool(solution["solver_success"])),
+        primal_value=np.asarray(float(solution["primal_value"])),
+        dual_value=np.asarray(float(solution["dual_value"])),
+        term_code=np.asarray(str(term_code)),
+        term_desc=np.asarray(str(term_desc)),
+        mode=np.asarray(str(solution["mode"])),
+        known_mass=np.asarray(float(solution["known_mass"])),
+        optimized_mass=np.asarray(float(solution["optimized_mass"])),
+        incompatible_fraction=np.asarray(float(solution["incompatible_fraction"])),
+        generalized_robustness=np.asarray(float(solution["generalized_robustness"])),
+        global_keys=global_keys,
+        x_values=x_values,
+        constraint_names=constraint_names,
+        certificate_col=certificate_col,
+        certificate_data=certificate_data,
+    )
+    return archive_path
+
+
+def read_prep_lp_solution(path: str | Path, *, allow_pickle: bool = True) -> Dict:
+    """Read a PrepLP solution archive and reconstruct the direct-basis solution dictionary."""
+    archive_path = _normalize_prep_solution_path(path)
+    with np.load(archive_path, allow_pickle=allow_pickle) as z:
+        global_keys = np.asarray(z["global_keys"], dtype=np.uint64)
+        x_values = np.asarray(z["x_values"], dtype=np.float64)
+        constraint_names = np.asarray(z["constraint_names"], dtype=str)
+        certificate_col = np.asarray(z["certificate_col"], dtype=np.int64)
+        certificate_data = np.asarray(z["certificate_data"], dtype=np.float64)
+        cert_row = np.zeros(certificate_col.shape[0], dtype=np.int32)
+        sparse_certificate = coo_array(
+            (certificate_data, (cert_row, certificate_col)),
+            shape=(1, constraint_names.size),
+        )
+        dual_certificate = dict(
+            zip(constraint_names[certificate_col].tolist(), certificate_data.tolist())
+        )
+        return {
+            "primal_value": float(np.asarray(z["primal_value"]).item()),
+            "dual_value": float(np.asarray(z["dual_value"]).item()),
+            "status": str(np.asarray(z["status"]).item()),
+            "success": bool(np.asarray(z["success"]).item()),
+            "solver_success": bool(np.asarray(z["solver_success"]).item()),
+            "mode": str(np.asarray(z["mode"]).item()),
+            "known_mass": float(np.asarray(z["known_mass"]).item()),
+            "optimized_mass": float(np.asarray(z["optimized_mass"]).item()),
+            "incompatible_fraction": float(np.asarray(z["incompatible_fraction"]).item()),
+            "generalized_robustness": float(np.asarray(z["generalized_robustness"]).item()),
+            "dual_certificate": dual_certificate,
+            "sparse_certificate": sparse_certificate,
+            "constraint_names": constraint_names,
+            "x": dict(zip(global_keys.tolist(), x_values.tolist())),
+            "term_code": (
+                str(np.asarray(z["term_code"]).item()),
+                str(np.asarray(z["term_desc"]).item()),
+            ),
+        }
+
+
+def load_prep_lp_solution(path: str | Path, *, allow_pickle: bool = True) -> Dict:
+    """Compatibility alias for `read_prep_lp_solution()`."""
+    return read_prep_lp_solution(path, allow_pickle=allow_pickle)
 
 
 # =========================
@@ -485,9 +608,9 @@ class PrepLP:
     Prepare LP ingredients for the canonical ring pipeline.
 
     Main outputs:
-      - variable_names
-      - known_vars_symbolic
-      - known_vars
+      - global_keys
+      - known_values_symbolic
+      - known_values
       - inflation_matrix
     """
 
@@ -514,8 +637,6 @@ class PrepLP:
         self.verbose_symmetry_discovery = verbose_symmetry_discovery
         self.verbose_cache = verbose_cache
         self.prob = ring_problem(self._requested_n, distribution)
-        self._cached_variable_names: np.ndarray | None = None
-        self._cached_known_vars: coo_array | None = None
         self._cached_inflation_matrix: csr_array | None = None
         self._cached_global_keys: np.ndarray | None = None
         self._cached_nof_caonical_global_events: int | None = None
@@ -588,7 +709,6 @@ class PrepLP:
     def _load_cache_if_available(self) -> None:
         if self.cache_path is None or not self.cache_path.exists():
             return
-        live_known_prefix = np.asarray(["1", *self.known_labels], dtype=str)
         try:
             with np.load(self.cache_path, allow_pickle=True) as z:
                 required = {
@@ -607,7 +727,7 @@ class PrepLP:
                     "solver_aptre",
                     "solver_asub",
                     "solver_aval",
-                    "variable_names",
+                    "row_names",
                 }
                 if any(key not in z.files for key in required):
                     raise self._incompatible_cache_error()
@@ -628,31 +748,21 @@ class PrepLP:
                 if not np.array_equal(cached_discovered_symmetries, self.discovered_symmetries):
                     raise self._incompatible_cache_error()
 
-                variable_names = np.asarray(z["variable_names"], dtype=str)
-                if variable_names.size < live_known_prefix.size:
-                    raise self._incompatible_cache_error()
-                if not np.array_equal(variable_names[: live_known_prefix.size], live_known_prefix):
-                    raise self._incompatible_cache_error()
-
+                row_names = np.asarray(z["row_names"], dtype=str)
                 inflation_shape_raw = np.asarray(z["inflation_matrix_shape"], dtype=np.int64)
                 if inflation_shape_raw.shape != (2,):
                     raise self._incompatible_cache_error()
                 inflation_shape = tuple(int(x) for x in inflation_shape_raw.tolist())
-                if inflation_shape[0] != 2 * self.nof_marginals:
+                if inflation_shape[0] != self.nof_marginals:
                     raise self._incompatible_cache_error()
-                if inflation_shape[1] != variable_names.size:
+                if inflation_shape[1] != int(np.asarray(z["global_keys"], dtype=np.uint64).size):
+                    raise self._incompatible_cache_error()
+                if not np.array_equal(row_names, np.asarray(self.row_labels, dtype=str)):
                     raise self._incompatible_cache_error()
 
-                nof_caonical_global_events = inflation_shape[1] - live_known_prefix.size
-                if nof_caonical_global_events < 0:
-                    raise self._incompatible_cache_error()
                 global_keys = np.asarray(z["global_keys"], dtype=np.uint64)
-                if global_keys.size != nof_caonical_global_events:
-                    raise self._incompatible_cache_error()
-                if not np.array_equal(
-                    variable_names[live_known_prefix.size :],
-                    np.asarray([str(key) for key in global_keys.tolist()], dtype=str),
-                ):
+                nof_caonical_global_events = int(global_keys.size)
+                if nof_caonical_global_events != inflation_shape[1]:
                     raise self._incompatible_cache_error()
 
                 try:
@@ -670,7 +780,6 @@ class PrepLP:
                     (data, indices, indptr),
                     shape=inflation_shape,
                 )
-                self._cached_variable_names = variable_names
                 self._cached_global_keys = global_keys
                 self._cached_nof_caonical_global_events = nof_caonical_global_events
                 self._cached_solver_column_payload = (
@@ -688,7 +797,6 @@ class PrepLP:
 
     def _save_cache(
         self,
-        variable_names: np.ndarray,
         inflation_matrix: csr_array,
         solver_payload: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
     ) -> None:
@@ -720,7 +828,7 @@ class PrepLP:
                 solver_aptre=np.asarray(solver_aptre, dtype=np.int64),
                 solver_asub=np.asarray(solver_asub, dtype=np.int32),
                 solver_aval=np.asarray(solver_aval, dtype=np.float64),
-                variable_names=variable_names,
+                row_names=np.asarray(self.row_labels, dtype=str),
             )
         self._cache_written = True
 
@@ -1104,25 +1212,22 @@ class PrepLP:
         int,
         np.ndarray,
         Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
-        np.ndarray,
     ]:
         """
         Tuple `(inflation_matrix, nof_caonical_global_events, global_keys,
-        solver_column_payload, variable_names)` for the full ring LP system.
+        solver_column_payload)` for the direct ring LP system.
         """
         if (
             self._cached_inflation_matrix is not None
             and self._cached_global_keys is not None
             and self._cached_nof_caonical_global_events is not None
             and self._cached_solver_column_payload is not None
-            and self._cached_variable_names is not None
         ):
             return (
                 self._cached_inflation_matrix,
                 self._cached_nof_caonical_global_events,
                 self._cached_global_keys,
                 self._cached_solver_column_payload,
-                self._cached_variable_names,
             )
 
         (
@@ -1167,59 +1272,46 @@ class PrepLP:
         ):
             global_keys, inverse = _stable_unique_inverse(all_keys)
             nof_caonical_global_events = int(global_keys.size)
-            nof_lp_vars = 1 + self.nof_marginals + nof_caonical_global_events
-            if nof_lp_vars > np.iinfo(np.int32).max:
+            if nof_caonical_global_events > np.iinfo(np.int32).max:
                 raise ValueError("Ring LP exceeds the current MOSEK Python binding variable limit.")
 
             sparse_matrix_cols = inverse.astype(np.int64, copy=False)
-            sparse_matrix_cols += np.int64(1 + self.nof_marginals)
-
             top_row_nnz = _sort_rows_and_count_unique(sparse_matrix_cols, row_entry_ptr)
-            row_nnz = np.empty(2 * self.nof_marginals, dtype=np.int64)
-            row_nnz[: self.nof_marginals] = top_row_nnz
-            row_nnz[self.nof_marginals :] = 1
-            indptr = np.empty(2 * self.nof_marginals + 1, dtype=np.int64)
+            indptr = np.empty(self.nof_marginals + 1, dtype=np.int64)
             indptr[0] = 0
-            if row_nnz.size > 0:
-                indptr[1:] = np.cumsum(row_nnz, dtype=np.int64)
+            if top_row_nnz.size > 0:
+                indptr[1:] = np.cumsum(top_row_nnz, dtype=np.int64)
             indices = np.empty(int(indptr[-1]), dtype=np.int64)
             data = np.empty(int(indptr[-1]), dtype=np.float64)
-            _fill_full_csr_from_sorted_rows(
+            _fill_direct_csr_from_sorted_rows(
                 sparse_matrix_cols,
                 row_entry_ptr,
-                self.nof_marginals,
                 indptr,
                 indices,
                 data,
             )
             inflation_matrix = csr_array(
                 (data, indices, indptr),
-                shape=(2 * self.nof_marginals, nof_lp_vars),
+                shape=(self.nof_marginals, nof_caonical_global_events),
             )
             solver_payload = _csr_to_column_payload(
                 indptr,
                 indices,
                 data,
-                nof_lp_vars,
+                nof_caonical_global_events,
             )
             solver_payload = tuple(np.ascontiguousarray(arr) for arr in solver_payload)
-            variable_names = np.asarray(
-                ["1", *self.known_labels, *[str(key) for key in global_keys.tolist()]],
-                dtype=str,
-            )
 
         self._cached_inflation_matrix = inflation_matrix
         self._cached_global_keys = global_keys
         self._cached_nof_caonical_global_events = nof_caonical_global_events
         self._cached_solver_column_payload = solver_payload
-        self._cached_variable_names = variable_names
-        self._save_cache(variable_names, inflation_matrix, solver_payload)
+        self._save_cache(inflation_matrix, solver_payload)
         return (
             inflation_matrix,
             nof_caonical_global_events,
             global_keys,
             solver_payload,
-            variable_names,
         )
 
     @property
@@ -1231,14 +1323,14 @@ class PrepLP:
 
     @property
     def nof_caonical_global_events(self) -> int:
-        """Number of canonical global-event LP columns beyond `1` and known marginals."""
+        """Number of canonical global-event LP columns."""
         if self._cached_nof_caonical_global_events is not None:
             return self._cached_nof_caonical_global_events
         return self._canonical_global_lhs_payload[1]
 
     @property
     def inflation_matrix(self) -> csr_array:
-        """Final sparse equality matrix, including known-value rows."""
+        """Direct marginal-form sparse matrix `A_direct`."""
         if self._cached_inflation_matrix is not None:
             return self._cached_inflation_matrix
         return self._canonical_global_lhs_payload[0]
@@ -1252,67 +1344,54 @@ class PrepLP:
 
     @property
     def nof_lp_vars(self):
-        """Number of LP variables in the final LP."""
-        if self._cached_variable_names is not None:
-            return int(self._cached_variable_names.size)
+        """Number of direct global-event variables in the final LP."""
+        if self._cached_global_keys is not None:
+            return int(self._cached_global_keys.size)
         if self._cached_nof_caonical_global_events is not None:
-            return 1 + self.nof_marginals + int(self._cached_nof_caonical_global_events)
-        return 1 + self.nof_marginals + self.nof_caonical_global_events
+            return int(self._cached_nof_caonical_global_events)
+        return self.nof_caonical_global_events
 
     @property
     def nof_lp_constraints(self) -> int:
-        """Number of LP equality constraints in the full cached system."""
+        """Number of LP constraints in the direct marginal formulation."""
         if self._cached_inflation_matrix is not None:
             return int(self._cached_inflation_matrix.shape[0])
-        return 2 * self.nof_marginals
+        return self.nof_marginals
 
-    @property
-    def blank_objective(self):
-        """Objective function of the final LP."""
-        return coo_array(([], ([], [])), shape=(1, self.nof_lp_vars), dtype=np.float64)
-
-    @cached_property
-    def known_vars_symbolic(self) -> coo_array:
-        """Sparse symbolic known-variables row vector aligned with `inflation_matrix` columns."""
-        total_cols = self.inflation_matrix.shape[1]
-        known_positions = np.arange(1, self.nof_marginals + 1, dtype=np.int64)
-        known_rows0 = np.zeros(self.nof_marginals, dtype=np.int32)
-        return coo_array(
-            (self.known_values_symbolic, (known_rows0, known_positions)),
-            shape=(1, total_cols),
-            dtype=object,
-        )
-
-    @cached_property
-    def known_vars(self) -> coo_array:
-        """Sparse float known-variables row vector aligned with `inflation_matrix` columns."""
-        if self._cached_known_vars is not None:
-            return self._cached_known_vars
-        total_cols = self.inflation_matrix.shape[1]
-        known_positions = np.arange(1, self.nof_marginals + 1, dtype=np.int64)
-        known_rows0 = np.zeros(self.nof_marginals, dtype=np.int32)
-        known_vars = coo_array(
-            (self.known_values.astype(np.float64, copy=False), (known_rows0, known_positions)),
-            shape=(1, total_cols),
-            dtype=np.float64,
-        )
-        self._cached_known_vars = known_vars
-        return known_vars
-
-    @cached_property
     def variable_names(self) -> np.ndarray:
-        """Variable names aligned with matrix columns: const, known marginals, global keys."""
-        if self._cached_variable_names is not None:
-            return self._cached_variable_names
-        return self._canonical_global_lhs_payload[4]
+        """Compatibility alias for the direct global-event uint64 keys."""
+        return self.global_keys
+
+    @cached_property
+    def _mass_weights(self) -> np.ndarray:
+        """Row multiplicities as float weights for direct mass objectives."""
+        return self.row_orbit_multiplicities.astype(np.float64, copy=False)
+
+    @cached_property
+    def _mass_objective(self) -> np.ndarray:
+        """Column objective giving the multiplicity-corrected global mass."""
+        matrix = self.inflation_matrix
+        return _csr_weighted_column_sums(
+            matrix.indptr.astype(np.int64, copy=False),
+            matrix.indices.astype(np.int64, copy=False),
+            matrix.data.astype(np.float64, copy=False),
+            self._mass_weights,
+            self.nof_lp_vars,
+        )
+
+    @cached_property
+    def _known_mass(self) -> float:
+        """Multiplicity-corrected total known mass for direct relaxations."""
+        return float(np.dot(self._mass_weights, self.known_values.astype(np.float64, copy=False)))
 
     def solve(
         self,
         *,
+        mode: str = "incompatible_fraction",
         optimizer: str = "free_simplex",
         verbose: int = 0,
     ) -> Dict:
-        """Solve the ring LP directly from the prepared solver-ready payload."""
+        """Solve the direct ring LP in feasibility or relaxed incompatibility modes."""
         import mosek
         from inflation.lp.lp_utils import streamprinter
 
@@ -1321,11 +1400,15 @@ class PrepLP:
             t_total = perf_counter()
             print("Starting pre-processing for the LP solver...")
 
+        solve_mode = _resolve_ring_solve_mode(mode)
         aptrb, aptre, asub, aval = self.solver_column_payload
         nof_lp_vars = self.nof_lp_vars
         nof_constraints = self.nof_lp_constraints
-        nof_marginals = self.nof_marginals
         known_values = self.known_values.astype(np.float64, copy=False)
+        global_keys = self.global_keys.astype(np.uint64, copy=False)
+        constraint_names = np.asarray(self.row_labels, dtype=object)
+        known_mass = self._known_mass
+        mass_objective = self._mass_objective.astype(np.float64, copy=False)
 
         if verbose > 1:
             print("Proceeding with ring LP initialization...")
@@ -1336,12 +1419,31 @@ class PrepLP:
             raise ValueError("Ring LP exceeds the current MOSEK Python binding dimension limit.")
 
         optimizer_choice = _resolve_mosek_optimizer(optimizer)
-        objective_vector = np.zeros(numvar, dtype=np.float64)
-        bkc = _boundkey_array(mosek.boundkey.fx, numcon)
-        rhs = np.zeros(numcon, dtype=np.float64)
-        rhs[nof_marginals:] = known_values
-        blc = rhs
-        buc = rhs.copy()
+        tolerance = 1e-9
+        rhs = np.ascontiguousarray(known_values, dtype=np.float64)
+        if solve_mode == "feasibility":
+            objective_vector = np.zeros(numvar, dtype=np.float64)
+            bkc = _boundkey_array(mosek.boundkey.fx, numcon)
+            blc = rhs.copy()
+            buc = rhs.copy()
+            objective_sense = mosek.objsense.maximize
+        elif solve_mode == "incompatible_fraction":
+            if known_mass <= 0.0:
+                raise ValueError("known_mass must be positive to compute incompatible_fraction.")
+            objective_vector = mass_objective.copy()
+            bkc = _boundkey_array(mosek.boundkey.up, numcon)
+            blc = np.zeros(numcon, dtype=np.float64)
+            buc = rhs.copy()
+            objective_sense = mosek.objsense.maximize
+        else:
+            if known_mass <= 0.0:
+                raise ValueError("known_mass must be positive to compute generalized_robustness.")
+            objective_vector = mass_objective.copy()
+            bkc = _boundkey_array(mosek.boundkey.lo, numcon)
+            blc = rhs.copy()
+            buc = np.zeros(numcon, dtype=np.float64)
+            objective_sense = mosek.objsense.minimize
+
         bkx = _boundkey_array(mosek.boundkey.lo, numvar)
         blx = np.zeros(numvar, dtype=np.float64)
         bux = np.zeros(numvar, dtype=np.float64)
@@ -1372,7 +1474,7 @@ class PrepLP:
                     task.putintparam(mosek.iparam.log_sim, 0)
                     task.putintparam(mosek.iparam.log_intpnt, 0)
 
-                task.putobjsense(mosek.objsense.maximize)
+                task.putobjsense(objective_sense)
                 if verbose > 0:
                     print(f"Size of constraint matrix: ({numcon}, {numvar})")
 
@@ -1432,33 +1534,52 @@ class PrepLP:
                     snx,
                 ) = task.getsolution(basic)
 
-                xx = np.asarray(xx, dtype=object)
-                yy = np.asarray(yy, dtype=object)
+                xx = np.asarray(xx, dtype=np.float64)
+                yy = np.asarray(yy, dtype=np.float64)
                 primal = task.getprimalobj(basic)
                 dual = task.getdualobj(basic)
 
                 status_str = solutionsta.__repr__()
-                success = solutionsta == mosek.solsta.optimal
+                solver_success = solutionsta != mosek.solsta.unknown
+                has_optimal_primal = solutionsta == mosek.solsta.optimal
                 term_tuple = mosek.Env.getcodedesc(trmcode)
                 if solutionsta == mosek.solsta.unknown and verbose > 0:
                     print("The solution status is unknown.")
                     print(f"   Termination code: {term_tuple}")
 
-                known_duals = yy[nof_marginals:]
-                cert_data = np.zeros(numvar, dtype=np.float64)
-                for idx in range(nof_marginals):
-                    cert_data[1 + idx] = float(known_duals[idx])
-                cert_col = np.nonzero(np.abs(cert_data) > 0)[0].astype(np.int64, copy=False)
+                optimized_mass = float(np.dot(mass_objective, xx)) if has_optimal_primal else np.nan
+                if solve_mode == "feasibility":
+                    success = bool(has_optimal_primal)
+                    incompatible_fraction = np.nan
+                    generalized_robustness = np.nan
+                elif solve_mode == "incompatible_fraction":
+                    success = bool(has_optimal_primal and optimized_mass >= known_mass - tolerance)
+                    incompatible_fraction = (
+                        max(0.0, 1.0 - (optimized_mass / known_mass))
+                        if has_optimal_primal
+                        else np.nan
+                    )
+                    generalized_robustness = np.nan
+                else:
+                    success = bool(has_optimal_primal and optimized_mass <= known_mass + tolerance)
+                    incompatible_fraction = np.nan
+                    generalized_robustness = (
+                        max(0.0, (optimized_mass / known_mass) - 1.0)
+                        if has_optimal_primal
+                        else np.nan
+                    )
+
+                cert_data = yy.astype(np.float64, copy=False)
+                cert_col = np.nonzero(~np.isclose(cert_data, 0.0))[0].astype(np.int64, copy=False)
                 cert_row = np.zeros(cert_col.size, dtype=np.int32)
                 cert_vals = cert_data[cert_col]
                 sparse_certificate = coo_array(
                     (cert_vals, (cert_row, cert_col)),
-                    shape=(1, numvar),
+                    shape=(1, numcon),
                 )
 
-                variable_names = self.variable_names.astype(object, copy=False)
-                x_values = dict(zip(variable_names.tolist(), xx.tolist()))
-                certificate = dict(zip(variable_names.tolist(), cert_data.tolist()))
+                x_values = dict(zip(global_keys.tolist(), xx.tolist()))
+                certificate = dict(zip(constraint_names.tolist(), cert_data.tolist()))
                 for var in list(certificate):
                     if np.isclose(certificate[var], 0.0):
                         del certificate[var]
@@ -1471,11 +1592,41 @@ class PrepLP:
                     "dual_value": dual,
                     "status": status_str,
                     "success": bool(success),
+                    "solver_success": bool(solver_success),
+                    "mode": solve_mode,
+                    "known_mass": float(known_mass),
+                    "optimized_mass": float(optimized_mass),
+                    "incompatible_fraction": incompatible_fraction,
+                    "generalized_robustness": generalized_robustness,
                     "dual_certificate": certificate,
                     "sparse_certificate": sparse_certificate,
+                    "constraint_names": np.asarray(constraint_names, dtype=str),
                     "x": x_values,
                     "term_code": term_tuple,
                 }
+
+    def save_solution(
+        self,
+        solution: Dict,
+        path: str | Path | None = None,
+        *,
+        compression: bool = True,
+    ) -> Path:
+        """Save a direct-basis PrepLP solution archive."""
+        target_path = self.output_path if path is None else Path(path)
+        if target_path is None:
+            raise ValueError("No output path configured for this PrepLP instance.")
+        return save_prep_lp_solution(solution, target_path, compression=compression)
+
+    @staticmethod
+    def read_solution(path: str | Path, *, allow_pickle: bool = True) -> Dict:
+        """Read a direct-basis PrepLP solution archive."""
+        return read_prep_lp_solution(path, allow_pickle=allow_pickle)
+
+    @staticmethod
+    def load_solution(path: str | Path, *, allow_pickle: bool = True) -> Dict:
+        """Compatibility alias for `read_solution()`."""
+        return read_prep_lp_solution(path, allow_pickle=allow_pickle)
 
 
 # =========================
@@ -1483,7 +1634,6 @@ class PrepLP:
 # =========================
 if __name__ == "__main__":
     from inflation.distributions import EJMDistribution, NSIPRDistribution, RGBDistribution
-    from inflation.lp.lp_utils import save_lp_solution
 
     n = 4
 
@@ -1511,8 +1661,7 @@ if __name__ == "__main__":
 
     prep_nsi = demo_preps["NSI-PR"]
     print("PrepLP initialized for NSI-PR demo; materializing LP inputs before Mosek.")
-    _ = prep_nsi.variable_names
-    known_vars = prep_nsi.known_vars
+    _ = prep_nsi.global_keys
     print(
         "LP inputs ready for NSI-PR demo: "
         f"rows={prep_nsi.nof_lp_constraints}, cols={prep_nsi.nof_lp_vars}. "
@@ -1524,27 +1673,28 @@ if __name__ == "__main__":
     )
 
     print(solution["status"])
+    print(
+        f"Exact feasibility: {solution['success']}. "
+        f"Incompatible fraction: {solution['incompatible_fraction']:.12g}"
+    )
     if prep_nsi.output_path is not None:
-        save_lp_solution(solution, prep_nsi.output_path)
+        prep_nsi.save_solution(solution)
         print(f"Saved LP solution archive to {prep_nsi.output_path}")
 
     def _evaluate_sparse_certificate_on_knowns(
         sparse_certificate: coo_array,
-        known_vec: coo_array,
+        known_values: np.ndarray,
     ) -> float:
-        """Evaluate sparse certificate on known assignments without densifying."""
+        """Evaluate a direct row-basis certificate on the known marginal values."""
         cert_coo = sparse_certificate
-        known_cols = known_vec.col.astype(np.int64, copy=False)
-        known_vals = known_vec.data.astype(float, copy=False)
-        known_map = dict(zip(known_cols.tolist(), known_vals.tolist()))
         value = 0.0
         for col, coeff in zip(cert_coo.col.tolist(), cert_coo.data.tolist()):
-            value += float(coeff) * float(known_map.get(int(col), 0.0))
+            value += float(coeff) * float(known_values[int(col)])
         return value
 
     def _print_infeasibility_certificate_analysis(
         solution_dict: dict,
-        known_vec: coo_array,
+        known_values: np.ndarray,
         *,
         chop_tol: float = 1e-10,
         top_k: int = 25,
@@ -1565,19 +1715,13 @@ if __name__ == "__main__":
             print(f"Dual certificate is numerically zero after chop_tol={chop_tol:g}.")
             return
 
-        known_terms = {k: v for k, v in cleaned.items() if k.startswith("P_global(")}
-        global_terms = {k: v for k, v in cleaned.items() if (k not in known_terms and k != "1")}
-        const_coeff = cleaned.get("1", 0.0)
-
         cert_value = _evaluate_sparse_certificate_on_knowns(
-            solution_dict["sparse_certificate"], known_vec
+            solution_dict["sparse_certificate"], known_values
         )
 
         print("\nCertificate analysis:")
         print(f"  nonzero terms (after chop): {len(cleaned)}")
-        print(f"  known-marginal terms: {len(known_terms)}")
-        print(f"  global-event terms: {len(global_terms)}")
-        print(f"  constant term coeff: {const_coeff:.12g}")
+        print(f"  constraint-row terms: {len(cleaned)}")
         print(f"  certificate value on knowns: {cert_value:.12g}")
         print("  incompatibility witness criterion: certificate < 0")
 
@@ -1587,4 +1731,7 @@ if __name__ == "__main__":
             print(f"    {coeff:+.12g} * {var}")
 
     if not solution.get("success", False):
-        _print_infeasibility_certificate_analysis(solution, known_vars)
+        _print_infeasibility_certificate_analysis(
+            solution,
+            prep_nsi.known_values.astype(np.float64, copy=False),
+        )

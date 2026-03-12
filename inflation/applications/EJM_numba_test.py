@@ -18,7 +18,6 @@ if str(_REPO_ROOT) not in sys.path:
 
 from inflation.distributions import EJMDistribution
 from inflation.applications.Final_algo_numba import PrepLP
-from inflation.lp.lp_utils import save_lp_solution
 
 
 def main(*, n: int) -> None:
@@ -31,8 +30,7 @@ def main(*, n: int) -> None:
         compress_rows_under_discovered_group=True,
     )
     print(f"PrepLP initialized for n={n}; materializing LP inputs before Mosek.")
-    _ = prep.variable_names
-    _ = prep.known_vars
+    _ = prep.global_keys
     print(
         f"LP inputs ready for n={n}: "
         f"rows={prep.nof_lp_constraints}, cols={prep.nof_lp_vars}. "
@@ -44,8 +42,12 @@ def main(*, n: int) -> None:
         verbose=2,
     )
     print(f"Solution status for n={n}: {solution['status']}")
+    print(
+        f"Exact feasibility for n={n}: {solution['success']}. "
+        f"Incompatible fraction: {solution['incompatible_fraction']:.12g}"
+    )
     if prep.output_path is not None:
-        save_lp_solution(solution, prep.output_path)
+        prep.save_solution(solution)
         print(f"Saved LP solution archive to {prep.output_path}")
 
 

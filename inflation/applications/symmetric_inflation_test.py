@@ -165,10 +165,13 @@ if __name__ == "__main__":
         auto_discover_symmetries=True,
         compress_rows_under_discovered_group=True,
     )
-    _ = prep.variable_names
-    _ = prep.known_vars
+    _ = prep.global_keys
 
     solution = prep.solve(
         verbose=True,
     )
     print(solution["status"])
+    print(
+        f"Exact feasibility: {solution['success']}. "
+        f"Incompatible fraction: {solution['incompatible_fraction']:.12g}"
+    )

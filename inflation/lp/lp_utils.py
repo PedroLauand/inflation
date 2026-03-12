@@ -77,6 +77,15 @@ def _normalize_npz_path(path: Union[str, Path]) -> Path:
     raise ValueError("Archive path must omit the extension or end with '.npz'.")
 
 
+def _serialize_solution_keys(keys) -> np.ndarray:
+    """Preserve integer keys and fall back to strings for generic symbolic labels."""
+    key_list = list(keys)
+    raw = np.asarray(key_list)
+    if raw.dtype.kind in {"u", "i"}:
+        return raw
+    return np.asarray(key_list, dtype=str)
+
+
 def save_lp_solution(
     solution: Dict,
     path: Union[str, Path],
@@ -88,8 +97,10 @@ def save_lp_solution(
     archive_path = _normalize_npz_path(path)
     archive_path.parent.mkdir(parents=True, exist_ok=True)
 
-    variable_names = np.asarray(list(solution["x"].keys()), dtype=str)
-    x_values = np.asarray([float(solution["x"][name]) for name in variable_names], dtype=float)
+    x_keys = list(solution["x"].keys())
+    variable_names = _serialize_solution_keys(x_keys)
+    x_values = np.asarray([float(solution["x"][name]) for name in x_keys], dtype=float)
+    constraint_names = np.asarray(solution.get("constraint_names", variable_names), dtype=str)
     sparse_certificate = canonical_order(solution["sparse_certificate"].tocoo(copy=False))
     nonzero_mask = ~np.isclose(sparse_certificate.data, 0.0)
     certificate_col = sparse_certificate.col[nonzero_mask].astype(np.int64, copy=False)
@@ -105,8 +116,15 @@ def save_lp_solution(
         dual_value=np.asarray(float(solution["dual_value"])),
         term_code=np.asarray(str(term_code)),
         term_desc=np.asarray(str(term_desc)),
+        mode=np.asarray(str(solution.get("mode", ""))),
+        solver_success=np.asarray(bool(solution.get("solver_success", solution["success"]))),
+        known_mass=np.asarray(float(solution.get("known_mass", np.nan))),
+        optimized_mass=np.asarray(float(solution.get("optimized_mass", np.nan))),
+        incompatible_fraction=np.asarray(float(solution.get("incompatible_fraction", np.nan))),
+        generalized_robustness=np.asarray(float(solution.get("generalized_robustness", np.nan))),
         variable_names=variable_names,
         x_values=x_values,
+        constraint_names=constraint_names,
         certificate_col=certificate_col,
         certificate_data=certificate_data,
     )
@@ -118,25 +136,47 @@ def read_lp_solution(path: Union[str, Path], *, allow_pickle: bool = True) -> Di
     """Read an LP solution archive and reconstruct the solveLP_sparse() solution dictionary."""
     archive_path = _normalize_npz_path(path)
     with np.load(archive_path, allow_pickle=allow_pickle) as z:
-        variable_names = np.asarray(z["variable_names"], dtype=str)
+        variable_names = np.asarray(z["variable_names"])
         x_values = np.asarray(z["x_values"], dtype=float)
+        constraint_names = (
+            np.asarray(z["constraint_names"], dtype=str)
+            if "constraint_names" in z.files
+            else variable_names
+        )
         certificate_col = np.asarray(z["certificate_col"], dtype=np.int64)
         certificate_data = np.asarray(z["certificate_data"], dtype=float)
         cert_row = np.zeros(certificate_col.shape[0], dtype=np.int32)
         sparse_certificate = coo_array(
             (certificate_data, (cert_row, certificate_col)),
-            shape=(1, variable_names.size),
+            shape=(1, constraint_names.size),
         )
         dual_certificate = dict(
-            zip(variable_names[certificate_col].tolist(), certificate_data.tolist())
+            zip(constraint_names[certificate_col].tolist(), certificate_data.tolist())
         )
         return {
             "primal_value": float(np.asarray(z["primal_value"]).item()),
             "dual_value": float(np.asarray(z["dual_value"]).item()),
             "status": str(np.asarray(z["status"]).item()),
             "success": bool(np.asarray(z["success"]).item()),
+            "solver_success": bool(
+                np.asarray(z["solver_success"]).item() if "solver_success" in z.files else np.asarray(z["success"]).item()
+            ),
+            "mode": str(np.asarray(z["mode"]).item()) if "mode" in z.files else "",
+            "known_mass": float(np.asarray(z["known_mass"]).item()) if "known_mass" in z.files else np.nan,
+            "optimized_mass": float(np.asarray(z["optimized_mass"]).item()) if "optimized_mass" in z.files else np.nan,
+            "incompatible_fraction": (
+                float(np.asarray(z["incompatible_fraction"]).item())
+                if "incompatible_fraction" in z.files
+                else np.nan
+            ),
+            "generalized_robustness": (
+                float(np.asarray(z["generalized_robustness"]).item())
+                if "generalized_robustness" in z.files
+                else np.nan
+            ),
             "dual_certificate": dual_certificate,
             "sparse_certificate": sparse_certificate,
+            "constraint_names": constraint_names,
             "x": dict(zip(variable_names.tolist(), x_values.tolist())),
             "term_code": (
                 str(np.asarray(z["term_code"]).item()),
