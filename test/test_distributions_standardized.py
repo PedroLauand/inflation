@@ -102,7 +102,10 @@ class TestStandardizedDistributionAPIs(unittest.TestCase):
     def test_migration_smoke(self):
         final_algo_path = REPO_ROOT / "inflation" / "applications" / "Final_algo_numba.py"
         final_mod = _load_module_from_path("final_algo_numba_smoke", final_algo_path)
-        value = final_mod.factorized_marginal_value([[1, 1, 1, 0, 0]], EJMDistribution())
+        value = final_mod.factorized_marginal_value(
+            [[1, 1, 2, 0, 0], [1, 2, 1, 0, 1]],
+            EJMDistribution(),
+        )
         self.assertIsInstance(value, sp.Expr)
 
         postquantum_path = REPO_ROOT / "inflation" / "applications" / "postquantum_proof_2outcomes.py"

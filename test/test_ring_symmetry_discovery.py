@@ -24,21 +24,26 @@ class TestRingSymmetryDiscovery(unittest.TestCase):
         prep = PrepLP(
             3,
             distribution,
-            cache_name=None,
             show_progress=False,
             auto_discover_symmetries=True,
             compress_rows_under_discovered_group=True,
             verbose_symmetry_discovery=False,
+            verbose_cache=False,
         )
         self.assertNotIn("variable_names", prep.__dict__)
         self.assertNotIn("known_vars_symbolic", prep.__dict__)
         self.assertNotIn("inflation_matrix", prep.__dict__)
 
-        symbolic = prep.known_vars_symbolic
+        symbolic = prep.known_values_symbolic
         numeric = prep.known_vars
-        self.assertEqual(symbolic.nnz, numeric.nnz)
-        self.assertTrue(np.array_equal(symbolic.col, numeric.col))
-        for sym_val, num_val in zip(symbolic.data.tolist(), numeric.data.tolist()):
+        self.assertEqual(len(symbolic), numeric.nnz)
+        self.assertTrue(
+            np.array_equal(
+                numeric.col,
+                np.arange(1, prep.nof_marginals + 1, dtype=prep.min_dtype),
+            )
+        )
+        for sym_val, num_val in zip(symbolic.tolist(), numeric.data.tolist()):
             self.assertAlmostEqual(float(sp.N(sym_val)), float(num_val), places=12)
 
     def test_row_orbit_metadata_consistency(self):
@@ -46,11 +51,11 @@ class TestRingSymmetryDiscovery(unittest.TestCase):
         prep = PrepLP(
             3,
             distribution,
-            cache_name=None,
             show_progress=False,
             auto_discover_symmetries=True,
             compress_rows_under_discovered_group=True,
             verbose_symmetry_discovery=False,
+            verbose_cache=False,
         )
 
         self.assertGreaterEqual(
@@ -91,11 +96,11 @@ class TestRingSymmetryDiscovery(unittest.TestCase):
         prep = PrepLP(
             3,
             distribution,
-            cache_name=None,
             show_progress=False,
             auto_discover_symmetries=True,
             compress_rows_under_discovered_group=False,
             verbose_symmetry_discovery=False,
+            verbose_cache=False,
         )
 
         self.assertEqual(
