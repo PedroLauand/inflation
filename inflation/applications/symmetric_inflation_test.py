@@ -14,7 +14,6 @@ import sys
 
 import numpy as np
 import sympy as sp
-from scipy.sparse import coo_array
 
 # Ensure repo root is on sys.path so "import inflation" works when running directly.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -142,8 +141,6 @@ class PrepLPExpectations(PrepLP):
 
 
 if __name__ == "__main__":
-    from inflation.lp.lp_utils import solveLP_sparse
-
     n = 3
     sqrt2 = np.sqrt(2.0)
     E_line = {
@@ -168,17 +165,10 @@ if __name__ == "__main__":
         auto_discover_symmetries=True,
         compress_rows_under_discovered_group=True,
     )
-    variable_names = prep.variable_names
-    known_vars = prep.known_vars
-    inflation_matrix = prep.inflation_matrix
+    _ = prep.variable_names
+    _ = prep.known_vars
 
-    nof_all_LP_vars = inflation_matrix.shape[1]
-    solution = solveLP_sparse(
-        objective=coo_array(([], ([], [])), shape=(1, nof_all_LP_vars)),
-        known_vars=known_vars,
-        equalities=inflation_matrix,
-        default_non_negative=True,
-        variables=variable_names,
+    solution = prep.solve(
         verbose=True,
     )
     print(solution["status"])

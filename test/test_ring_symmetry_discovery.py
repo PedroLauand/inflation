@@ -40,7 +40,7 @@ class TestRingSymmetryDiscovery(unittest.TestCase):
         self.assertTrue(
             np.array_equal(
                 numeric.col,
-                np.arange(1, prep.nof_marginals + 1, dtype=prep.min_dtype),
+                np.arange(1, prep.nof_marginals + 1, dtype=np.int64),
             )
         )
         for sym_val, num_val in zip(symbolic.tolist(), numeric.data.tolist()):

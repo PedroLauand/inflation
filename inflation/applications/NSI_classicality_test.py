@@ -10,8 +10,6 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
-import mosek
-
 # Ensure repo root is on sys.path so "import inflation" works when running this file directly.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
@@ -19,10 +17,10 @@ if str(_REPO_ROOT) not in sys.path:
 
 from inflation.distributions import NSIPRDistribution
 from inflation.applications.Final_algo_numba import PrepLP
-from inflation.lp.lp_utils import save_lp_solution, solveLP_sparse
+from inflation.lp.lp_utils import save_lp_solution
 
 
-def main(*, inflation_levels=(6, 7, 8)) -> None:
+def main(*, inflation_levels=(5, 6, 7, 8)) -> None:
     for n in inflation_levels:
         print(f"\n\n New problem: exploring NSI with inflation level {n}.")
         distribution = NSIPRDistribution()
@@ -34,26 +32,17 @@ def main(*, inflation_levels=(6, 7, 8)) -> None:
             compress_rows_under_discovered_group=True,
         )
         print(f"PrepLP initialized for n={n}; materializing LP inputs before Mosek.")
-        variable_names = prep.variable_names
-        known_vars = prep.known_vars
-        inflation_matrix = prep.inflation_matrix
+        _ = prep.variable_names
+        _ = prep.known_vars
         print(
             f"LP inputs ready for n={n}: "
-            f"rows={inflation_matrix.shape[0]}, cols={inflation_matrix.shape[1]}. "
+            f"rows={prep.nof_lp_constraints}, cols={prep.nof_lp_vars}. "
             "Starting Mosek setup."
         )
 
-        solverparameters = {
-            mosek.iparam.optimizer: mosek.optimizertype.intpnt,
-        }
-        solution = solveLP_sparse(
-            objective=prep.blank_objective,
-            known_vars=known_vars,
-            equalities=inflation_matrix,
-            default_non_negative=True,
-            variables=variable_names,
+        solution = prep.solve(
+            optimizer="interior_point",
             verbose=2,
-            solverparameters=solverparameters,
         )
         print(f"Solution status for n={n}: {solution['status']}")
         if prep.output_path is not None:

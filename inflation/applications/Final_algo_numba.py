@@ -14,15 +14,15 @@ from collections import Counter
 from functools import cached_property
 from itertools import combinations, permutations, product
 from pathlib import Path
+from time import perf_counter
 from typing import Dict, Iterable, Iterator, List, Sequence, Tuple
 import sys
 
 import numpy as np
 import sympy as sp
-from numba import njit, types
-from numba.typed import Dict as NumbaDict
+from numba import njit, prange
 from numba.typed import List as NumbaList
-from scipy.sparse import coo_array
+from scipy.sparse import coo_array, csr_array
 from inflation.progress_utils import make_tqdm as tqdm, progress_stage
 
 # Ensure repo root is on sys.path so "import inflation" works when running this file directly.
@@ -41,21 +41,7 @@ from inflation.applications.ring_utils import build_off_diagonal_ring_problem
 from inflation.distributions.protocols import RingDistributionProtocol
 from inflation.symmetry_utils import discovery_symmetries_from_predicate
 
-ZERO_I32 = np.int32(0)
-CACHE_FORMAT_VERSION = np.int64(4)
-
-
-def _min_signed_dtype(bound: int) -> np.dtype:
-    """Choose the smallest signed integer dtype that can represent ``bound``."""
-    if bound < 0:
-        raise ValueError("bound must be non-negative")
-    if bound <= np.iinfo(np.int8).max:
-        return np.dtype(np.int8)
-    if bound <= np.iinfo(np.int16).max:
-        return np.dtype(np.int16)
-    if bound <= np.iinfo(np.int32).max:
-        return np.dtype(np.int32)
-    return np.dtype(np.int64)
+CACHE_FORMAT_VERSION = np.int64(5)
 
 
 def ring_problem(inflation_level: int, distribution: RingDistributionProtocol) -> InflationProblem:
@@ -164,36 +150,189 @@ def _average_orbit_label(labels: Sequence[str]) -> str:
     return f"({' + '.join(weighted_terms)})/{len(labels)}"
 
 
-@njit(cache=True, fastmath=True)
-def _fill_cols_uint64(
-    evt: np.ndarray,
-    remaining: np.ndarray,
+@njit(cache=True, parallel=True, fastmath=True)
+def _fill_global_extension_keys_parallel(
+    row_entry_ptr: np.ndarray,
+    row_fixed_ptr: np.ndarray,
+    fixed_slots_flat: np.ndarray,
+    fixed_vals_flat: np.ndarray,
+    row_remaining_ptr: np.ndarray,
+    remaining_slots_flat: np.ndarray,
+    nof_off_diagonal_slots: int,
     outcomes: int,
     level_invperms: NumbaList,
-    global_event_map,
-    next_event_idx: int,
+) -> np.ndarray:
+    """Enumerate canonical uint64 global-event keys for each row in parallel."""
+    nof_rows = row_entry_ptr.size - 1
+    total_entries = int(row_entry_ptr[-1])
+    all_keys = np.empty(total_entries, dtype=np.uint64)
+    for row_num in prange(nof_rows):
+        evt = np.zeros(nof_off_diagonal_slots, dtype=np.uint8)
+        fixed_start = int(row_fixed_ptr[row_num])
+        fixed_end = int(row_fixed_ptr[row_num + 1])
+        for pos in range(fixed_start, fixed_end):
+            evt[fixed_slots_flat[pos]] = fixed_vals_flat[pos]
+        remaining_start = int(row_remaining_ptr[row_num])
+        remaining_end = int(row_remaining_ptr[row_num + 1])
+        remaining_size = remaining_end - remaining_start
+        entry_start = int(row_entry_ptr[row_num])
+        entry_end = int(row_entry_ptr[row_num + 1])
+        for offset in range(entry_end - entry_start):
+            tmp = offset
+            for rem_pos in range(remaining_size - 1, -1, -1):
+                idx = remaining_slots_flat[remaining_start + rem_pos]
+                evt[idx] = tmp % outcomes
+                tmp //= outcomes
+            all_keys[entry_start + offset] = canonical_leximin_coset_chain_uint64(
+                evt,
+                outcomes,
+                level_invperms,
+            )
+    return all_keys
+
+
+@njit(cache=True, parallel=True, fastmath=True)
+def _sort_rows_and_count_unique(
     sparse_matrix_cols: np.ndarray,
-    start: int,
-    total: int,
-    new_keys: NumbaList,
-) -> int:
-    """Writes into sparse_matrix_cols and updates global_event_map/new_keys."""
-    next_event_idx = np.int32(next_event_idx)
-    for pos in range(total):
-        tmp = pos
-        for r in range(remaining.size - 1, -1, -1):
-            idx = remaining[r]
-            evt[idx] = tmp % outcomes
-            tmp //= outcomes
-        key = canonical_leximin_coset_chain_uint64(evt, outcomes, level_invperms)
-        event_idx = global_event_map.get(key, ZERO_I32)
-        if event_idx == 0:
-            event_idx = next_event_idx
-            next_event_idx = np.int32(next_event_idx + 1)
-            global_event_map[key] = event_idx
-            new_keys.append(key)
-        sparse_matrix_cols[start + pos] = event_idx
-    return next_event_idx
+    row_entry_ptr: np.ndarray,
+) -> np.ndarray:
+    """Sort each row slice in place and count unique columns per row."""
+    nof_rows = row_entry_ptr.size - 1
+    row_nnz = np.empty(nof_rows, dtype=np.int64)
+    for row_num in prange(nof_rows):
+        start = int(row_entry_ptr[row_num])
+        end = int(row_entry_ptr[row_num + 1])
+        if end > start:
+            row_slice = sparse_matrix_cols[start:end]
+            row_slice.sort()
+            unique_cols = 1
+            prev = row_slice[0]
+            for pos in range(start + 1, end):
+                col = sparse_matrix_cols[pos]
+                if col != prev:
+                    unique_cols += 1
+                    prev = col
+        else:
+            unique_cols = 0
+        row_nnz[row_num] = 1 + unique_cols
+    return row_nnz
+
+
+@njit(cache=True, parallel=True, fastmath=True)
+def _fill_full_csr_from_sorted_rows(
+    sparse_matrix_cols: np.ndarray,
+    row_entry_ptr: np.ndarray,
+    nof_marginals: int,
+    indptr: np.ndarray,
+    indices: np.ndarray,
+    data: np.ndarray,
+) -> None:
+    """Fill the full solver CSR matrix, including appended known-value rows."""
+    for row_num in prange(nof_marginals):
+        write_pos = int(indptr[row_num])
+        indices[write_pos] = np.int64(1 + row_num)
+        data[write_pos] = -1.0
+        write_pos += 1
+        start = int(row_entry_ptr[row_num])
+        end = int(row_entry_ptr[row_num + 1])
+        if end > start:
+            current = sparse_matrix_cols[start]
+            multiplicity = 1
+            for pos in range(start + 1, end):
+                col = sparse_matrix_cols[pos]
+                if col == current:
+                    multiplicity += 1
+                else:
+                    indices[write_pos] = current
+                    data[write_pos] = float(multiplicity)
+                    write_pos += 1
+                    current = col
+                    multiplicity = 1
+            indices[write_pos] = current
+            data[write_pos] = float(multiplicity)
+
+    for marginal_idx in prange(nof_marginals):
+        row_num = nof_marginals + marginal_idx
+        write_pos = int(indptr[row_num])
+        indices[write_pos] = np.int64(1 + marginal_idx)
+        data[write_pos] = 1.0
+
+
+@njit(cache=True, fastmath=True)
+def _csr_to_column_payload(
+    indptr: np.ndarray,
+    indices: np.ndarray,
+    data: np.ndarray,
+    nof_cols: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Build MOSEK-style column pointers and row indices from CSR arrays."""
+    counts = np.zeros(nof_cols, dtype=np.int64)
+    for pos in range(indices.size):
+        counts[int(indices[pos])] += 1
+
+    aptrb = np.empty(nof_cols, dtype=np.int64)
+    aptre = np.empty(nof_cols, dtype=np.int64)
+    running = np.int64(0)
+    for col in range(nof_cols):
+        aptrb[col] = running
+        running += counts[col]
+        aptre[col] = running
+
+    asub = np.empty(indices.size, dtype=np.int32)
+    aval = np.empty(data.size, dtype=np.float64)
+    next_pos = aptrb.copy()
+    nof_rows = indptr.size - 1
+    for row_num in range(nof_rows):
+        start = int(indptr[row_num])
+        end = int(indptr[row_num + 1])
+        for pos in range(start, end):
+            col = int(indices[pos])
+            write_pos = int(next_pos[col])
+            asub[write_pos] = np.int32(row_num)
+            aval[write_pos] = data[pos]
+            next_pos[col] = write_pos + 1
+    return aptrb, aptre, asub, aval
+
+def _stable_unique_inverse(keys: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Return first-appearance unique keys and inverse indices preserving row-major order."""
+    if keys.size == 0:
+        return np.empty(0, dtype=np.uint64), np.empty(0, dtype=np.int64)
+    unique_keys, first_idx, inverse = np.unique(
+        keys,
+        return_index=True,
+        return_inverse=True,
+    )
+    order = np.argsort(first_idx, kind="stable")
+    remap = np.empty(order.size, dtype=np.int64)
+    remap[order] = np.arange(order.size, dtype=np.int64)
+    return unique_keys[order], remap[inverse]
+
+
+def _boundkey_array(value, size: int) -> np.ndarray:
+    """Allocate a MOSEK boundkey array with the current binding's accepted dtype."""
+    return np.full(size, value, dtype=np.int32)
+
+
+def _resolve_mosek_optimizer(name: str):
+    """Map a user-facing optimizer choice to the MOSEK optimizer enum."""
+    import mosek
+
+    normalized = str(name).strip().lower()
+    optimizer_map = {
+        "simplex": mosek.optimizertype.free_simplex,
+        "free_simplex": mosek.optimizertype.free_simplex,
+        "primal_simplex": mosek.optimizertype.primal_simplex,
+        "dual_simplex": mosek.optimizertype.dual_simplex,
+        "interior_point": mosek.optimizertype.intpnt,
+        "intpnt": mosek.optimizertype.intpnt,
+    }
+    try:
+        return optimizer_map[normalized]
+    except KeyError as exc:
+        raise ValueError(
+            "Unknown optimizer choice. Expected one of: "
+            "simplex, free_simplex, primal_simplex, dual_simplex, interior_point, intpnt."
+        ) from exc
 
 
 # =========================
@@ -269,52 +408,73 @@ def factorized_marginal_value(
     return val
 
 
-def representatives_of_global_extensions_uint64(
+def _build_row_extension_descriptors(
+    marginals: List[List[List[int]]],
+    *,
     n: int,
     outcomes: int,
-    marginal: List[List[int]],
-    level_invperms: NumbaList,
-    global_event_map,
-    next_event_idx: int,
-    list_of_all_LP_variables: List[int],
-    total: int,
-    sparse_matrix_cols: np.ndarray,
-    start: int,
-) -> int:
-    """
-    Uint64-keyed path using Numba typed dicts.
-    Modifies global_event_map, sparse_matrix_cols, list_of_all_LP_variables.
-    """
-    fixed: Dict[int, int] = {}
-    for (_one, i, j, _zero, a) in marginal:
-        si = _offdiag_slot_index(int(i), int(j), n)
-        if si in fixed and fixed[si] != a:
-            return next_event_idx
-        fixed[si] = a
-    Nslots = n * (n - 1)
-    fixed_idx = np.fromiter(fixed.keys(), dtype=np.int64)
-    fixed_val = np.fromiter(fixed.values(), dtype=np.uint8)
-    mask = np.ones(Nslots, dtype=bool)
-    mask[fixed_idx] = False
-    remaining = np.nonzero(mask)[0]
-    evt = np.zeros(Nslots, dtype=np.uint8)
-    if fixed_idx.size:
-        evt[fixed_idx] = fixed_val
-    new_keys = NumbaList.empty_list(types.uint64)
-    next_event_idx = _fill_cols_uint64(
-        evt,
-        remaining,
-        outcomes,
-        level_invperms,
-        global_event_map,
-        next_event_idx,
-        sparse_matrix_cols,
-        start,
-        total,
-        new_keys,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Flatten per-row fixed/remaining slot metadata for Numba parallel kernels."""
+    nof_rows = len(marginals)
+    nof_slots = n * (n - 1)
+
+    row_entry_ptr = np.empty(nof_rows + 1, dtype=np.int64)
+    row_fixed_ptr = np.empty(nof_rows + 1, dtype=np.int64)
+    row_remaining_ptr = np.empty(nof_rows + 1, dtype=np.int64)
+    row_entry_ptr[0] = 0
+    row_fixed_ptr[0] = 0
+    row_remaining_ptr[0] = 0
+
+    fixed_slots_chunks: List[np.ndarray] = []
+    fixed_vals_chunks: List[np.ndarray] = []
+    remaining_slots_chunks: List[np.ndarray] = []
+
+    for row_num, marginal in enumerate(marginals):
+        fixed_slots = np.empty(len(marginal), dtype=np.int64)
+        fixed_vals = np.empty(len(marginal), dtype=np.uint8)
+        seen_slots: set[int] = set()
+        for idx, (_one, i, j, _zero, a) in enumerate(marginal):
+            slot = _offdiag_slot_index(int(i), int(j), n)
+            if slot in seen_slots:
+                raise ValueError("Invalid marginal: duplicate fixed off-diagonal slot.")
+            seen_slots.add(slot)
+            fixed_slots[idx] = slot
+            fixed_vals[idx] = np.uint8(a)
+        mask = np.ones(nof_slots, dtype=bool)
+        if fixed_slots.size:
+            mask[fixed_slots] = False
+        remaining_slots = np.nonzero(mask)[0].astype(np.int64, copy=False)
+        total = pow(outcomes, int(remaining_slots.size))
+        row_entry_ptr[row_num + 1] = row_entry_ptr[row_num] + np.int64(total)
+        row_fixed_ptr[row_num + 1] = row_fixed_ptr[row_num] + np.int64(fixed_slots.size)
+        row_remaining_ptr[row_num + 1] = row_remaining_ptr[row_num] + np.int64(remaining_slots.size)
+        fixed_slots_chunks.append(fixed_slots)
+        fixed_vals_chunks.append(fixed_vals)
+        remaining_slots_chunks.append(remaining_slots)
+
+    fixed_slots_flat = (
+        np.concatenate(fixed_slots_chunks).astype(np.int64, copy=False)
+        if fixed_slots_chunks
+        else np.empty(0, dtype=np.int64)
     )
-    list_of_all_LP_variables.extend(new_keys)
-    return next_event_idx
+    fixed_vals_flat = (
+        np.concatenate(fixed_vals_chunks).astype(np.uint8, copy=False)
+        if fixed_vals_chunks
+        else np.empty(0, dtype=np.uint8)
+    )
+    remaining_slots_flat = (
+        np.concatenate(remaining_slots_chunks).astype(np.int64, copy=False)
+        if remaining_slots_chunks
+        else np.empty(0, dtype=np.int64)
+    )
+    return (
+        row_entry_ptr,
+        row_fixed_ptr,
+        fixed_slots_flat,
+        fixed_vals_flat,
+        row_remaining_ptr,
+        remaining_slots_flat,
+    )
 
 
 # =========================
@@ -356,10 +516,10 @@ class PrepLP:
         self.prob = ring_problem(self._requested_n, distribution)
         self._cached_variable_names: np.ndarray | None = None
         self._cached_known_vars: coo_array | None = None
-        self._cached_inflation_matrix: coo_array | None = None
+        self._cached_inflation_matrix: csr_array | None = None
         self._cached_global_keys: np.ndarray | None = None
         self._cached_nof_caonical_global_events: int | None = None
-        self._cached_min_dtype: np.dtype | None = None
+        self._cached_solver_column_payload: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None
         self._cache_written = False
         self._initialize_cache()
 
@@ -439,9 +599,14 @@ class PrepLP:
                     "original_symmetry_generators",
                     "discovered_symmetry_generators",
                     "inflation_matrix_shape",
-                    "inflation_matrix_row_indices",
-                    "inflation_matrix_columns_indices",
+                    "inflation_matrix_indptr",
+                    "inflation_matrix_indices",
                     "inflation_matrix_data_entries",
+                    "global_keys",
+                    "solver_aptrb",
+                    "solver_aptre",
+                    "solver_asub",
+                    "solver_aval",
                     "variable_names",
                 }
                 if any(key not in z.files for key in required):
@@ -473,7 +638,7 @@ class PrepLP:
                 if inflation_shape_raw.shape != (2,):
                     raise self._incompatible_cache_error()
                 inflation_shape = tuple(int(x) for x in inflation_shape_raw.tolist())
-                if inflation_shape[0] != self.nof_marginals:
+                if inflation_shape[0] != 2 * self.nof_marginals:
                     raise self._incompatible_cache_error()
                 if inflation_shape[1] != variable_names.size:
                     raise self._incompatible_cache_error()
@@ -481,36 +646,56 @@ class PrepLP:
                 nof_caonical_global_events = inflation_shape[1] - live_known_prefix.size
                 if nof_caonical_global_events < 0:
                     raise self._incompatible_cache_error()
-                global_name_slice = variable_names[live_known_prefix.size :]
-                if global_name_slice.size != nof_caonical_global_events:
+                global_keys = np.asarray(z["global_keys"], dtype=np.uint64)
+                if global_keys.size != nof_caonical_global_events:
                     raise self._incompatible_cache_error()
+                if not np.array_equal(
+                    variable_names[live_known_prefix.size :],
+                    np.asarray([str(key) for key in global_keys.tolist()], dtype=str),
+                ):
+                    raise self._incompatible_cache_error()
+
                 try:
-                    global_keys = np.asarray(global_name_slice, dtype=np.uint64)
+                    indptr = np.asarray(z["inflation_matrix_indptr"], dtype=np.int64)
+                    indices = np.asarray(z["inflation_matrix_indices"], dtype=np.int64)
+                    data = np.asarray(z["inflation_matrix_data_entries"], dtype=np.float64)
+                    solver_aptrb = np.asarray(z["solver_aptrb"], dtype=np.int64)
+                    solver_aptre = np.asarray(z["solver_aptre"], dtype=np.int64)
+                    solver_asub = np.asarray(z["solver_asub"], dtype=np.int32)
+                    solver_aval = np.asarray(z["solver_aval"], dtype=np.float64)
                 except (TypeError, ValueError) as exc:
                     raise self._incompatible_cache_error() from exc
 
-                row_idx = np.asarray(z["inflation_matrix_row_indices"])
-                col_idx = np.asarray(z["inflation_matrix_columns_indices"])
-                data = np.asarray(z["inflation_matrix_data_entries"])
-                self._cached_inflation_matrix = coo_array((data, (row_idx, col_idx)), shape=inflation_shape)
+                self._cached_inflation_matrix = csr_array(
+                    (data, indices, indptr),
+                    shape=inflation_shape,
+                )
                 self._cached_variable_names = variable_names
                 self._cached_global_keys = global_keys
                 self._cached_nof_caonical_global_events = nof_caonical_global_events
-                self._cached_min_dtype = _min_signed_dtype(inflation_shape[1])
+                self._cached_solver_column_payload = (
+                    np.ascontiguousarray(solver_aptrb),
+                    np.ascontiguousarray(solver_aptre),
+                    np.ascontiguousarray(solver_asub),
+                    np.ascontiguousarray(solver_aval),
+                )
         except ValueError as exc:
             if str(exc) == str(self._incompatible_cache_error()):
                 raise
             raise self._incompatible_cache_error() from exc
         except (OSError, TypeError, KeyError) as exc:
             raise self._incompatible_cache_error() from exc
+
     def _save_cache(
         self,
         variable_names: np.ndarray,
-        inflation_matrix: coo_array,
+        inflation_matrix: csr_array,
+        solver_payload: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
     ) -> None:
         if self.cache_path is None or self._cache_written:
             return
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        solver_aptrb, solver_aptre, solver_asub, solver_aval = solver_payload
         with progress_stage(
             f"Saving LP input cache to {self.cache_path}",
             enabled=self.verbose_cache,
@@ -527,9 +712,14 @@ class PrepLP:
                 original_symmetry_generators=np.asarray(self.core_symmetries, dtype=int),
                 discovered_symmetry_generators=np.asarray(self.discovered_symmetries, dtype=int),
                 inflation_matrix_shape=np.asarray(inflation_matrix.shape, dtype=np.int64),
-                inflation_matrix_columns_indices=inflation_matrix.col,
-                inflation_matrix_row_indices=inflation_matrix.row,
-                inflation_matrix_data_entries=inflation_matrix.data,
+                inflation_matrix_indptr=np.asarray(inflation_matrix.indptr, dtype=np.int64),
+                inflation_matrix_indices=np.asarray(inflation_matrix.indices, dtype=np.int64),
+                inflation_matrix_data_entries=np.asarray(inflation_matrix.data, dtype=np.float64),
+                global_keys=np.asarray(self.global_keys, dtype=np.uint64),
+                solver_aptrb=np.asarray(solver_aptrb, dtype=np.int64),
+                solver_aptre=np.asarray(solver_aptre, dtype=np.int64),
+                solver_asub=np.asarray(solver_asub, dtype=np.int32),
+                solver_aval=np.asarray(solver_aval, dtype=np.float64),
                 variable_names=variable_names,
             )
         self._cache_written = True
@@ -896,46 +1086,74 @@ class PrepLP:
         return counts
 
     @cached_property
-    def _canonical_global_lhs_payload(self) -> Tuple[coo_array, int, np.dtype, np.ndarray]:
-        """
-        Tuple `(inflation_matrix, nof_caonical_global_events, min_dtype, global_keys)`
-        for canonical global-event extension constraints.
-        """
-        global_event_map = NumbaDict.empty(key_type=types.uint64, value_type=types.int32)
-        list_of_all_global_keys: List[int] = []
-        next_event_idx = np.int32(1 + self.nof_marginals)
-
-        row_extension_counts = self.row_extension_counts
-        row_starts = np.empty(self.nof_marginals, dtype=np.int64)
-        if self.nof_marginals > 0:
-            row_starts[0] = 0
-        if self.nof_marginals > 1:
-            row_starts[1:] = np.cumsum(row_extension_counts[:-1], dtype=np.int64)
-        total_entries = int(row_extension_counts.sum(dtype=np.int64))
-        sparse_matrix_rows = np.repeat(
-            np.arange(self.nof_marginals, dtype=np.int32),
-            row_extension_counts,
+    def _row_extension_descriptor_payload(
+        self,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Flat per-row metadata for the parallel global-extension kernel."""
+        return _build_row_extension_descriptors(
+            self.marginals,
+            n=self.n,
+            outcomes=self.outcomes,
         )
-        sparse_matrix_cols = np.empty(total_entries, dtype=np.int32)
-        sparse_matrix_data = np.ones(total_entries, dtype=np.int8)
 
-        # Enumerate global extensions and canonicalize each extension to a column key.
-        for row_num, marginal in enumerate(
-            tqdm(self.marginals, desc="Finding global extensions...", disable=not self.show_progress)
+    @cached_property
+    def _canonical_global_lhs_payload(
+        self,
+    ) -> Tuple[
+        csr_array,
+        int,
+        np.ndarray,
+        Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+        np.ndarray,
+    ]:
+        """
+        Tuple `(inflation_matrix, nof_caonical_global_events, global_keys,
+        solver_column_payload, variable_names)` for the full ring LP system.
+        """
+        if (
+            self._cached_inflation_matrix is not None
+            and self._cached_global_keys is not None
+            and self._cached_nof_caonical_global_events is not None
+            and self._cached_solver_column_payload is not None
+            and self._cached_variable_names is not None
         ):
-            start = int(row_starts[row_num])
-            next_event_idx = representatives_of_global_extensions_uint64(
-                n=self.n,
-                outcomes=self.outcomes,
-                marginal=marginal,
-                level_invperms=self.level_invperms,
-                global_event_map=global_event_map,
-                next_event_idx=next_event_idx,
-                list_of_all_LP_variables=list_of_all_global_keys,
-                total=int(row_extension_counts[row_num]),
-                sparse_matrix_cols=sparse_matrix_cols,
-                start=start,
+            return (
+                self._cached_inflation_matrix,
+                self._cached_nof_caonical_global_events,
+                self._cached_global_keys,
+                self._cached_solver_column_payload,
+                self._cached_variable_names,
             )
+
+        (
+            row_entry_ptr,
+            row_fixed_ptr,
+            fixed_slots_flat,
+            fixed_vals_flat,
+            row_remaining_ptr,
+            remaining_slots_flat,
+        ) = self._row_extension_descriptor_payload
+        total_entries = int(row_entry_ptr[-1]) if row_entry_ptr.size else 0
+
+        with progress_stage(
+            "Finding global extensions...",
+            enabled=self.show_progress,
+            end_message=lambda elapsed: (
+                f"Enumerated {total_entries} canonicalized extensions in {elapsed:.2f}s"
+            ),
+        ):
+            all_keys = _fill_global_extension_keys_parallel(
+                row_entry_ptr,
+                row_fixed_ptr,
+                fixed_slots_flat,
+                fixed_vals_flat,
+                row_remaining_ptr,
+                remaining_slots_flat,
+                self.nof_off_diagonal_slots,
+                self.outcomes,
+                self.level_invperms,
+            )
+
         with progress_stage(
             "Finalizing sparse extension matrix...",
             enabled=self.show_progress,
@@ -947,35 +1165,69 @@ class PrepLP:
                 f"in {elapsed:.2f}s"
             ),
         ):
-            if int(next_event_idx) > np.iinfo(np.int32).max:
-                raise ValueError("next_event_idx exceeds int32 range; use wider dtype")
-            nof_caonical_global_events = int(next_event_idx) - (1 + self.nof_marginals)
-            min_dtype = _min_signed_dtype(int(next_event_idx))
-            sparse_matrix_cols = sparse_matrix_cols.astype(min_dtype, copy=False)
+            global_keys, inverse = _stable_unique_inverse(all_keys)
+            nof_caonical_global_events = int(global_keys.size)
+            nof_lp_vars = 1 + self.nof_marginals + nof_caonical_global_events
+            if nof_lp_vars > np.iinfo(np.int32).max:
+                raise ValueError("Ring LP exceeds the current MOSEK Python binding variable limit.")
 
-            known_rows = np.arange(self.nof_marginals, dtype=np.int32)
-            known_cols = np.arange(1, self.nof_marginals + 1, dtype=min_dtype)
-            known_data = -np.ones(self.nof_marginals, dtype=np.int8)
+            sparse_matrix_cols = inverse.astype(np.int64, copy=False)
+            sparse_matrix_cols += np.int64(1 + self.nof_marginals)
 
-            all_rows = np.concatenate([known_rows, sparse_matrix_rows])
-            all_cols = np.concatenate([known_cols, sparse_matrix_cols])
-            all_data = np.concatenate([known_data, sparse_matrix_data])
-            inflation_matrix = coo_array(
-                (all_data, (all_rows, all_cols)),
-                shape=(self.nof_marginals, int(next_event_idx)),
+            top_row_nnz = _sort_rows_and_count_unique(sparse_matrix_cols, row_entry_ptr)
+            row_nnz = np.empty(2 * self.nof_marginals, dtype=np.int64)
+            row_nnz[: self.nof_marginals] = top_row_nnz
+            row_nnz[self.nof_marginals :] = 1
+            indptr = np.empty(2 * self.nof_marginals + 1, dtype=np.int64)
+            indptr[0] = 0
+            if row_nnz.size > 0:
+                indptr[1:] = np.cumsum(row_nnz, dtype=np.int64)
+            indices = np.empty(int(indptr[-1]), dtype=np.int64)
+            data = np.empty(int(indptr[-1]), dtype=np.float64)
+            _fill_full_csr_from_sorted_rows(
+                sparse_matrix_cols,
+                row_entry_ptr,
+                self.nof_marginals,
+                indptr,
+                indices,
+                data,
             )
-            inflation_matrix.sum_duplicates()
-            global_keys = np.asarray(list_of_all_global_keys, dtype=np.uint64)
-            if global_keys.size != nof_caonical_global_events:
-                raise ValueError("global_keys count does not match the number of canonical global events")
-        return inflation_matrix, nof_caonical_global_events, min_dtype, global_keys
+            inflation_matrix = csr_array(
+                (data, indices, indptr),
+                shape=(2 * self.nof_marginals, nof_lp_vars),
+            )
+            solver_payload = _csr_to_column_payload(
+                indptr,
+                indices,
+                data,
+                nof_lp_vars,
+            )
+            solver_payload = tuple(np.ascontiguousarray(arr) for arr in solver_payload)
+            variable_names = np.asarray(
+                ["1", *self.known_labels, *[str(key) for key in global_keys.tolist()]],
+                dtype=str,
+            )
+
+        self._cached_inflation_matrix = inflation_matrix
+        self._cached_global_keys = global_keys
+        self._cached_nof_caonical_global_events = nof_caonical_global_events
+        self._cached_solver_column_payload = solver_payload
+        self._cached_variable_names = variable_names
+        self._save_cache(variable_names, inflation_matrix, solver_payload)
+        return (
+            inflation_matrix,
+            nof_caonical_global_events,
+            global_keys,
+            solver_payload,
+            variable_names,
+        )
 
     @property
     def global_keys(self) -> np.ndarray:
         """Canonical uint64 keys of global-event LP columns."""
         if self._cached_global_keys is not None:
             return self._cached_global_keys
-        return self._canonical_global_lhs_payload[3]
+        return self._canonical_global_lhs_payload[2]
 
     @property
     def nof_caonical_global_events(self) -> int:
@@ -985,36 +1237,45 @@ class PrepLP:
         return self._canonical_global_lhs_payload[1]
 
     @property
-    def min_dtype(self) -> np.dtype:
-        """Smallest signed integer dtype that can represent all LP column indices."""
-        if self._cached_min_dtype is not None:
-            return self._cached_min_dtype
-        return self._canonical_global_lhs_payload[2]
-
-    @property
-    def inflation_matrix(self) -> coo_array:
-        """Final sparse equality matrix combining known-value and extension constraints."""
+    def inflation_matrix(self) -> csr_array:
+        """Final sparse equality matrix, including known-value rows."""
         if self._cached_inflation_matrix is not None:
             return self._cached_inflation_matrix
-        inflation_matrix = self._canonical_global_lhs_payload[0]
-        self._save_cache(self.variable_names, inflation_matrix)
-        return inflation_matrix
+        return self._canonical_global_lhs_payload[0]
+
+    @property
+    def solver_column_payload(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Cached column-major equality payload for direct MOSEK task assembly."""
+        if self._cached_solver_column_payload is not None:
+            return self._cached_solver_column_payload
+        return self._canonical_global_lhs_payload[3]
 
     @property
     def nof_lp_vars(self):
         """Number of LP variables in the final LP."""
-        return self.inflation_matrix.shape[1]
+        if self._cached_variable_names is not None:
+            return int(self._cached_variable_names.size)
+        if self._cached_nof_caonical_global_events is not None:
+            return 1 + self.nof_marginals + int(self._cached_nof_caonical_global_events)
+        return 1 + self.nof_marginals + self.nof_caonical_global_events
+
+    @property
+    def nof_lp_constraints(self) -> int:
+        """Number of LP equality constraints in the full cached system."""
+        if self._cached_inflation_matrix is not None:
+            return int(self._cached_inflation_matrix.shape[0])
+        return 2 * self.nof_marginals
 
     @property
     def blank_objective(self):
         """Objective function of the final LP."""
-        return coo_array(([], ([], [])), shape=(1, self.nof_lp_vars), dtype=self.min_dtype)
+        return coo_array(([], ([], [])), shape=(1, self.nof_lp_vars), dtype=np.float64)
 
     @cached_property
     def known_vars_symbolic(self) -> coo_array:
         """Sparse symbolic known-variables row vector aligned with `inflation_matrix` columns."""
         total_cols = self.inflation_matrix.shape[1]
-        known_positions = np.arange(1, self.nof_marginals + 1, dtype=self.min_dtype)
+        known_positions = np.arange(1, self.nof_marginals + 1, dtype=np.int64)
         known_rows0 = np.zeros(self.nof_marginals, dtype=np.int32)
         return coo_array(
             (self.known_values_symbolic, (known_rows0, known_positions)),
@@ -1028,11 +1289,12 @@ class PrepLP:
         if self._cached_known_vars is not None:
             return self._cached_known_vars
         total_cols = self.inflation_matrix.shape[1]
-        known_positions = np.arange(1, self.nof_marginals + 1, dtype=self.min_dtype)
+        known_positions = np.arange(1, self.nof_marginals + 1, dtype=np.int64)
         known_rows0 = np.zeros(self.nof_marginals, dtype=np.int32)
         known_vars = coo_array(
-            (self.known_values, (known_rows0, known_positions)),
+            (self.known_values.astype(np.float64, copy=False), (known_rows0, known_positions)),
             shape=(1, total_cols),
+            dtype=np.float64,
         )
         self._cached_known_vars = known_vars
         return known_vars
@@ -1042,12 +1304,178 @@ class PrepLP:
         """Variable names aligned with matrix columns: const, known marginals, global keys."""
         if self._cached_variable_names is not None:
             return self._cached_variable_names
-        variable_names = np.asarray(
-            ["1", *self.known_labels, *[str(k) for k in self.global_keys.tolist()]],
-            dtype=str,
-        )
-        self._cached_variable_names = variable_names
-        return variable_names
+        return self._canonical_global_lhs_payload[4]
+
+    def solve(
+        self,
+        *,
+        optimizer: str = "free_simplex",
+        verbose: int = 0,
+    ) -> Dict:
+        """Solve the ring LP directly from the prepared solver-ready payload."""
+        import mosek
+        from inflation.lp.lp_utils import streamprinter
+
+        if verbose > 1:
+            t0 = perf_counter()
+            t_total = perf_counter()
+            print("Starting pre-processing for the LP solver...")
+
+        aptrb, aptre, asub, aval = self.solver_column_payload
+        nof_lp_vars = self.nof_lp_vars
+        nof_constraints = self.nof_lp_constraints
+        nof_marginals = self.nof_marginals
+        known_values = self.known_values.astype(np.float64, copy=False)
+
+        if verbose > 1:
+            print("Proceeding with ring LP initialization...")
+
+        numcon = nof_constraints
+        numvar = nof_lp_vars
+        if numcon > np.iinfo(np.int32).max or numvar > np.iinfo(np.int32).max:
+            raise ValueError("Ring LP exceeds the current MOSEK Python binding dimension limit.")
+
+        optimizer_choice = _resolve_mosek_optimizer(optimizer)
+        objective_vector = np.zeros(numvar, dtype=np.float64)
+        bkc = _boundkey_array(mosek.boundkey.fx, numcon)
+        rhs = np.zeros(numcon, dtype=np.float64)
+        rhs[nof_marginals:] = known_values
+        blc = rhs
+        buc = rhs.copy()
+        bkx = _boundkey_array(mosek.boundkey.lo, numvar)
+        blx = np.zeros(numvar, dtype=np.float64)
+        bux = np.zeros(numvar, dtype=np.float64)
+
+        aptrb = np.ascontiguousarray(aptrb, dtype=np.int64)
+        aptre = np.ascontiguousarray(aptre, dtype=np.int64)
+        asub = np.ascontiguousarray(asub, dtype=np.int32)
+        aval = np.ascontiguousarray(aval, dtype=np.float64)
+        objective_vector = np.ascontiguousarray(objective_vector, dtype=np.float64)
+        bkc = np.ascontiguousarray(bkc, dtype=np.int32)
+        blc = np.ascontiguousarray(blc, dtype=np.float64)
+        buc = np.ascontiguousarray(buc, dtype=np.float64)
+        bkx = np.ascontiguousarray(bkx, dtype=np.int32)
+        blx = np.ascontiguousarray(blx, dtype=np.float64)
+        bux = np.ascontiguousarray(bux, dtype=np.float64)
+
+        with mosek.Env() as env:
+            with mosek.Task(env) as task:
+                task.putintparam(mosek.iparam.sim_reformulation, mosek.simreform.aggressive)
+                task.putintparam(mosek.iparam.sim_switch_optimizer, mosek.onoffkey.on)
+                task.putintparam(mosek.iparam.optimizer, optimizer_choice)
+                task.putintparam(mosek.iparam.sim_solve_form, mosek.solveform.primal)
+                if verbose > 0:
+                    task.set_Stream(mosek.streamtype.log, streamprinter)
+                    task.putintparam(mosek.iparam.log_include_summary, mosek.onoffkey.on)
+                    task.putintparam(mosek.iparam.log_storage, 1)
+                if verbose < 2:
+                    task.putintparam(mosek.iparam.log_sim, 0)
+                    task.putintparam(mosek.iparam.log_intpnt, 0)
+
+                task.putobjsense(mosek.objsense.maximize)
+                if verbose > 0:
+                    print(f"Size of constraint matrix: ({numcon}, {numvar})")
+
+                with progress_stage(
+                    "Starting task.inputdata in Mosek...",
+                    enabled=verbose > 1,
+                    end_message=lambda elapsed: f"Mosek input data loaded in {elapsed:.2f}s",
+                ):
+                    task.inputdata(
+                        numcon,
+                        numvar,
+                        objective_vector,
+                        0.0,
+                        aptrb,
+                        aptre,
+                        asub,
+                        aval,
+                        bkc,
+                        blc,
+                        buc,
+                        bkx,
+                        blx,
+                        bux,
+                    )
+
+                if verbose > 1:
+                    print("Pre-processing took", format(perf_counter() - t0, ".4f"), "seconds.\n")
+                    t0 = perf_counter()
+                if verbose > 2:
+                    with progress_stage(
+                        "Writing problem to debug_lp.ptf...",
+                        enabled=True,
+                        end_message=lambda elapsed: f"Wrote debug_lp.ptf in {elapsed:.2f}s",
+                    ):
+                        task.writedata("debug_lp.ptf")
+
+                if verbose > 0:
+                    print("\nSolving the problem...\n")
+                trmcode = task.optimize()
+                if verbose > 1:
+                    print("Solving took", format(perf_counter() - t0, ".4f"), "seconds.")
+
+                basic = mosek.soltype.bas
+                (
+                    problemsta,
+                    solutionsta,
+                    skc,
+                    skx,
+                    skn,
+                    xc,
+                    xx,
+                    yy,
+                    slc,
+                    suc,
+                    slx,
+                    sux,
+                    snx,
+                ) = task.getsolution(basic)
+
+                xx = np.asarray(xx, dtype=object)
+                yy = np.asarray(yy, dtype=object)
+                primal = task.getprimalobj(basic)
+                dual = task.getdualobj(basic)
+
+                status_str = solutionsta.__repr__()
+                success = solutionsta == mosek.solsta.optimal
+                term_tuple = mosek.Env.getcodedesc(trmcode)
+                if solutionsta == mosek.solsta.unknown and verbose > 0:
+                    print("The solution status is unknown.")
+                    print(f"   Termination code: {term_tuple}")
+
+                known_duals = yy[nof_marginals:]
+                cert_data = np.zeros(numvar, dtype=np.float64)
+                for idx in range(nof_marginals):
+                    cert_data[1 + idx] = float(known_duals[idx])
+                cert_col = np.nonzero(np.abs(cert_data) > 0)[0].astype(np.int64, copy=False)
+                cert_row = np.zeros(cert_col.size, dtype=np.int32)
+                cert_vals = cert_data[cert_col]
+                sparse_certificate = coo_array(
+                    (cert_vals, (cert_row, cert_col)),
+                    shape=(1, numvar),
+                )
+
+                variable_names = self.variable_names.astype(object, copy=False)
+                x_values = dict(zip(variable_names.tolist(), xx.tolist()))
+                certificate = dict(zip(variable_names.tolist(), cert_data.tolist()))
+                for var in list(certificate):
+                    if np.isclose(certificate[var], 0.0):
+                        del certificate[var]
+
+                if verbose > 1:
+                    print("\nTotal execution time:", format(perf_counter() - t_total, ".4f"), "seconds.")
+
+                return {
+                    "primal_value": primal,
+                    "dual_value": dual,
+                    "status": status_str,
+                    "success": bool(success),
+                    "dual_certificate": certificate,
+                    "sparse_certificate": sparse_certificate,
+                    "x": x_values,
+                    "term_code": term_tuple,
+                }
 
 
 # =========================
@@ -1055,7 +1483,7 @@ class PrepLP:
 # =========================
 if __name__ == "__main__":
     from inflation.distributions import EJMDistribution, NSIPRDistribution, RGBDistribution
-    from inflation.lp.lp_utils import save_lp_solution, solveLP_sparse
+    from inflation.lp.lp_utils import save_lp_solution
 
     n = 4
 
@@ -1083,22 +1511,15 @@ if __name__ == "__main__":
 
     prep_nsi = demo_preps["NSI-PR"]
     print("PrepLP initialized for NSI-PR demo; materializing LP inputs before Mosek.")
-    variable_names = prep_nsi.variable_names
+    _ = prep_nsi.variable_names
     known_vars = prep_nsi.known_vars
-    inflation_matrix = prep_nsi.inflation_matrix
     print(
         "LP inputs ready for NSI-PR demo: "
-        f"rows={inflation_matrix.shape[0]}, cols={inflation_matrix.shape[1]}. "
+        f"rows={prep_nsi.nof_lp_constraints}, cols={prep_nsi.nof_lp_vars}. "
         "Starting Mosek setup."
     )
 
-    nof_all_LP_vars = inflation_matrix.shape[1]
-    solution = solveLP_sparse(
-        objective=coo_array(([], ([], [])), shape=(1, nof_all_LP_vars)),
-        known_vars=known_vars,
-        equalities=inflation_matrix,
-        default_non_negative=True,
-        variables=variable_names,
+    solution = prep_nsi.solve(
         verbose=2,
     )
 

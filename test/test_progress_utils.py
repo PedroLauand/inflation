@@ -36,10 +36,10 @@ class _FakeMatrix:
 class _FakePrep:
     def __init__(self, *args, **kwargs):
         self.output_path = None
-        self.blank_objective = "blank-objective"
         self._variable_names = ["1", "known"]
         self._known_vars = "known-vars"
         self._inflation_matrix = _FakeMatrix((7, 11))
+        self.solve_calls = []
 
     @property
     def variable_names(self):
@@ -55,6 +55,20 @@ class _FakePrep:
     def inflation_matrix(self):
         print("Finalizing sparse extension matrix...")
         return self._inflation_matrix
+
+    @property
+    def nof_lp_constraints(self):
+        return self._inflation_matrix.shape[0]
+
+    @property
+    def nof_lp_vars(self):
+        return self._inflation_matrix.shape[1]
+
+    def solve(self, **kwargs):
+        self.solve_calls.append(kwargs)
+        print("Starting pre-processing for the LP solver...")
+        print("Optimizer started.")
+        return {"status": "optimal"}
 
 
 class TestProgressUtils(unittest.TestCase):
@@ -171,18 +185,15 @@ class TestProgressUtils(unittest.TestCase):
 
     def test_ejm_entrypoint_materializes_inputs_before_solver_setup(self):
         stdout_stream = _NonTtyStringIO()
-        solver_calls = []
+        fake_prep = _FakePrep()
 
-        def fake_solve(**kwargs):
-            solver_calls.append(kwargs)
-            print("Starting pre-processing for the LP solver...")
-            print("Optimizer started.")
-            return {"status": "optimal"}
+        def fake_prep_factory(*args, **kwargs):
+            return fake_prep
 
-        with redirect_stdout(stdout_stream), mock.patch.object(ejm_numba_test, "PrepLP", _FakePrep), mock.patch.object(
+        with redirect_stdout(stdout_stream), mock.patch.object(
             ejm_numba_test,
-            "solveLP_sparse",
-            side_effect=fake_solve,
+            "PrepLP",
+            side_effect=fake_prep_factory,
         ):
             ejm_numba_test.main(n=3)
 
@@ -196,10 +207,8 @@ class TestProgressUtils(unittest.TestCase):
         ]
         positions = [output.index(marker) for marker in expected_markers]
         self.assertEqual(positions, sorted(positions))
-        self.assertEqual(solver_calls[0]["verbose"], 2)
-        self.assertEqual(solver_calls[0]["variables"], ["1", "known"])
-        self.assertEqual(solver_calls[0]["known_vars"], "known-vars")
-        self.assertIsInstance(solver_calls[0]["equalities"], _FakeMatrix)
+        self.assertEqual(fake_prep.solve_calls[0]["verbose"], 2)
+        self.assertEqual(fake_prep.solve_calls[0]["optimizer"], "interior_point")
 
 
 if __name__ == "__main__":
