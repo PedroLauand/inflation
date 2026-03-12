@@ -23,7 +23,7 @@ from inflation.lp.lp_utils import save_lp_solution, solveLP_sparse
 
 
 if __name__ == "__main__":
-    for n in [4,5,6]:
+    for n in [6,7,8]:
         print(f"\n\n New problem: exploring NSI with inflation level {n}.")
         distribution = NSIPRDistribution()
         prep = PrepLP(

@@ -143,11 +143,9 @@ dmypy.json
 
 # Generated cache artifacts (can still be added manually with `git add -f`)
 inflation/applications/cache/
+inflation/applications/outputs/
 **/cache/*.npz
 *cache*.npz
 
 #Visual Studio IDE
 .vs/
-arena.py
-arena.ipynb
-inflation/applications/outputs/NSI-PR_n=4_lp_solution_output.npz
