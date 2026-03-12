@@ -23,7 +23,7 @@ from numba import njit, types
 from numba.typed import Dict as NumbaDict
 from numba.typed import List as NumbaList
 from scipy.sparse import coo_array
-from tqdm.auto import tqdm
+from inflation.progress_utils import make_tqdm as tqdm
 
 # Ensure repo root is on sys.path so "import inflation" works when running this file directly.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -725,7 +725,7 @@ class PrepLP:
             scenario=self.prob,
             initial_generators=self.core_symmetries,
             candidate_generators=self.candidate_symmetries,
-            verbose=self.verbose_symmetry_discovery,
+            verbose=False,
             return_group=True,
             progress_desc="Discovering ring stabilizing symmetries",
         )
