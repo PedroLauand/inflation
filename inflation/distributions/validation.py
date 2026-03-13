@@ -192,39 +192,43 @@ def validate_consistency_upto(dist: RingDistributionProtocol, n: int) -> Validat
     for length in range(1, max_n - 1):
         for event in _iter_events(alphabet, length):
             lhs = sp.simplify(dist.prob_event_line(event))
-            line_extensions = [sp.simplify(dist.prob_event_line(event + (a,))) for a in range(alphabet)]
-            for outcome, extension_prob in enumerate(line_extensions):
+            extension_checks = (
+                ("right", [((event + (a,)), sp.simplify(dist.prob_event_line(event + (a,)))) for a in range(alphabet)]),
+                ("left", [(((a,) + event), sp.simplify(dist.prob_event_line((a,) + event))) for a in range(alphabet)]),
+            )
+            for direction, line_extensions in extension_checks:
+                for extended_event, extension_prob in line_extensions:
+                    checks_run += 1
+                    is_negative, simplified_prob = _expr_is_negative(extension_prob)
+                    if is_negative:
+                        failures.append(
+                            _make_failure(
+                                validator=validator,
+                                family=f"{family}:line-extension-{direction}-nonnegativity",
+                                length=length + 1,
+                                event=extended_event,
+                                split_index=None,
+                                lhs=simplified_prob,
+                                rhs=sp.Integer(0),
+                                message=f"single-site {direction} line extension has negative probability",
+                            )
+                        )
+                rhs_line = sp.simplify(sum(extension_prob for _extended_event, extension_prob in line_extensions))
                 checks_run += 1
-                is_negative, simplified_prob = _expr_is_negative(extension_prob)
-                if is_negative:
+                ok, _diff = _expr_equal(lhs, rhs_line)
+                if not ok:
                     failures.append(
                         _make_failure(
                             validator=validator,
-                            family=f"{family}:line-extension-nonnegativity",
-                            length=length + 1,
-                            event=event + (outcome,),
+                            family=f"{family}:line-extension-{direction}",
+                            length=length,
+                            event=event,
                             split_index=None,
-                            lhs=simplified_prob,
-                            rhs=sp.Integer(0),
-                            message="single-site line extension has negative probability",
+                            lhs=lhs,
+                            rhs=rhs_line,
+                            message=f"line probability does not equal sum over single-site {direction} line extensions",
                         )
                     )
-            rhs_line = sp.simplify(sum(line_extensions))
-            checks_run += 1
-            ok, _diff = _expr_equal(lhs, rhs_line)
-            if not ok:
-                failures.append(
-                    _make_failure(
-                        validator=validator,
-                        family=f"{family}:line-extension",
-                        length=length,
-                        event=event,
-                        split_index=None,
-                        lhs=lhs,
-                        rhs=rhs_line,
-                        message="line probability does not equal sum over single-site line extensions",
-                    )
-                )
 
     return ValidationReport(
         validator=validator,

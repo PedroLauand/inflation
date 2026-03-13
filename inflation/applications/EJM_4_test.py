@@ -34,21 +34,31 @@ def main(*, n: int = 4) -> None:
     print(
         f"LP inputs ready for n={n}: "
         f"rows={prep.nof_lp_constraints}, cols={prep.nof_lp_vars}. "
-        "Starting Mosek setup."
+        "Starting relaxed incompatibility solve."
     )
 
     solution = prep.solve(
         optimizer="primal_simplex",
         verbose=2,
     )
-    print(f"Solution status for n={n}: {solution['status']}")
+    print(f"Relaxed LP status for EJM n={n}: {solution['status']}")
     print(
-        f"Feasible within tolerance for n={n}: {solution['success']}. "
+        f"Feasible within tolerance for EJM n={n}: {solution['success']}. "
         f"Incompatible fraction: {solution['incompatible_fraction']:.12g}"
     )
+    print(
+        f"Known mass: {solution['known_mass']:.12g}. "
+        f"Optimized compatible mass: {solution['optimized_mass']:.12g}"
+    )
+    if solution["success"]:
+        print("EJM is feasible within tolerance in the current ring LP.")
+    else:
+        print("EJM is detected as incompatible by the relaxed LP.")
+        print("Dual certificate from the relaxed LP:")
+        prep.print_certificate(solution)
     if prep.output_path is not None:
         prep.save_solution(solution)
-        print(f"Saved LP solution archive to {prep.output_path}")
+        print(f"Saved relaxed LP solution archive to {prep.output_path}")
 
 
 if __name__ == "__main__":
