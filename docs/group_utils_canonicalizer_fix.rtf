@@ -1,0 +1,120 @@
+{\rtf1\ansi\deff0
+{\fonttbl{\f0 Courier New;}}
+\fs22
+\b Group Utils Canonicalizer Fix\par
+\b0
+\par
+This note explains what was wrong with the previous canonicalization logic in \f0 inflation/applications/Group_utils.py\f0  and why the new implementation fixes the underlying problem.\par
+\par
+\b 1. Observable failure\par
+\b0
+The bug showed up most clearly in the ring LP branch when row compression under automatically discovered symmetries was enabled.\par
+\par
+For the filtered GHZ n=4 example that kept only disjoint unions of 2-cycles and 3-cycles:\par
+- the uncompressed LP was incompatible,\par
+- but the compressed LP could become spuriously compatible.\par
+\par
+That is a correctness failure, not a numerical tolerance issue. It means the compression step was identifying rows that were not actually equivalent in the quotient LP.\par
+\par
+\b 2. What was wrong with the old canonicalizer\par
+\b0
+The old code tried to canonicalize supports and events by updating a representative along a Schreier-Sims style chain, using precomputed inverse-transversal data. The intended goal was sound, but the implementation had two fundamental problems.\par
+\par
+\b 2.1 The chain update/composition logic was wrong\par
+\b0
+The old fast path did not reproduce the action of the full symmetry group on the ambient coordinates. In practice that meant:\par
+- canonicalizing an already stored canonical support key could change it again,\par
+- canonicalizing an event decoded from a stored global key could change it again,\par
+- different passes through the same canonicalizer could produce different answers before stabilizing.\par
+\par
+So the fast canonicalizer was not idempotent, which is already enough to break any orbit-based quotient construction.\par
+\par
+\b 2.2 The row compression rule used the wrong equivalence test\par
+\b0
+The old row compression payload grouped rows by re-canonicalizing each base support directly under the discovered group. That is not the same thing as computing the induced action of the discovered subgroup on the already core-canonical base row set.\par
+\par
+As a result, rows could be put in the same compressed orbit even though, after quotienting columns, their actual row signatures still differed. Zero-probability rows were especially important here, because merging them incorrectly weakens the support constraints and can turn an incompatible LP into a compatible one.\par
+\par
+\b 3. Concrete symptoms seen during debugging\par
+\b0
+The broken implementation had all of the following pathologies:\par
+- stored base support keys were not fixed points of the support canonicalizer,\par
+- stored global event keys were not fixed points of the event canonicalizer,\par
+- members of a claimed compressed row orbit could have different exact row signatures after column canonicalization,\par
+- compressed and uncompressed formulations could disagree on incompatibility for the same marginal family.\par
+\par
+Those are structural errors. No tolerance change can fix them.\par
+\par
+\b 4. What the new code does instead\par
+\b0
+The new implementation is exact. Instead of trying to update along a faulty chain, it explicitly represents the action of every group element that is relevant to the ring problem.\par
+\par
+\b 4.1 Exact support canonicalization\par
+\b0
+For supports, the new code enumerates the exact forward ambient permutation for each group element and applies all of them to the support. The canonical representative is then the lexicographically minimal sorted support tuple over the full group.\par
+\par
+This immediately restores:\par
+- full-group correctness,\par
+- determinism,\par
+- idempotence.\par
+\par
+\b 4.2 Exact event canonicalization in compact form\par
+\b0
+For events, the new code does not expand back to a full one-hot vector for every comparison. Instead, for each group element it precomputes:\par
+- which input slot feeds each output slot,\par
+- how outcomes are permuted within that slot.\par
+\par
+Then canonicalization is done directly on the compact event digits by evaluating the full group action exactly and selecting the lexicographically minimal transformed event.\par
+\par
+This fixes the old global-key drift while keeping the event canonicalizer efficient enough for the ring branch.\par
+\par
+\b 4.3 Correct row compression by induced action\par
+\b0
+The row compression fix is just as important as the canonicalizer fix.\par
+\par
+Rows are no longer grouped by ad hoc re-canonicalization under the discovered group. Instead, the new code computes the actual induced action on the base row set:\par
+- take a base support key,\par
+- apply a discovered symmetry permutation in ambient coordinates,\par
+- recanonicalize the result under the core group,\par
+- map that canonical support back to a base-row index.\par
+\par
+The discovered row orbit is the closure of that induced action. That is the mathematically correct quotient on the existing base representatives.\par
+\par
+\b 5. Why the slot/outcome factorization is valid here\par
+\b0
+The compact event canonicalizer assumes that every relevant symmetry acts as:\par
+- a permutation of off-diagonal slots,\par
+- together with an outcome relabeling inside each slot.\par
+\par
+For the ring branch, that is not an unsafe guess. It follows from the way the ring problem is built from InflationProblem and from the kinds of symmetries that are allowed there: copy relabelings, party relabelings, setting relabelings, and outcome relabelings. Still, the code does not merely assume it.\par
+\par
+The new \f0 prepare_group_chain(...)\f0  checks every group element and raises if any permutation fails to preserve outcome blocks by slot or fails to induce a true per-slot outcome permutation. So the compact event path is both justified and verified per instance.\par
+\par
+\b 6. Fail-fast validation that was added\par
+\b0
+The fix also adds explicit validation checks so that future regressions stop the build instead of silently weakening the LP.\par
+\par
+The code now checks that:\par
+- every stored base support key is already canonical under the core group,\par
+- every stored global key is canonical under the discovered-group event canonicalizer,\par
+- compressed row orbits are value-consistent,\par
+- for small enough cases, orbit members have identical exact row signatures after column canonicalization.\par
+\par
+If any of those checks fail, the code raises immediately.\par
+\par
+\b 7. Why this fixes the GHZ failure\par
+\b0
+In the GHZ filtered case, the old compression path merged rows that should have remained distinct. That removed critical zero-probability support information and changed the feasible set.\par
+\par
+With the new exact canonicalizers and induced row-action orbits:\par
+- base keys stay canonical,\par
+- global keys stay canonical,\par
+- rows are only compressed when their quotient signatures really match,\par
+- compressed and uncompressed LPs agree again on incompatibility.\par
+\par
+\b 8. Bottom line\par
+\b0
+The old problem was not that the code used symmetry compression. The problem was that it used an incorrect canonicalization/group-action implementation, so the quotient was not the true quotient of the LP.\par
+\par
+The new code fixes that by replacing the faulty fast-chain logic with exact group actions, exact compact event canonicalization, exact induced row orbits, and explicit validation checks. In other words, it fixes the mathematics of the quotient, not just the symptom that first exposed it.\par
+}
