@@ -11,8 +11,10 @@
 from __future__ import annotations
 
 from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from functools import cached_property
 from itertools import combinations, permutations, product
+import multiprocessing as mp
 import os
 from pathlib import Path
 import tempfile
@@ -341,28 +343,26 @@ def _estimate_per_worker_raw_buffer_bytes(max_row_entries: int) -> int:
     """Bytes required for one worker's raw uint64 key buffer for the worst structural row."""
     return 8 * max(0, int(max_row_entries))
 
-def _estimate_wave_peak_bytes(
-    row_extension_counts_slice: np.ndarray,
-    *,
-    wave_rows_count: int,
-    wave_unique_nnz_total: int,
+def _estimate_per_worker_peak_bytes(max_row_entries: int) -> int:
+    """One-pass worker peak bytes: raw keys plus exact unique keys and counts."""
+    return 24 * max(0, int(max_row_entries))
+
+
+def _estimate_active_worker_peak_bytes(
+    row_extension_counts: np.ndarray,
+    worker_count: int,
 ) -> int:
-    """Exact wave-local peak bytes for the current two-pass row-at-a-time builder."""
-    raw_buffers_bytes = 8 * int(np.asarray(row_extension_counts_slice, dtype=np.int64).sum())
-    wave_rows_bytes = 8 * int(wave_rows_count)
-    row_unique_nnz_bytes = 8 * int(wave_rows_count)
-    pass1_peak = raw_buffers_bytes + wave_rows_bytes + row_unique_nnz_bytes
-    wave_output_ptr_bytes = 8 * (int(wave_rows_count) + 1)
-    wave_unique_keys_bytes = 8 * int(wave_unique_nnz_total)
-    wave_unique_counts_bytes = 8 * int(wave_unique_nnz_total)
-    pass2_peak = (
-        raw_buffers_bytes
-        + wave_rows_bytes
-        + wave_output_ptr_bytes
-        + wave_unique_keys_bytes
-        + wave_unique_counts_bytes
-    )
-    return max(pass1_peak, pass2_peak)
+    """Upper bound on concurrent one-pass worker memory from the largest active rows."""
+    counts = np.asarray(row_extension_counts, dtype=np.int64)
+    if counts.size == 0 or worker_count <= 0:
+        return 0
+    active_workers = min(int(worker_count), int(counts.size))
+    if active_workers == counts.size:
+        selected = counts
+    else:
+        partition_idx = counts.size - active_workers
+        selected = np.partition(counts, partition_idx)[partition_idx:]
+    return 24 * int(selected.sum())
 
 
 def _slot_index_dtype(nof_slots: int):
@@ -458,10 +458,9 @@ def _write_rle_sorted_uint64_to_flat(
     return np.int64(write_pos + 1)
 
 
-@njit(cache=True, parallel=True, fastmath=True)
-def _count_unique_global_extension_keys_per_row(
-    row_unique_nnz: np.ndarray,
-    wave_rows: np.ndarray,
+@njit(cache=True, nogil=True, fastmath=True)
+def _compute_unique_global_extension_keys_for_row(
+    row_num: int,
     row_extension_counts: np.ndarray,
     row_fixed_ptr: np.ndarray,
     fixed_slots_flat: np.ndarray,
@@ -472,69 +471,30 @@ def _count_unique_global_extension_keys_per_row(
     outcomes: int,
     slot_sources: np.ndarray,
     outcome_maps: np.ndarray,
-) -> None:
-    """Pass 1: count exact unique canonical keys for each row in a wave."""
-    for local_row in prange(wave_rows.size):
-        row_num = int(wave_rows[local_row])
-        total = int(row_extension_counts[row_num])
-        raw_keys = np.empty(total, dtype=np.uint64)
-        _fill_sorted_global_extension_keys_for_row(
-            raw_keys,
-            row_num,
-            row_fixed_ptr,
-            fixed_slots_flat,
-            fixed_vals_flat,
-            row_remaining_ptr,
-            remaining_slots_flat,
-            nof_off_diagonal_slots,
-            outcomes,
-            slot_sources,
-            outcome_maps,
-        )
-        row_unique_nnz[local_row] = _count_unique_sorted_uint64(raw_keys)
-
-
-@njit(cache=True, parallel=True, fastmath=True)
-def _fill_unique_global_extension_keys_per_row(
-    wave_unique_keys_flat: np.ndarray,
-    wave_unique_counts_flat: np.ndarray,
-    wave_output_ptr: np.ndarray,
-    wave_rows: np.ndarray,
-    row_extension_counts: np.ndarray,
-    row_fixed_ptr: np.ndarray,
-    fixed_slots_flat: np.ndarray,
-    fixed_vals_flat: np.ndarray,
-    row_remaining_ptr: np.ndarray,
-    remaining_slots_flat: np.ndarray,
-    nof_off_diagonal_slots: int,
-    outcomes: int,
-    slot_sources: np.ndarray,
-    outcome_maps: np.ndarray,
-) -> None:
-    """Pass 2: materialize exact sorted `(key, count)` row streams for a wave."""
-    for local_row in prange(wave_rows.size):
-        row_num = int(wave_rows[local_row])
-        total = int(row_extension_counts[row_num])
-        raw_keys = np.empty(total, dtype=np.uint64)
-        _fill_sorted_global_extension_keys_for_row(
-            raw_keys,
-            row_num,
-            row_fixed_ptr,
-            fixed_slots_flat,
-            fixed_vals_flat,
-            row_remaining_ptr,
-            remaining_slots_flat,
-            nof_off_diagonal_slots,
-            outcomes,
-            slot_sources,
-            outcome_maps,
-        )
-        _write_rle_sorted_uint64_to_flat(
-            raw_keys,
-            wave_unique_keys_flat,
-            wave_unique_counts_flat,
-            int(wave_output_ptr[local_row]),
-        )
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Enumerate, sort, and RLE one row into exact-sized unique-key/count arrays."""
+    total = int(row_extension_counts[row_num])
+    if total == 0:
+        return np.empty(0, dtype=np.uint64), np.empty(0, dtype=np.uint64)
+    raw_keys = np.empty(total, dtype=np.uint64)
+    _fill_sorted_global_extension_keys_for_row(
+        raw_keys,
+        row_num,
+        row_fixed_ptr,
+        fixed_slots_flat,
+        fixed_vals_flat,
+        row_remaining_ptr,
+        remaining_slots_flat,
+        nof_off_diagonal_slots,
+        outcomes,
+        slot_sources,
+        outcome_maps,
+    )
+    unique_count = int(_count_unique_sorted_uint64(raw_keys))
+    unique_keys = np.empty(unique_count, dtype=np.uint64)
+    unique_counts = np.empty(unique_count, dtype=np.uint64)
+    _write_rle_sorted_uint64_to_flat(raw_keys, unique_keys, unique_counts, 0)
+    return unique_keys, unique_counts
 
 
 @njit(cache=True)
@@ -955,6 +915,53 @@ def _read_row_counts_archive(path: Path) -> Tuple[np.ndarray, np.ndarray]:
         )
 
 
+_ROW_ARCHIVE_WORKER_STATE: dict | None = None
+
+
+def _init_row_archive_worker(state: dict) -> None:
+    """Install shared read-only row-build state in each process worker."""
+    global _ROW_ARCHIVE_WORKER_STATE
+    _ROW_ARCHIVE_WORKER_STATE = state
+    try:
+        set_num_threads(1)
+    except Exception:
+        pass
+
+
+def _build_row_archive_worker(row_num: int) -> Tuple[int, str, int, int]:
+    """Build one row archive in a process worker and return lightweight metadata."""
+    state = _ROW_ARCHIVE_WORKER_STATE
+    if state is None:
+        raise RuntimeError("Row-archive worker state was not initialized.")
+    row_idx = int(row_num)
+    unique_keys, unique_counts = _compute_unique_global_extension_keys_for_row(
+        row_idx,
+        state["row_extension_counts"],
+        state["row_fixed_ptr"],
+        state["fixed_slots_flat"],
+        state["fixed_vals_flat"],
+        state["row_remaining_ptr"],
+        state["remaining_slots_flat"],
+        int(state["nof_off_diagonal_slots"]),
+        int(state["outcomes"]),
+        state["slot_sources"],
+        state["outcome_maps"],
+    )
+    row_path = Path(state["scratch_dir"]) / f"row_{row_idx:06d}.npz"
+    _write_row_counts_archive(row_path, unique_keys, unique_counts)
+    return row_idx, str(row_path), int(state["row_extension_counts"][row_idx]), int(unique_keys.size)
+
+
+def _row_archive_pool_context():
+    """Pick the process start method for external row parallelism."""
+    if os.name != "nt":
+        try:
+            return mp.get_context("fork")
+        except ValueError:
+            pass
+    return mp.get_context("spawn")
+
+
 def _reconstruct_csr_from_column_payload(
     solver_payload: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
     *,
@@ -1289,6 +1296,7 @@ class PrepLP:
         show_progress: bool = True,
         auto_discover_symmetries: bool = True,
         compress_rows_under_discovered_group: bool = True,
+        validate_discovered_row_orbits: bool = False,
         verbose_symmetry_discovery: bool = True,
         verbose_cache: bool = True,
     ) -> None:
@@ -1299,6 +1307,7 @@ class PrepLP:
         self.show_progress = show_progress
         self.auto_discover_symmetries = auto_discover_symmetries
         self.compress_rows_under_discovered_group = compress_rows_under_discovered_group
+        self.validate_discovered_row_orbits = validate_discovered_row_orbits
         self.verbose_symmetry_discovery = verbose_symmetry_discovery
         self.verbose_cache = verbose_cache
         self.prob = ring_problem(self._requested_n, distribution)
@@ -1390,9 +1399,14 @@ class PrepLP:
         return _estimate_per_worker_raw_buffer_bytes(self.estimated_max_row_entries)
 
     @cached_property
-    def worst_case_active_wave_raw_buffer_bytes(self) -> int:
-        """Worst-case raw worker-buffer footprint if an entire wave hits the structural maximum."""
-        return max(1, int(self.worker_count)) * self.per_worker_raw_buffer_bytes
+    def per_worker_peak_bytes(self) -> int:
+        """One-pass worst-case per-worker peak, including exact unique keys and counts."""
+        return _estimate_per_worker_peak_bytes(self.estimated_max_row_entries)
+
+    @cached_property
+    def worst_case_active_worker_peak_bytes(self) -> int:
+        """Worst-case one-pass active-worker peak if every worker hits the structural maximum."""
+        return max(1, int(self.worker_count)) * self.per_worker_peak_bytes
 
     def _log_structural_memory_plan(self) -> None:
         """Emit an early structural memory estimate before marginal enumeration begins."""
@@ -1405,7 +1419,8 @@ class PrepLP:
             f"smallest_marginal_size={self.smallest_marginal_size}, "
             f"max_row_entries={self.estimated_max_row_entries}, "
             f"per_worker_raw_buffer={_format_gib(self.per_worker_raw_buffer_bytes)}, "
-            f"worst_case_active_wave_raw_buffers={_format_gib(self.worst_case_active_wave_raw_buffer_bytes)}, "
+            f"per_worker_peak={_format_gib(self.per_worker_peak_bytes)}, "
+            f"worst_case_active_workers={_format_gib(self.worst_case_active_worker_peak_bytes)}, "
             f"usable_memory={_format_gib(self.usable_memory_budget_bytes)}"
             f"{estimate_suffix}",
             enabled=self.show_progress,
@@ -1858,11 +1873,13 @@ class PrepLP:
             row_remaining_ptr,
             remaining_slots_flat,
         ) = _build_row_extension_descriptors([marginal], n=self.n, outcomes=self.outcomes)
-        total = int(pow(self.outcomes, self.nof_off_diagonal_slots - len(marginal)))
-        raw_keys = np.empty(total, dtype=np.uint64)
-        _fill_sorted_global_extension_keys_for_row(
-            raw_keys,
+        row_extension_counts = np.asarray(
+            [int(pow(self.outcomes, self.nof_off_diagonal_slots - len(marginal)))],
+            dtype=np.int64,
+        )
+        unique_keys, unique_counts = _compute_unique_global_extension_keys_for_row(
             0,
+            row_extension_counts,
             row_fixed_ptr,
             fixed_slots_flat,
             fixed_vals_flat,
@@ -1873,12 +1890,9 @@ class PrepLP:
             self.slot_sources,
             self.outcome_maps,
         )
-        if raw_keys.size == 0:
-            return np.empty(0, dtype=np.uint64), np.empty(0, dtype=np.uint64)
-        unique_keys, counts = np.unique(raw_keys, return_counts=True)
         return (
-            np.asarray(unique_keys, dtype=np.uint64),
-            np.asarray(counts, dtype=np.uint64),
+            np.asarray(unique_keys, dtype=np.uint64, copy=False),
+            np.asarray(unique_counts, dtype=np.uint64, copy=False),
         )
 
     @cached_property
@@ -1955,7 +1969,8 @@ class PrepLP:
             )
 
         _ = self._validated_base_support_keys
-        _ = self._validated_discovered_row_orbits
+        if self.validate_discovered_row_orbits:
+            _ = self._validated_discovered_row_orbits
         orbit_order = self._discovered_row_orbits
 
         marginals: List[List[List[int]]] = []
@@ -2104,6 +2119,139 @@ class PrepLP:
                     f"column {col_idx}, stored={int(key)}, canonical={int(canonical_key)}."
                 )
 
+    def _row_archive_worker_state(self, scratch_dir: Path) -> dict:
+        """Shared read-only state passed once to row-archive process workers."""
+        (
+            _row_entry_ptr,
+            row_fixed_ptr,
+            fixed_slots_flat,
+            fixed_vals_flat,
+            row_remaining_ptr,
+            remaining_slots_flat,
+        ) = self._row_extension_descriptor_payload
+        return {
+            "scratch_dir": str(scratch_dir),
+            "row_extension_counts": self.row_extension_counts.astype(np.int64, copy=False),
+            "row_fixed_ptr": row_fixed_ptr,
+            "fixed_slots_flat": fixed_slots_flat,
+            "fixed_vals_flat": fixed_vals_flat,
+            "row_remaining_ptr": row_remaining_ptr,
+            "remaining_slots_flat": remaining_slots_flat,
+            "nof_off_diagonal_slots": np.int64(self.nof_off_diagonal_slots),
+            "outcomes": np.int64(self.outcomes),
+            "slot_sources": self.slot_sources,
+            "outcome_maps": self.outcome_maps,
+        }
+
+    def _build_row_archives(self, scratch_dir: Path) -> List[Path | None]:
+        """Build one exact `(key, count)` scratch archive per row using external task parallelism."""
+        row_archive_paths: List[Path | None] = [None] * self.nof_marginals
+        if self.nof_marginals == 0:
+            return row_archive_paths
+
+        row_extension_counts = self.row_extension_counts.astype(np.int64, copy=False)
+        total_entries = int(row_extension_counts.sum())
+        max_workers = max(1, int(self.worker_count))
+        exact_max_row_entries = int(row_extension_counts.max()) if row_extension_counts.size else 0
+        exact_per_worker_raw_buffer_bytes = _estimate_per_worker_raw_buffer_bytes(exact_max_row_entries)
+        exact_per_worker_peak_bytes = _estimate_per_worker_peak_bytes(exact_max_row_entries)
+        exact_active_worker_peak_bytes = _estimate_active_worker_peak_bytes(row_extension_counts, max_workers)
+        usable_memory_budget = self.usable_memory_budget_bytes
+
+        if exact_max_row_entries > self.estimated_max_row_entries:
+            raise AssertionError(
+                "Exact row-extension count exceeded the structural max-row estimate: "
+                f"exact={exact_max_row_entries}, structural={self.estimated_max_row_entries}."
+            )
+        if self.per_worker_peak_bytes > usable_memory_budget:
+            raise MemoryError(
+                "The structural worst-case marginal row requires a one-pass worker peak of "
+                f"{_format_gib(self.per_worker_peak_bytes)}, which exceeds the usable build budget "
+                f"of {_format_gib(usable_memory_budget)}."
+            )
+        if self.worst_case_active_worker_peak_bytes > usable_memory_budget:
+            raise MemoryError(
+                "The structural active one-pass workers require "
+                f"{_format_gib(self.worst_case_active_worker_peak_bytes)}, which exceeds the usable build budget "
+                f"of {_format_gib(usable_memory_budget)}."
+            )
+        if exact_active_worker_peak_bytes > usable_memory_budget:
+            raise MemoryError(
+                "Active one-pass workers require "
+                f"{_format_gib(exact_active_worker_peak_bytes)}, which exceeds the usable build budget "
+                f"of {_format_gib(usable_memory_budget)}."
+            )
+
+        _log_progress_line(
+            "Global extension workload: "
+            f"workers={max_workers}, "
+            f"rows={self.nof_marginals}, "
+            f"total_entries={total_entries}, "
+            f"exact_max_row_entries={exact_max_row_entries}, "
+            f"exact_per_worker_raw_buffer={_format_gib(exact_per_worker_raw_buffer_bytes)}, "
+            f"exact_per_worker_peak={_format_gib(exact_per_worker_peak_bytes)}, "
+            f"exact_active_workers={_format_gib(exact_active_worker_peak_bytes)}, "
+            f"scratch={scratch_dir}",
+            enabled=self.show_progress,
+        )
+
+        state = self._row_archive_worker_state(scratch_dir)
+        rows_done = 0
+        entries_done = 0
+        progress_start_time = perf_counter()
+
+        def _handle_completed_result(result: Tuple[int, str, int, int], pending_count: int) -> None:
+            nonlocal rows_done, entries_done
+            row_num, row_path_str, row_entries, _row_unique_nnz = result
+            row_archive_paths[int(row_num)] = Path(row_path_str)
+            rows_done += 1
+            entries_done += int(row_entries)
+            percent = (100.0 * entries_done / total_entries) if total_entries else 100.0
+            _log_progress_line(
+                "Global extensions task complete: "
+                f"row={row_num}, "
+                f"rows_done={rows_done}/{self.nof_marginals}, "
+                f"entries_done={entries_done}/{total_entries} "
+                f"({percent:.1f}%), "
+                f"active={pending_count}, "
+                f"elapsed={perf_counter() - progress_start_time:.2f}s",
+                enabled=self.show_progress,
+            )
+
+        if max_workers == 1:
+            _init_row_archive_worker(state)
+            for row_num in range(self.nof_marginals):
+                result = _build_row_archive_worker(row_num)
+                _handle_completed_result(result, 0)
+            return row_archive_paths
+
+        in_flight_limit = max_workers
+        ctx = _row_archive_pool_context()
+        with ProcessPoolExecutor(
+            max_workers=max_workers,
+            mp_context=ctx,
+            initializer=_init_row_archive_worker,
+            initargs=(state,),
+        ) as executor:
+            pending = {}
+            next_row = 0
+            while next_row < self.nof_marginals and len(pending) < in_flight_limit:
+                future = executor.submit(_build_row_archive_worker, next_row)
+                pending[future] = next_row
+                next_row += 1
+
+            while pending:
+                done, _not_done = wait(tuple(pending.keys()), return_when=FIRST_COMPLETED)
+                for future in done:
+                    pending.pop(future, None)
+                    result = future.result()
+                    if next_row < self.nof_marginals:
+                        new_future = executor.submit(_build_row_archive_worker, next_row)
+                        pending[new_future] = next_row
+                        next_row += 1
+                    _handle_completed_result(result, len(pending))
+        return row_archive_paths
+
     @cached_property
     def _canonical_global_lhs_payload(
         self,
@@ -2129,54 +2277,12 @@ class PrepLP:
                 self._cached_solver_column_payload,
             )
 
-        (
-            row_entry_ptr,
-            row_fixed_ptr,
-            fixed_slots_flat,
-            fixed_vals_flat,
-            row_remaining_ptr,
-            remaining_slots_flat,
-        ) = self._row_extension_descriptor_payload
         row_extension_counts = self.row_extension_counts.astype(np.int64, copy=False)
-        total_entries = int(row_entry_ptr[-1]) if row_entry_ptr.size else 0
-        worker_count = self.worker_count
+        total_entries = int(row_extension_counts.sum())
         usable_memory_budget = self.usable_memory_budget_bytes
-        exact_max_row_entries = int(row_extension_counts.max()) if row_extension_counts.size else 0
-        exact_per_worker_raw_buffer_bytes = _estimate_per_worker_raw_buffer_bytes(exact_max_row_entries)
-        if exact_max_row_entries > self.estimated_max_row_entries:
-            raise AssertionError(
-                "Exact row-extension count exceeded the structural max-row estimate: "
-                f"exact={exact_max_row_entries}, structural={self.estimated_max_row_entries}."
-            )
-        if self.per_worker_raw_buffer_bytes > usable_memory_budget:
-            raise MemoryError(
-                "The structural worst-case marginal row requires a raw uint64 key buffer of "
-                f"{_format_gib(self.per_worker_raw_buffer_bytes)}, which exceeds the usable build budget "
-                f"of {_format_gib(usable_memory_budget)}."
-            )
-        if self.worst_case_active_wave_raw_buffer_bytes > usable_memory_budget:
-            raise MemoryError(
-                "The structural active-wave raw worker buffers require "
-                f"{_format_gib(self.worst_case_active_wave_raw_buffer_bytes)}, which exceeds the usable build budget "
-                f"of {_format_gib(usable_memory_budget)}."
-            )
-        wave_count = max(1, (self.nof_marginals + worker_count - 1) // max(1, worker_count))
         scratch_root = _detect_scratch_root()
         scratch_root.mkdir(parents=True, exist_ok=True)
 
-        _log_progress_line(
-            "Global extension workload: "
-            f"workers={worker_count}, "
-            f"rows={self.nof_marginals}, "
-            f"total_entries={total_entries}, "
-            f"exact_max_row_entries={exact_max_row_entries}, "
-            f"exact_per_worker_raw_buffer={_format_gib(exact_per_worker_raw_buffer_bytes)}, "
-            f"waves={wave_count}, "
-            f"scratch={scratch_root}",
-            enabled=self.show_progress,
-        )
-
-        row_archive_paths: List[Path | None] = [None] * self.nof_marginals
         global_keys = np.empty(0, dtype=np.uint64)
         nof_caonical_global_events = 0
         total_nnz = 0
@@ -2198,93 +2304,7 @@ class PrepLP:
                     f"Enumerated {total_entries} canonicalized extensions in {elapsed:.2f}s"
                 ),
             ):
-                entries_done = 0
-                wave_start_time = perf_counter()
-                for wave_idx in range(wave_count):
-                    row_start = wave_idx * worker_count
-                    row_stop = min(row_start + worker_count, self.nof_marginals)
-                    if row_start >= row_stop:
-                        break
-                    wave_rows = np.arange(row_start, row_stop, dtype=np.int64)
-                    wave_extension_counts = row_extension_counts[row_start:row_stop]
-                    row_unique_nnz = np.empty(wave_rows.size, dtype=np.int64)
-                    _count_unique_global_extension_keys_per_row(
-                        row_unique_nnz,
-                        wave_rows,
-                        row_extension_counts,
-                        row_fixed_ptr,
-                        fixed_slots_flat,
-                        fixed_vals_flat,
-                        row_remaining_ptr,
-                        remaining_slots_flat,
-                        self.nof_off_diagonal_slots,
-                        self.outcomes,
-                        self.slot_sources,
-                        self.outcome_maps,
-                    )
-                    wave_output_ptr = np.empty(wave_rows.size + 1, dtype=np.int64)
-                    wave_output_ptr[0] = 0
-                    if row_unique_nnz.size:
-                        wave_output_ptr[1:] = np.cumsum(row_unique_nnz, dtype=np.int64)
-                    wave_peak_bytes = _estimate_wave_peak_bytes(
-                        wave_extension_counts,
-                        wave_rows_count=wave_rows.size,
-                        wave_unique_nnz_total=int(wave_output_ptr[-1]),
-                    )
-                    if wave_peak_bytes > usable_memory_budget:
-                        raise MemoryError(
-                            "Active global-extension wave requires "
-                            f"{_format_gib(wave_peak_bytes)}, which exceeds the usable build budget "
-                            f"of {_format_gib(usable_memory_budget)}."
-                        )
-                    wave_unique_keys_flat = np.empty(int(wave_output_ptr[-1]), dtype=np.uint64)
-                    wave_unique_counts_flat = np.empty(int(wave_output_ptr[-1]), dtype=np.uint64)
-                    _fill_unique_global_extension_keys_per_row(
-                        wave_unique_keys_flat,
-                        wave_unique_counts_flat,
-                        wave_output_ptr,
-                        wave_rows,
-                        row_extension_counts,
-                        row_fixed_ptr,
-                        fixed_slots_flat,
-                        fixed_vals_flat,
-                        row_remaining_ptr,
-                        remaining_slots_flat,
-                        self.nof_off_diagonal_slots,
-                        self.outcomes,
-                        self.slot_sources,
-                        self.outcome_maps,
-                    )
-                    for local_row_idx in range(wave_rows.size):
-                        row_num = int(wave_rows[local_row_idx])
-                        row_slice_start = int(wave_output_ptr[local_row_idx])
-                        row_slice_stop = int(wave_output_ptr[local_row_idx + 1])
-                        row_path = scratch_dir / f"row_{row_num:06d}.npz"
-                        _write_row_counts_archive(
-                            row_path,
-                            wave_unique_keys_flat[row_slice_start:row_slice_stop],
-                            wave_unique_counts_flat[row_slice_start:row_slice_stop],
-                        )
-                        row_archive_paths[row_num] = row_path
-                    entries_done += int(wave_extension_counts.sum())
-                    percent = (100.0 * entries_done / total_entries) if total_entries else 100.0
-                    _log_progress_line(
-                        "Global extensions wave "
-                        f"{wave_idx + 1}/{wave_count} complete: "
-                        f"rows={row_start}:{row_stop}, "
-                        f"rows_done={row_stop}/{self.nof_marginals}, "
-                        f"entries_done={entries_done}/{total_entries} "
-                        f"({percent:.1f}%), "
-                        f"peak={_format_gib(wave_peak_bytes)}, "
-                        f"elapsed={perf_counter() - wave_start_time:.2f}s",
-                        enabled=self.show_progress,
-                    )
-                    del wave_unique_counts_flat
-                    del wave_unique_keys_flat
-                    del wave_output_ptr
-                    del row_unique_nnz
-                    del wave_extension_counts
-                    del wave_rows
+                row_archive_paths = self._build_row_archives(scratch_dir)
 
             with progress_stage(
                 "Finalizing direct LP payload...",
@@ -2377,12 +2397,6 @@ class PrepLP:
                 del column_counts
                 del row_archive_paths
                 del row_extension_counts
-                del row_entry_ptr
-                del row_fixed_ptr
-                del fixed_slots_flat
-                del fixed_vals_flat
-                del row_remaining_ptr
-                del remaining_slots_flat
 
         self._cached_global_keys = global_keys
         self._cached_nof_caonical_global_events = nof_caonical_global_events

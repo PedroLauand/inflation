@@ -14,12 +14,12 @@ import inflation.applications.Final_algo_numba as final_algo_numba
 from inflation.applications.Final_algo_numba import (
     CACHE_FORMAT_VERSION,
     PrepLP,
-    _count_unique_global_extension_keys_per_row,
+    _compute_unique_global_extension_keys_for_row,
     _detect_worker_count,
     _detect_total_memory_budget_bytes,
     _cycles_from_J,
-    _estimate_wave_peak_bytes,
-    _fill_unique_global_extension_keys_per_row,
+    _estimate_active_worker_peak_bytes,
+    _estimate_per_worker_peak_bytes,
     keep_loops_of_length,
     keep_loops_up_to_three,
     _relaxed_mass_gap,
@@ -341,18 +341,15 @@ class TestClusterOptimizedRing(unittest.TestCase):
         custom_prep = self._make_prep(4, marginal_filter_fn=lambda _m: True)
         self.assertEqual(custom_prep.smallest_marginal_size, 2)
 
-    def test_wave_peak_estimator_accounts_for_shared_wave_arrays(self):
-        peak = _estimate_wave_peak_bytes(
-            np.asarray([4, 8], dtype=np.int64),
-            wave_rows_count=2,
-            wave_unique_nnz_total=5,
+    def test_one_pass_peak_estimators_match_worker_model(self):
+        self.assertEqual(_estimate_per_worker_peak_bytes(12), 24 * 12)
+        peak = _estimate_active_worker_peak_bytes(
+            np.asarray([4, 8, 3, 10], dtype=np.int64),
+            worker_count=2,
         )
-        raw_buffers = 8 * (4 + 8)
-        pass1 = raw_buffers + 8 * 2 + 8 * 2
-        pass2 = raw_buffers + 8 * 2 + 8 * 3 + 8 * 5 + 8 * 5
-        self.assertEqual(peak, max(pass1, pass2))
+        self.assertEqual(peak, 24 * (10 + 8))
 
-    def test_two_pass_row_pipeline_emits_exact_sorted_unique_counts(self):
+    def test_one_pass_row_kernel_emits_exact_sorted_unique_counts(self):
         prep = self._make_prep(4, distribution=NSIPRDistribution())
         (
             _row_entry_ptr,
@@ -363,71 +360,44 @@ class TestClusterOptimizedRing(unittest.TestCase):
             remaining_slots_flat,
         ) = prep._row_extension_descriptor_payload
         wave_rows = np.arange(min(4, prep.nof_marginals), dtype=np.int64)
-        row_unique_nnz = np.empty(wave_rows.size, dtype=np.int64)
-        _count_unique_global_extension_keys_per_row(
-            row_unique_nnz,
-            wave_rows,
-            prep.row_extension_counts.astype(np.int64, copy=False),
-            row_fixed_ptr,
-            fixed_slots_flat,
-            fixed_vals_flat,
-            row_remaining_ptr,
-            remaining_slots_flat,
-            prep.nof_off_diagonal_slots,
-            prep.outcomes,
-            prep.slot_sources,
-            prep.outcome_maps,
-        )
-        output_ptr = np.empty(wave_rows.size + 1, dtype=np.int64)
-        output_ptr[0] = 0
-        output_ptr[1:] = np.cumsum(row_unique_nnz, dtype=np.int64)
-        flat_keys = np.empty(int(output_ptr[-1]), dtype=np.uint64)
-        flat_counts = np.empty(int(output_ptr[-1]), dtype=np.uint64)
-        _fill_unique_global_extension_keys_per_row(
-            flat_keys,
-            flat_counts,
-            output_ptr,
-            wave_rows,
-            prep.row_extension_counts.astype(np.int64, copy=False),
-            row_fixed_ptr,
-            fixed_slots_flat,
-            fixed_vals_flat,
-            row_remaining_ptr,
-            remaining_slots_flat,
-            prep.nof_off_diagonal_slots,
-            prep.outcomes,
-            prep.slot_sources,
-            prep.outcome_maps,
-        )
-        for local_row, row_num in enumerate(wave_rows.tolist()):
-            start = int(output_ptr[local_row])
-            stop = int(output_ptr[local_row + 1])
-            row_keys = flat_keys[start:stop]
-            row_counts = flat_counts[start:stop]
-            self.assertEqual(stop - start, int(row_unique_nnz[local_row]))
+        for row_num in wave_rows.tolist():
+            row_keys, row_counts = _compute_unique_global_extension_keys_for_row(
+                int(row_num),
+                prep.row_extension_counts.astype(np.int64, copy=False),
+                row_fixed_ptr,
+                fixed_slots_flat,
+                fixed_vals_flat,
+                row_remaining_ptr,
+                remaining_slots_flat,
+                prep.nof_off_diagonal_slots,
+                prep.outcomes,
+                prep.slot_sources,
+                prep.outcome_maps,
+            )
             self.assertTrue(np.all(row_counts > 0))
             if row_keys.size > 1:
                 self.assertTrue(np.all(row_keys[1:] > row_keys[:-1]))
             self.assertEqual(int(row_counts.sum()), int(prep.row_extension_counts[row_num]))
 
     def test_row_archives_are_written_once_per_row_and_preserve_row_totals(self):
-        prep = self._make_prep(4, distribution=NSIPRDistribution())
-        archived_rows: list[tuple[int, np.ndarray, np.ndarray]] = []
-        original_write = final_algo_numba._write_row_counts_archive
+        with mock.patch.object(final_algo_numba, "_detect_worker_count", return_value=1):
+            prep = self._make_prep(4, distribution=NSIPRDistribution())
+            archived_rows: list[tuple[int, np.ndarray, np.ndarray]] = []
+            original_write = final_algo_numba._write_row_counts_archive
 
-        def capture_write(path, keys, counts):
-            row_num = int(Path(path).stem.split("_")[1])
-            archived_rows.append(
-                (
-                    row_num,
-                    np.asarray(keys, dtype=np.uint64).copy(),
-                    np.asarray(counts, dtype=np.uint64).copy(),
+            def capture_write(path, keys, counts):
+                row_num = int(Path(path).stem.split("_")[1])
+                archived_rows.append(
+                    (
+                        row_num,
+                        np.asarray(keys, dtype=np.uint64).copy(),
+                        np.asarray(counts, dtype=np.uint64).copy(),
+                    )
                 )
-            )
-            return original_write(path, keys, counts)
+                return original_write(path, keys, counts)
 
-        with mock.patch.object(final_algo_numba, "_write_row_counts_archive", side_effect=capture_write):
-            _ = prep.global_keys
+            with mock.patch.object(final_algo_numba, "_write_row_counts_archive", side_effect=capture_write):
+                _ = prep.global_keys
 
         self.assertEqual(len(archived_rows), prep.nof_marginals)
         self.assertEqual(sorted(row_num for row_num, _keys, _counts in archived_rows), list(range(prep.nof_marginals)))
@@ -448,14 +418,38 @@ class TestClusterOptimizedRing(unittest.TestCase):
     def test_largest_row_buffer_budget_violation_fails_fast(self):
         with mock.patch.object(final_algo_numba, "_detect_total_memory_budget_bytes", return_value=1):
             prep = self._make_prep(3)
-            with self.assertRaisesRegex(MemoryError, "structural worst-case marginal row requires a raw uint64 key buffer"):
+            with self.assertRaisesRegex(MemoryError, "structural worst-case marginal row requires a one-pass worker peak"):
                 _ = prep.global_keys
 
-    def test_active_wave_budget_violation_fails_fast(self):
+    def test_active_worker_budget_violation_fails_fast(self):
         prep = self._make_prep(3)
-        with mock.patch.object(final_algo_numba, "_estimate_wave_peak_bytes", return_value=prep.usable_memory_budget_bytes + 1):
-            with self.assertRaisesRegex(MemoryError, "Active global-extension wave requires"):
+        with mock.patch.object(
+            final_algo_numba,
+            "_estimate_active_worker_peak_bytes",
+            return_value=prep.usable_memory_budget_bytes + 1,
+        ):
+            with self.assertRaisesRegex(MemoryError, "Active one-pass workers require"):
                 _ = prep.global_keys
+
+    def test_discovered_row_orbit_validation_is_opt_in(self):
+        with mock.patch.object(
+            PrepLP,
+            "_validated_discovered_row_orbits",
+            new_callable=mock.PropertyMock,
+            side_effect=AssertionError("validation should be skipped"),
+        ):
+            prep = self._make_prep(4, validate_discovered_row_orbits=False)
+            _ = prep.row_labels
+
+        with mock.patch.object(
+            PrepLP,
+            "_validated_discovered_row_orbits",
+            new_callable=mock.PropertyMock,
+            side_effect=AssertionError("validation enabled"),
+        ):
+            prep = self._make_prep(4, validate_discovered_row_orbits=True)
+            with self.assertRaisesRegex(AssertionError, "validation enabled"):
+                _ = prep.row_labels
 
     def test_direct_matrix_public_api_shape(self):
         prep = self._make_prep(3)
