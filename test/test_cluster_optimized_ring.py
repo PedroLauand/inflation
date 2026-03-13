@@ -17,12 +17,20 @@ from inflation.applications.Final_algo_numba import (
     _count_unique_global_extension_keys_per_row,
     _detect_worker_count,
     _detect_total_memory_budget_bytes,
+    _cycles_from_J,
     _fill_unique_global_extension_keys_per_row,
+    _relaxed_mass_gap,
+    _relaxed_mass_tolerance,
+    _perm_from_marginal,
     read_prep_lp_solution,
     _offdiag_slot_index,
     _union_sorted_unique_uint64,
 )
-from inflation.applications.Group_utils import canonical_leximin_coset_chain_uint64
+from inflation.applications.Group_utils import (
+    build_sympy_group,
+    canonical_leximin_coset_chain_uint64,
+    canonical_leximin_support_indices,
+)
 from inflation.distributions import GHZDistribution, NSIPRDistribution
 from inflation.lp.lp_utils import solveLP_sparse
 
@@ -49,6 +57,45 @@ class _ParityBinaryDistribution:
 
     def prob_event_line(self, outcomes):
         return self.prob_event_loop(outcomes)
+
+
+def _keep_any_two_or_three_cycles(marginal) -> bool:
+    cycles = _cycles_from_J(_perm_from_marginal(marginal))
+    return len(cycles) > 0 and all(len(cycle) in (2, 3) for cycle in cycles)
+
+
+def _encode_event_key(evt: np.ndarray, outcomes: int) -> int:
+    acc = 0
+    base = 1
+    for digit in evt.tolist():
+        acc += int(digit) * base
+        base *= int(outcomes)
+    return acc
+
+
+def _reference_support_canonicalizer(support: np.ndarray, group_elements: np.ndarray) -> tuple[int, ...]:
+    best = None
+    for perm in group_elements:
+        candidate = tuple(sorted(int(perm[int(pos)]) for pos in support.tolist()))
+        if best is None or candidate < best:
+            best = candidate
+    return best or tuple()
+
+
+def _reference_event_canonicalizer(evt: np.ndarray, outcomes: int, group_elements: np.ndarray) -> int:
+    slot_count = evt.size
+    best = None
+    for perm in group_elements:
+        mapped_evt = np.empty(slot_count, dtype=np.uint8)
+        for in_slot in range(slot_count):
+            coord = in_slot * outcomes + int(evt[in_slot])
+            mapped_coord = int(perm[coord])
+            out_slot, out_digit = divmod(mapped_coord, outcomes)
+            mapped_evt[out_slot] = np.uint8(out_digit)
+        candidate = tuple(int(x) for x in mapped_evt.tolist())
+        if best is None or candidate < best:
+            best = candidate
+    return _encode_event_key(np.asarray(best, dtype=np.uint8), outcomes)
 
 
 def _reference_global_keys_and_matrix(prep: PrepLP) -> tuple[np.ndarray, np.ndarray]:
@@ -82,7 +129,14 @@ def _reference_global_keys_and_matrix(prep: PrepLP) -> tuple[np.ndarray, np.ndar
                 idx = remaining[rem_pos]
                 evt[idx] = tmp % prep.outcomes
                 tmp //= prep.outcomes
-            key = int(canonical_leximin_coset_chain_uint64(evt, prep.outcomes, prep.level_invperms))
+            key = int(
+                canonical_leximin_coset_chain_uint64(
+                    evt,
+                    prep.outcomes,
+                    prep.slot_sources,
+                    prep.outcome_maps,
+                )
+            )
             column = global_event_map.get(key)
             if column is None:
                 column = len(global_keys)
@@ -161,6 +215,43 @@ class TestClusterOptimizedRing(unittest.TestCase):
                 expected_keys, expected_dense = _reference_global_keys_and_matrix(prep)
                 np.testing.assert_array_equal(prep.global_keys, expected_keys)
                 np.testing.assert_allclose(prep.inflation_matrix.toarray(), expected_dense)
+
+    def test_support_canonicalizer_is_idempotent_and_matches_reference(self):
+        prep = self._make_prep(4, distribution=GHZDistribution())
+        group = build_sympy_group(prep.core_symmetries, prep.N)
+        reference_elements = np.asarray(list(group.generate_schreier_sims(af=True)), dtype=int)
+        for key in prep.base_support_keys[: min(12, prep.base_nof_marginals)]:
+            support = np.asarray(key, dtype=np.int64)
+            canonical = canonical_leximin_support_indices(support, prep.N, prep.core_group_perms)
+            canonical_key = tuple(int(x) for x in canonical.tolist())
+            self.assertEqual(canonical_key, key)
+            self.assertEqual(
+                canonical_key,
+                _reference_support_canonicalizer(support, reference_elements),
+            )
+
+    def test_event_canonicalizer_is_idempotent_and_matches_reference(self):
+        prep = self._make_prep(4, distribution=GHZDistribution())
+        _ = prep.global_keys
+        group = build_sympy_group(prep.discovered_symmetries, prep.N)
+        reference_elements = np.asarray(list(group.generate_schreier_sims(af=True)), dtype=int)
+        for key in prep.global_keys[: min(24, prep.global_keys.size)]:
+            evt = final_algo_numba._decode_uint64_event_key(
+                np.uint64(key),
+                prep.nof_off_diagonal_slots,
+                prep.outcomes,
+            )
+            canonical = canonical_leximin_coset_chain_uint64(
+                evt,
+                prep.outcomes,
+                prep.slot_sources,
+                prep.outcome_maps,
+            )
+            self.assertEqual(int(canonical), int(key))
+            self.assertEqual(
+                int(key),
+                _reference_event_canonicalizer(evt, prep.outcomes, reference_elements),
+            )
 
     def test_row_labels_use_grouped_cycle_notation(self):
         prep = self._make_prep(4, distribution=GHZDistribution())
@@ -257,7 +348,8 @@ class TestClusterOptimizedRing(unittest.TestCase):
             remaining_slots_flat,
             prep.nof_off_diagonal_slots,
             prep.outcomes,
-            prep.level_invperms,
+            prep.slot_sources,
+            prep.outcome_maps,
         )
         output_ptr = np.empty(wave_rows.size + 1, dtype=np.int64)
         output_ptr[0] = 0
@@ -277,7 +369,8 @@ class TestClusterOptimizedRing(unittest.TestCase):
             remaining_slots_flat,
             prep.nof_off_diagonal_slots,
             prep.outcomes,
-            prep.level_invperms,
+            prep.slot_sources,
+            prep.outcome_maps,
         )
         for local_row, row_num in enumerate(wave_rows.tolist()):
             start = int(output_ptr[local_row])
@@ -449,6 +542,20 @@ class TestClusterOptimizedRing(unittest.TestCase):
         self.assertFalse(generalized_robustness_solution["success"])
         self.assertGreater(float(generalized_robustness_solution["generalized_robustness"]), 0.0)
 
+    def test_relaxed_success_uses_mass_scaled_tolerance(self):
+        known_mass = 1.0e6
+        mass_tol = _relaxed_mass_tolerance(known_mass)
+        tiny_relative_gap = 9.39099575881e-10 * known_mass
+        large_relative_gap = 2.0e-8 * known_mass
+
+        self.assertGreater(mass_tol, tiny_relative_gap)
+        self.assertLess(mass_tol, large_relative_gap)
+
+        small_gap = _relaxed_mass_gap(known_mass - tiny_relative_gap, known_mass, sense="upper")
+        large_gap = _relaxed_mass_gap(known_mass - large_relative_gap, known_mass, sense="upper")
+        self.assertLessEqual(small_gap, mass_tol)
+        self.assertGreater(large_gap, mass_tol)
+
     def test_ghz_n3_all_equal_distribution_is_feasible(self):
         prep = self._make_prep(3, distribution=GHZDistribution())
 
@@ -462,6 +569,84 @@ class TestClusterOptimizedRing(unittest.TestCase):
         self.assertTrue(feasibility_solution["success"])
         self.assertEqual(feasibility_solution["status"], "optimal")
         self.assertEqual(feasibility_solution["sparse_certificate"].nnz, 0)
+
+    def test_row_compression_matches_uncompressed_on_ghz_filtered_case(self):
+        base_kwargs = {
+            "marginal_filter_fn": _keep_any_two_or_three_cycles,
+            "auto_discover_symmetries": True,
+            "show_progress": False,
+            "verbose_symmetry_discovery": False,
+            "verbose_cache": False,
+        }
+        prep_uncompressed = self._make_prep(
+            4,
+            distribution=GHZDistribution(),
+            compress_rows_under_discovered_group=False,
+            **base_kwargs,
+        )
+        prep_compressed = self._make_prep(
+            4,
+            distribution=GHZDistribution(),
+            compress_rows_under_discovered_group=True,
+            **base_kwargs,
+        )
+
+        sol_uncompressed = prep_uncompressed.solve(mode="incompatible_fraction", verbose=0)
+        sol_compressed = prep_compressed.solve(mode="incompatible_fraction", verbose=0)
+
+        self.assertFalse(sol_uncompressed["success"])
+        self.assertFalse(sol_compressed["success"])
+        self.assertGreater(float(sol_uncompressed["incompatible_fraction"]), 0.0)
+        self.assertAlmostEqual(
+            float(sol_uncompressed["incompatible_fraction"]),
+            float(sol_compressed["incompatible_fraction"]),
+            places=9,
+        )
+        self.assertTrue(
+            any(sp.simplify(value) == 0 for value in prep_uncompressed.base_known_values_symbolic.tolist())
+        )
+        self.assertTrue(any(sp.simplify(value) == 0 for value in prep_compressed.known_values_symbolic.tolist()))
+
+    def test_row_compression_matches_uncompressed_on_nsi_n4(self):
+        prep_uncompressed = self._make_prep(
+            4,
+            distribution=NSIPRDistribution(),
+            compress_rows_under_discovered_group=False,
+        )
+        prep_compressed = self._make_prep(
+            4,
+            distribution=NSIPRDistribution(),
+            compress_rows_under_discovered_group=True,
+        )
+
+        sol_uncompressed = prep_uncompressed.solve(mode="incompatible_fraction", verbose=0)
+        sol_compressed = prep_compressed.solve(mode="incompatible_fraction", verbose=0)
+
+        self.assertEqual(sol_uncompressed["success"], sol_compressed["success"])
+        self.assertAlmostEqual(
+            float(sol_uncompressed["incompatible_fraction"]),
+            float(sol_compressed["incompatible_fraction"]),
+            places=9,
+        )
+
+    def test_compressed_orbit_members_share_identical_row_signatures(self):
+        prep = self._make_prep(
+            4,
+            distribution=GHZDistribution(),
+            marginal_filter_fn=_keep_any_two_or_three_cycles,
+            compress_rows_under_discovered_group=True,
+        )
+        for orbit_members in prep.row_orbit_members:
+            rep_keys = None
+            rep_counts = None
+            for base_idx in orbit_members:
+                keys, counts = prep._row_signature_for_marginal(prep.base_marginals[base_idx])
+                if rep_keys is None:
+                    rep_keys = keys
+                    rep_counts = counts
+                    continue
+                np.testing.assert_array_equal(keys, rep_keys)
+                np.testing.assert_array_equal(counts, rep_counts)
 
     def test_solution_roundtrip_preserves_direct_basis_metadata(self):
         prep = self._make_prep(4, distribution=NSIPRDistribution())

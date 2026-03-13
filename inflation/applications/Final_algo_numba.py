@@ -23,7 +23,6 @@ import sys
 import numpy as np
 import sympy as sp
 from numba import get_num_threads, njit, prange, set_num_threads
-from numba.typed import List as NumbaList
 from scipy.sparse import coo_array, csr_array
 from inflation.progress_utils import make_tqdm as tqdm, progress_stage
 
@@ -43,7 +42,7 @@ from inflation.applications.ring_utils import build_off_diagonal_ring_problem
 from inflation.distributions.protocols import RingDistributionProtocol
 from inflation.symmetry_utils import discovery_symmetries_from_predicate
 
-CACHE_FORMAT_VERSION = np.int64(7)
+CACHE_FORMAT_VERSION = np.int64(8)
 
 
 def ring_problem(inflation_level: int, distribution: RingDistributionProtocol) -> InflationProblem:
@@ -57,7 +56,7 @@ def ring_problem(inflation_level: int, distribution: RingDistributionProtocol) -
 def _prepare_group_chain(
     prob: InflationProblem,
     symmetries: np.ndarray | None = None,
-) -> Tuple[int, int, int, NumbaList]:
+) -> Tuple[int, int, int, np.ndarray, np.ndarray, np.ndarray]:
     n = prob.inflation_level_per_source[0]
     outcomes = prob.outcomes_per_party[0]
     if outcomes >= 255:
@@ -75,8 +74,8 @@ def _prepare_group_chain(
     if symmetries is None:
         symmetries = np.asarray(prob.symmetries, dtype=int)
     G = build_sympy_group(symmetries, N)
-    level_invperms = prepare_group_chain(G, N)
-    return n, outcomes, N, level_invperms
+    group_perms, slot_sources, outcome_maps = prepare_group_chain(G, N, outcomes)
+    return n, outcomes, N, group_perms, slot_sources, outcome_maps
 
 
 def _offdiag_slot_index(i: int, j: int, n: int) -> int:
@@ -383,7 +382,8 @@ def _fill_sorted_global_extension_keys_for_row(
     remaining_slots_flat: np.ndarray,
     nof_off_diagonal_slots: int,
     outcomes: int,
-    level_invperms: NumbaList,
+    slot_sources: np.ndarray,
+    outcome_maps: np.ndarray,
 ) -> None:
     """Enumerate and sort one row's canonical uint64 global-extension keys."""
     evt = np.zeros(nof_off_diagonal_slots, dtype=np.uint8)
@@ -404,7 +404,8 @@ def _fill_sorted_global_extension_keys_for_row(
         raw_keys[pos] = canonical_leximin_coset_chain_uint64(
             evt,
             outcomes,
-            level_invperms,
+            slot_sources,
+            outcome_maps,
         )
     raw_keys.sort()
 
@@ -464,7 +465,8 @@ def _count_unique_global_extension_keys_per_row(
     remaining_slots_flat: np.ndarray,
     nof_off_diagonal_slots: int,
     outcomes: int,
-    level_invperms: NumbaList,
+    slot_sources: np.ndarray,
+    outcome_maps: np.ndarray,
 ) -> None:
     """Pass 1: count exact unique canonical keys for each row in a wave."""
     for local_row in prange(wave_rows.size):
@@ -481,7 +483,8 @@ def _count_unique_global_extension_keys_per_row(
             remaining_slots_flat,
             nof_off_diagonal_slots,
             outcomes,
-            level_invperms,
+            slot_sources,
+            outcome_maps,
         )
         row_unique_nnz[local_row] = _count_unique_sorted_uint64(raw_keys)
 
@@ -500,7 +503,8 @@ def _fill_unique_global_extension_keys_per_row(
     remaining_slots_flat: np.ndarray,
     nof_off_diagonal_slots: int,
     outcomes: int,
-    level_invperms: NumbaList,
+    slot_sources: np.ndarray,
+    outcome_maps: np.ndarray,
 ) -> None:
     """Pass 2: materialize exact sorted `(key, count)` row streams for a wave."""
     for local_row in prange(wave_rows.size):
@@ -517,7 +521,8 @@ def _fill_unique_global_extension_keys_per_row(
             remaining_slots_flat,
             nof_off_diagonal_slots,
             outcomes,
-            level_invperms,
+            slot_sources,
+            outcome_maps,
         )
         _write_rle_sorted_uint64_to_flat(
             raw_keys,
@@ -599,6 +604,18 @@ def _log_progress_line(message: str, *, enabled: bool) -> None:
     """Emit a clean stdout status line when progress reporting is enabled."""
     if enabled:
         print(message, flush=True)
+
+
+@njit(cache=True, fastmath=True)
+def _decode_uint64_event_key(key: np.uint64, slot_count: int, outcomes: int) -> np.ndarray:
+    """Decode a uint64 canonical event key into compact slot outcomes."""
+    evt = np.empty(slot_count, dtype=np.uint8)
+    base = np.uint64(outcomes)
+    tmp = np.uint64(key)
+    for slot in range(slot_count):
+        evt[slot] = np.uint8(tmp % base)
+        tmp //= base
+    return evt
 
 
 @njit(cache=True, parallel=True, fastmath=True)
@@ -819,6 +836,25 @@ def _resolve_ring_solve_mode(mode: str) -> str:
             "feasibility, incompatible_fraction, generalized_robustness."
         )
     return normalized
+
+
+def _relaxed_mass_gap(
+    optimized_mass: float,
+    known_mass: float,
+    *,
+    sense: str,
+) -> float:
+    """Return the positive mass violation for a relaxed ring LP mode."""
+    if sense == "upper":
+        return max(0.0, known_mass - optimized_mass)
+    if sense == "lower":
+        return max(0.0, optimized_mass - known_mass)
+    raise ValueError("sense must be 'upper' or 'lower'.")
+
+
+def _relaxed_mass_tolerance(known_mass: float, *, abs_tol: float = 1e-9, rel_tol: float = 1e-8) -> float:
+    """Tolerance for relaxed-mass feasibility, scaled to the known mass."""
+    return max(float(abs_tol), float(rel_tol) * abs(float(known_mass)))
 
 
 def _normalize_prep_solution_path(path: str | Path) -> Path:
@@ -1139,6 +1175,23 @@ def _cycles_from_J(J: Dict[int, int]) -> List[List[int]]:
             raise ValueError("Ring marginals cannot contain 1-cycles.")
         cycles.append(cyc)
     return cycles
+
+
+def keep_cycles_up_to_length(max_cycle_length: int):
+    """Return a marginal filter that admits only disjoint cycles of length <= `max_cycle_length`."""
+    max_cycle_length = int(max_cycle_length)
+    if max_cycle_length < 2:
+        raise ValueError("Cycle-length filter requires max_cycle_length >= 2.")
+
+    def _filter(marginal: List[List[int]]) -> bool:
+        cycles = _cycles_from_J(_perm_from_marginal(marginal))
+        return len(cycles) > 0 and all(len(cycle) <= max_cycle_length for cycle in cycles)
+
+    _filter.__name__ = f"keep_cycles_up_to_length_{max_cycle_length}"
+    return _filter
+
+
+keep_up_to_three_cycles = keep_cycles_up_to_length(3)
 
 
 def factorized_marginal_value(
@@ -1466,13 +1519,13 @@ class PrepLP:
         return np.unique(np.vstack((self.core_symmetries, candidates)), axis=0)
 
     @cached_property
-    def _core_group_chain_data(self) -> Tuple[int, int, int, NumbaList]:
-        """Tuple `(n, outcomes, N, level_invperms)` prepared from core symmetries."""
+    def _core_group_chain_data(self) -> Tuple[int, int, int, np.ndarray, np.ndarray, np.ndarray]:
+        """Tuple `(n, outcomes, N, group_perms, slot_sources, outcome_maps)` for core symmetries."""
         return _prepare_group_chain(self.prob, self.core_symmetries)
 
     @cached_property
-    def _effective_group_chain_data(self) -> Tuple[int, int, int, NumbaList]:
-        """Tuple `(n, outcomes, N, level_invperms)` prepared from discovered symmetries."""
+    def _effective_group_chain_data(self) -> Tuple[int, int, int, np.ndarray, np.ndarray, np.ndarray]:
+        """Tuple `(n, outcomes, N, group_perms, slot_sources, outcome_maps)` for discovered symmetries."""
         return _prepare_group_chain(self.prob, self.discovered_symmetries)
 
     @property
@@ -1496,14 +1549,34 @@ class PrepLP:
         return self.n * (self.n - 1)
 
     @property
-    def core_level_invperms(self) -> NumbaList:
-        """Schreier-Sims inverse-transversal chain for the core symmetry group."""
+    def core_group_perms(self) -> np.ndarray:
+        """Exact forward coordinate permutations for the core symmetry group."""
         return self._core_group_chain_data[3]
 
     @property
-    def level_invperms(self) -> NumbaList:
-        """Schreier-Sims inverse-transversal chain for the discovered symmetry group."""
+    def core_slot_sources(self) -> np.ndarray:
+        """Input-slot lookup per core symmetry element and output slot."""
+        return self._core_group_chain_data[4]
+
+    @property
+    def core_outcome_maps(self) -> np.ndarray:
+        """Output-outcome lookup per core symmetry element, slot, and input outcome."""
+        return self._core_group_chain_data[5]
+
+    @property
+    def group_perms(self) -> np.ndarray:
+        """Exact forward coordinate permutations for the discovered symmetry group."""
         return self._effective_group_chain_data[3]
+
+    @property
+    def slot_sources(self) -> np.ndarray:
+        """Input-slot lookup per discovered symmetry element and output slot."""
+        return self._effective_group_chain_data[4]
+
+    @property
+    def outcome_maps(self) -> np.ndarray:
+        """Output-outcome lookup per discovered symmetry element, slot, and input outcome."""
+        return self._effective_group_chain_data[5]
 
     @cached_property
     def _base_marginal_payload(self) -> Tuple[List[List[List[int]]], List[Tuple[int, ...]]]:
@@ -1530,7 +1603,7 @@ class PrepLP:
                 for image in _derangements(subset):
                     for pat in product(base_outcomes, repeat=subset_size):
                         support = _marginal_support_from_cycle_cover(subset, image, pat, self.n, self.outcomes)
-                        canonical_support = canonical_leximin_support_indices(support, self.N, self.core_level_invperms)
+                        canonical_support = canonical_leximin_support_indices(support, self.N, self.core_group_perms)
                         key = tuple(int(x) for x in canonical_support.tolist())
                         if key not in seen_keys:
                             marginal = _marginal_from_support_key(key, self.n, self.outcomes)
@@ -1552,10 +1625,29 @@ class PrepLP:
         """Sorted support keys for base marginals."""
         return self._base_marginal_payload[1]
 
+    @cached_property
+    def _base_support_index(self) -> Dict[Tuple[int, ...], int]:
+        """Lookup from canonical base support key to base-row index."""
+        return {key: idx for idx, key in enumerate(self.base_support_keys)}
+
     @property
     def base_nof_marginals(self) -> int:
         """Number of base canonical marginals."""
         return len(self.base_marginals)
+
+    @cached_property
+    def _validated_base_support_keys(self) -> bool:
+        """Ensure stored base support keys are fixed points of the core canonicalizer."""
+        for idx, key in enumerate(self.base_support_keys):
+            support = np.asarray(key, dtype=np.int64)
+            canonical = canonical_leximin_support_indices(support, self.N, self.core_group_perms)
+            canonical_key = tuple(int(x) for x in canonical.tolist())
+            if canonical_key != key:
+                raise AssertionError(
+                    "Stored base support key is not canonical under the core symmetry group: "
+                    f"row {idx}, stored={key}, canonical={canonical_key}."
+                )
+        return True
 
     @cached_property
     def base_row_labels(self) -> np.ndarray:
@@ -1632,9 +1724,10 @@ class PrepLP:
     @cached_property
     def discovered_symmetries(self) -> np.ndarray:
         """Largest discovered stabilizing subgroup used for final canonicalization."""
+        _ = self._validated_base_support_keys
         if not self.auto_discover_symmetries:
             return self.core_symmetries
-        support_to_idx = {key: idx for idx, key in enumerate(self.base_support_keys)}
+        support_to_idx = self._base_support_index
         values = self.base_known_values_symbolic
 
         def _stabilizer_predicate(perm: np.ndarray) -> bool:
@@ -1643,7 +1736,7 @@ class PrepLP:
                 mapped_canon = canonical_leximin_support_indices(
                     mapped_support,
                     self.N,
-                    self.core_level_invperms,
+                    self.core_group_perms,
                 )
                 mapped_key = tuple(int(x) for x in mapped_canon.tolist())
                 mapped_idx = support_to_idx.get(mapped_key)
@@ -1665,6 +1758,125 @@ class PrepLP:
         if discovered.size == 0:
             return self.core_symmetries
         return np.asarray(discovered, dtype=int)
+
+    @cached_property
+    def _discovered_row_orbits(self) -> List[Tuple[int, ...]]:
+        """Exact base-row orbits induced by the discovered symmetry group."""
+        _ = self._validated_base_support_keys
+        support_to_idx = self._base_support_index
+        visited = np.zeros(self.base_nof_marginals, dtype=bool)
+        orbit_members: List[Tuple[int, ...]] = []
+
+        for start_idx in range(self.base_nof_marginals):
+            if visited[start_idx]:
+                continue
+            orbit: set[int] = set()
+            frontier = [start_idx]
+            while frontier:
+                idx = frontier.pop()
+                if idx in orbit:
+                    continue
+                orbit.add(idx)
+                visited[idx] = True
+                support = np.asarray(self.base_support_keys[idx], dtype=np.int64)
+                for perm in self.discovered_symmetries:
+                    mapped_support = np.asarray([int(perm[pos]) for pos in support], dtype=np.int64)
+                    mapped_canonical = canonical_leximin_support_indices(
+                        mapped_support,
+                        self.N,
+                        self.core_group_perms,
+                    )
+                    mapped_key = tuple(int(x) for x in mapped_canonical.tolist())
+                    mapped_idx = support_to_idx.get(mapped_key)
+                    if mapped_idx is None:
+                        raise AssertionError(
+                            "Discovered symmetry moved a base support outside the core-canonical row set: "
+                            f"source={tuple(int(x) for x in support.tolist())}, mapped={mapped_key}."
+                        )
+                    if mapped_idx not in orbit:
+                        frontier.append(mapped_idx)
+            members = tuple(sorted(orbit))
+            for idx in members:
+                visited[idx] = True
+            orbit_members.append(members)
+        return orbit_members
+
+    def _row_signature_for_marginal(
+        self,
+        marginal: List[List[int]],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Enumerate the exact discovered-group-quotiented signature of one base row."""
+        (
+            _row_entry_ptr,
+            row_fixed_ptr,
+            fixed_slots_flat,
+            fixed_vals_flat,
+            row_remaining_ptr,
+            remaining_slots_flat,
+        ) = _build_row_extension_descriptors([marginal], n=self.n, outcomes=self.outcomes)
+        total = int(pow(self.outcomes, self.nof_off_diagonal_slots - len(marginal)))
+        raw_keys = np.empty(total, dtype=np.uint64)
+        _fill_sorted_global_extension_keys_for_row(
+            raw_keys,
+            0,
+            row_fixed_ptr,
+            fixed_slots_flat,
+            fixed_vals_flat,
+            row_remaining_ptr,
+            remaining_slots_flat,
+            self.nof_off_diagonal_slots,
+            self.outcomes,
+            self.slot_sources,
+            self.outcome_maps,
+        )
+        if raw_keys.size == 0:
+            return np.empty(0, dtype=np.uint64), np.empty(0, dtype=np.uint64)
+        unique_keys, counts = np.unique(raw_keys, return_counts=True)
+        return (
+            np.asarray(unique_keys, dtype=np.uint64),
+            np.asarray(counts, dtype=np.uint64),
+        )
+
+    @cached_property
+    def _validated_discovered_row_orbits(self) -> bool:
+        """Small-case exact validation that compressed row orbits are quotient-row consistent."""
+        if not self.compress_rows_under_discovered_group:
+            return True
+        max_validation_rows = 64
+        max_validation_entries = 250_000
+        if self.base_nof_marginals > max_validation_rows:
+            return True
+        total_entries = 0
+        for marginal in self.base_marginals:
+            total_entries += int(pow(self.outcomes, self.nof_off_diagonal_slots - len(marginal)))
+            if total_entries > max_validation_entries:
+                return True
+
+        for orbit_members in self._discovered_row_orbits:
+            representative_keys = None
+            representative_counts = None
+            representative_value = self.base_known_values_symbolic[orbit_members[0]]
+            for base_idx in orbit_members:
+                current_value = self.base_known_values_symbolic[base_idx]
+                if sp.simplify(current_value - representative_value) != 0:
+                    raise AssertionError(
+                        "Discovered row orbit contains non-equal symbolic known values: "
+                        f"orbit={orbit_members}."
+                    )
+                row_keys, row_counts = self._row_signature_for_marginal(self.base_marginals[base_idx])
+                if representative_keys is None:
+                    representative_keys = row_keys
+                    representative_counts = row_counts
+                    continue
+                if (
+                    not np.array_equal(row_keys, representative_keys)
+                    or not np.array_equal(row_counts, representative_counts)
+                ):
+                    raise AssertionError(
+                        "Discovered row orbit is not quotient-row consistent after column canonicalization: "
+                        f"orbit={orbit_members}."
+                    )
+        return True
 
     @cached_property
     def _row_compression_payload(
@@ -1698,16 +1910,9 @@ class PrepLP:
                 member_labels,
             )
 
-        orbit_map: Dict[Tuple[int, ...], List[int]] = {}
-        orbit_order: List[Tuple[int, ...]] = []
-        for idx, key in enumerate(self.base_support_keys):
-            support = np.asarray(key, dtype=np.int64)
-            canon = canonical_leximin_support_indices(support, self.N, self.level_invperms)
-            canon_key = tuple(int(x) for x in canon.tolist())
-            if canon_key not in orbit_map:
-                orbit_map[canon_key] = []
-                orbit_order.append(canon_key)
-            orbit_map[canon_key].append(idx)
+        _ = self._validated_base_support_keys
+        _ = self._validated_discovered_row_orbits
+        orbit_order = self._discovered_row_orbits
 
         marginals: List[List[List[int]]] = []
         known_values_symbolic = np.empty(len(orbit_order), dtype=object)
@@ -1719,8 +1924,7 @@ class PrepLP:
         orbit_average_labels: List[str] = []
         orbit_member_labels: List[Tuple[str, ...]] = []
 
-        for orbit_idx, canon_key in enumerate(orbit_order):
-            members = tuple(orbit_map[canon_key])
+        for orbit_idx, members in enumerate(orbit_order):
             orbit_members.append(members)
             multiplicities[orbit_idx] = len(members)
             rep = members[0]
@@ -1839,6 +2043,23 @@ class PrepLP:
             outcomes=self.outcomes,
         )
 
+    def _assert_global_keys_canonical(self, global_keys: np.ndarray) -> None:
+        """Fail fast if any stored global key is not canonical under the discovered group."""
+        slot_count = self.nof_off_diagonal_slots
+        for col_idx, key in enumerate(np.asarray(global_keys, dtype=np.uint64)):
+            evt = _decode_uint64_event_key(np.uint64(key), slot_count, self.outcomes)
+            canonical_key = canonical_leximin_coset_chain_uint64(
+                evt,
+                self.outcomes,
+                self.slot_sources,
+                self.outcome_maps,
+            )
+            if int(canonical_key) != int(key):
+                raise AssertionError(
+                    "Stored global key is not canonical under the discovered symmetry group: "
+                    f"column {col_idx}, stored={int(key)}, canonical={int(canonical_key)}."
+                )
+
     @cached_property
     def _canonical_global_lhs_payload(
         self,
@@ -1946,7 +2167,8 @@ class PrepLP:
                         remaining_slots_flat,
                         self.nof_off_diagonal_slots,
                         self.outcomes,
-                        self.level_invperms,
+                        self.slot_sources,
+                        self.outcome_maps,
                     )
                     wave_output_ptr = np.empty(wave_rows.size + 1, dtype=np.int64)
                     wave_output_ptr[0] = 0
@@ -1967,7 +2189,8 @@ class PrepLP:
                         remaining_slots_flat,
                         self.nof_off_diagonal_slots,
                         self.outcomes,
-                        self.level_invperms,
+                        self.slot_sources,
+                        self.outcome_maps,
                     )
                     for local_row_idx in range(wave_rows.size):
                         row_num = int(wave_rows[local_row_idx])
@@ -2014,6 +2237,7 @@ class PrepLP:
                     global_keys = _union_sorted_unique_uint64(global_keys, row_keys)
 
                 nof_caonical_global_events = int(global_keys.size)
+                self._assert_global_keys_canonical(global_keys)
                 if nof_caonical_global_events > np.iinfo(np.int32).max:
                     raise ValueError("Ring LP exceeds the current MOSEK Python binding variable limit.")
 
@@ -2224,7 +2448,6 @@ class PrepLP:
             raise ValueError("Ring LP exceeds the current MOSEK Python binding dimension limit.")
 
         optimizer_choice = _resolve_mosek_optimizer(optimizer)
-        tolerance = 1e-9
         rhs = np.ascontiguousarray(known_values, dtype=np.float64)
         if solve_mode == "feasibility":
             objective_vector = np.zeros(numvar, dtype=np.float64)
@@ -2362,18 +2585,22 @@ class PrepLP:
                     incompatible_fraction = np.nan
                     generalized_robustness = np.nan
                 elif solve_mode == "incompatible_fraction":
-                    success = bool(has_optimal_primal and optimized_mass >= known_mass - tolerance)
+                    gap = _relaxed_mass_gap(optimized_mass, known_mass, sense="upper") if has_optimal_primal else np.nan
+                    mass_tol = _relaxed_mass_tolerance(known_mass)
+                    success = bool(has_optimal_primal and gap <= mass_tol)
                     incompatible_fraction = (
-                        max(0.0, 1.0 - (optimized_mass / known_mass))
+                        max(0.0, gap / known_mass)
                         if has_optimal_primal
                         else np.nan
                     )
                     generalized_robustness = np.nan
                 else:
-                    success = bool(has_optimal_primal and optimized_mass <= known_mass + tolerance)
+                    gap = _relaxed_mass_gap(optimized_mass, known_mass, sense="lower") if has_optimal_primal else np.nan
+                    mass_tol = _relaxed_mass_tolerance(known_mass)
+                    success = bool(has_optimal_primal and gap <= mass_tol)
                     incompatible_fraction = np.nan
                     generalized_robustness = (
-                        max(0.0, (optimized_mass / known_mass) - 1.0)
+                        max(0.0, gap / known_mass)
                         if has_optimal_primal
                         else np.nan
                     )
@@ -2585,7 +2812,7 @@ if __name__ == "__main__":
 
     print(solution["status"])
     print(
-        f"Exact feasibility: {solution['success']}. "
+        f"Feasible within tolerance: {solution['success']}. "
         f"Incompatible fraction: {solution['incompatible_fraction']:.12g}"
     )
     if prep_nsi.output_path is not None:
