@@ -6,7 +6,7 @@ from unittest import mock
 
 import sympy as sp
 
-import inflation.applications.EJM_numba_test as ejm_numba_test
+import inflation.applications.EJM_5_test as ejm_5_test
 from inflation.applications.Final_algo_numba import PrepLP
 from inflation.progress_utils import make_tqdm, progress_stage
 
@@ -126,31 +126,44 @@ class TestProgressUtils(unittest.TestCase):
         prep = None
         prep_cached = None
         try:
-            with redirect_stdout(stdout_stream), redirect_stderr(stderr_stream):
-                prep = PrepLP(
-                    3,
-                    _UniformBinaryDistribution(),
-                    problem_name=cache_name,
-                    show_progress=True,
-                    auto_discover_symmetries=True,
-                    compress_rows_under_discovered_group=True,
-                    verbose_symmetry_discovery=True,
-                    verbose_cache=True,
-                )
-                _ = prep.global_keys
-                _ = prep.known_values
-                _ = prep.inflation_matrix
+            with mock.patch.dict("inflation.applications.Final_algo_numba.os.environ", {"SLURM_CPUS_PER_TASK": "2"}, clear=False):
+                with mock.patch("inflation.applications.Final_algo_numba.set_num_threads"):
+                    with redirect_stdout(stdout_stream), redirect_stderr(stderr_stream):
+                        prep = PrepLP(
+                            3,
+                            _UniformBinaryDistribution(),
+                            problem_name=cache_name,
+                            show_progress=True,
+                            auto_discover_symmetries=True,
+                            compress_rows_under_discovered_group=True,
+                            verbose_symmetry_discovery=True,
+                            verbose_cache=True,
+                        )
+                        _ = prep.global_keys
+                        _ = prep.known_values
+                        _ = prep.inflation_matrix
 
             stdout_output = stdout_stream.getvalue()
             stderr_output = stderr_stream.getvalue()
 
             self.assertIn("Canonicalizing marginals", stdout_output)
             self.assertIn("Computing marginal values...", stdout_output)
+            self.assertIn("Global extension plan:", stdout_output)
+            self.assertIn("usable_memory=", stdout_output)
+            self.assertIn("per_worker_raw_buffer=", stdout_output)
+            self.assertIn("active_wave_raw_buffers=", stdout_output)
+            self.assertIn("waves=", stdout_output)
             self.assertIn("Finding global extensions...", stdout_output)
-            self.assertIn("Finalizing sparse extension matrix...", stdout_output)
-            self.assertIn("Constraint matrix finalized:", stdout_output)
+            self.assertIn("Global extensions wave 1/", stdout_output)
+            self.assertIn("Global extensions wave 2/", stdout_output)
+            self.assertIn("rows_done=", stdout_output)
+            self.assertIn("Finalizing direct LP payload...", stdout_output)
+            self.assertIn("Exact final payload:", stdout_output)
+            self.assertIn("Direct LP payload finalized:", stdout_output)
             self.assertIn("Saving LP input cache to", stdout_output)
             self.assertIn("Saved LP constraints cache to", stdout_output)
+            self.assertNotIn("work_units=", stdout_output)
+            self.assertNotIn("chunk_entries=", stdout_output)
             self.assertNotIn("Discovering ring stabilizing symmetries", stdout_output)
             self.assertNotIn("Stabilizer subgroup summary", stdout_output)
             self.assertNotIn("Canonicalizing marginals", stderr_output)
@@ -195,11 +208,11 @@ class TestProgressUtils(unittest.TestCase):
             return fake_prep
 
         with redirect_stdout(stdout_stream), mock.patch.object(
-            ejm_numba_test,
+            ejm_5_test,
             "PrepLP",
             side_effect=fake_prep_factory,
         ):
-            ejm_numba_test.main(n=3)
+            ejm_5_test.main(n=3)
 
         output = stdout_stream.getvalue()
         expected_markers = [
