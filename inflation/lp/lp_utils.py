@@ -5,6 +5,7 @@ This file contains functions to interact with LP solvers.
 """
 
 import sys
+import threading
 from pathlib import Path
 import mosek
 import numpy as np
@@ -355,6 +356,7 @@ def solveLP_sparse(objective: coo_array = blank_coo_array,
 
     with mosek.Env() as env:
         with mosek.Task(env) as task:
+            log_printer = None
             # Set parameters for the solver depending on value type
             if solverparameters:
                 for param, val in solverparameters.items():
@@ -376,7 +378,8 @@ def solveLP_sparse(objective: coo_array = blank_coo_array,
                                  mosek.solveform.primal)
             if verbose > 0:
                 # Attach a log stream printer to the task
-                task.set_Stream(mosek.streamtype.log, streamprinter)
+                log_printer = make_streamprinter()
+                task.set_Stream(mosek.streamtype.log, log_printer)
                 task.putintparam(mosek.iparam.log_include_summary,
                                  mosek.onoffkey.on)
                 task.putintparam(mosek.iparam.log_storage, 1)
@@ -659,6 +662,8 @@ def solveLP_sparse(objective: coo_array = blank_coo_array,
             if verbose > 0:
                 print("\nSolving the problem...\n")
             trmcode = task.optimize()
+            if log_printer is not None:
+                log_printer.flush()
             if verbose > 1:
                 print("Solving took", format(perf_counter() - t0, ".4f"),
                       "seconds.")
@@ -738,16 +743,47 @@ def solveLP_sparse(objective: coo_array = blank_coo_array,
             }
 
 
+class _BufferedStreamPrinter:
+    """Line-buffered MOSEK stream callback to avoid partial-line interleaving."""
+
+    def __init__(self, stream=None):
+        self._stream = sys.stdout if stream is None else stream
+        self._buffer = ""
+        self._lock = threading.Lock()
+
+    def __call__(self, text: str) -> None:
+        if not text:
+            return
+        with self._lock:
+            self._buffer += str(text)
+            while True:
+                newline_pos = self._buffer.find("\n")
+                if newline_pos < 0:
+                    break
+                chunk = self._buffer[:newline_pos + 1]
+                self._stream.write(chunk)
+                self._buffer = self._buffer[newline_pos + 1:]
+            self._stream.flush()
+
+    def flush(self) -> None:
+        with self._lock:
+            if self._buffer:
+                self._stream.write(self._buffer)
+                self._buffer = ""
+            self._stream.flush()
+
+
+def make_streamprinter(stream=None):
+    """Create a line-buffered MOSEK stream callback for a specific stream."""
+    return _BufferedStreamPrinter(stream=stream)
+
+
+_default_streamprinter = make_streamprinter()
+
+
 def streamprinter(text: str) -> None:
-    """A stream printer to get output from Mosek.
-    
-    Parameters
-    ----------
-    text : str
-        Text to print.
-    """
-    sys.stdout.write(text)
-    sys.stdout.flush()
+    """Backward-compatible default MOSEK stream printer."""
+    _default_streamprinter(text)
 
 
 ###########################################################################

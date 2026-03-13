@@ -10,6 +10,7 @@ from contextlib import redirect_stdout
 
 from inflation.sdp.sdp_utils import solveSDP_MosekFUSION
 from inflation.lp.lp_utils import solveLP_sparse, to_sparse, convert_dicts, \
+    make_streamprinter, \
     solveLP
 
 simple_lp = {
@@ -448,6 +449,19 @@ class TestTools(unittest.TestCase):
 
 
 class TestSolverVerbosity(unittest.TestCase):
+    def test_make_streamprinter_buffers_partial_lines_until_flush(self):
+        stream = io.StringIO()
+        printer = make_streamprinter(stream)
+
+        printer("Basic solution ")
+        self.assertEqual(stream.getvalue(), "")
+
+        printer("summary\nSolution ")
+        self.assertEqual(stream.getvalue(), "Basic solution summary\n")
+
+        printer.flush()
+        self.assertEqual(stream.getvalue(), "Basic solution summary\nSolution ")
+
     def test_verbose_two_reports_preprocessing_without_debug_dump(self):
         stdout = io.StringIO()
         with tempfile.TemporaryDirectory() as tmpdir:
