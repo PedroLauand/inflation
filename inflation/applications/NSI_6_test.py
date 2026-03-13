@@ -38,12 +38,12 @@ def main(*, n: int = 6) -> None:
     )
 
     solution = prep.solve(
-        optimizer="interior_point",
+        optimizer="primal_simplex",
         verbose=2,
     )
     print(f"Solution status for n={n}: {solution['status']}")
     print(
-        f"Exact feasibility for n={n}: {solution['success']}. "
+        f"Feasible within tolerance for n={n}: {solution['success']}. "
         f"Incompatible fraction: {solution['incompatible_fraction']:.12g}"
     )
     if prep.output_path is not None:

@@ -1,7 +1,7 @@
 """
-EJM_5_test.py
+EJM_4_test.py
 --------------------------------------------------------------------
-Test the ring inflation LP pipeline for n=5, outcomes=4 using the
+Test the ring inflation LP pipeline for n=4, outcomes=4 using the
 EJM loop distribution.
 --------------------------------------------------------------------
 """
@@ -20,7 +20,7 @@ from inflation.distributions import EJMDistribution
 from inflation.applications.Final_algo_numba import PrepLP
 
 
-def main(*, n: int = 5) -> None:
+def main(*, n: int = 4) -> None:
     distribution = EJMDistribution()
     prep = PrepLP(
         n,

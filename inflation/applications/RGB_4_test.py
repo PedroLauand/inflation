@@ -1,8 +1,8 @@
 """
-EJM_5_test.py
+RGB_4_test.py
 --------------------------------------------------------------------
-Test the ring inflation LP pipeline for n=5, outcomes=4 using the
-EJM loop distribution.
+Test the ring inflation LP pipeline for n=4, outcomes=4 using the
+RGB loop distribution.
 --------------------------------------------------------------------
 """
 
@@ -16,16 +16,16 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from inflation.distributions import EJMDistribution
+from inflation.distributions import RGBDistribution
 from inflation.applications.Final_algo_numba import PrepLP
 
 
-def main(*, n: int = 5) -> None:
-    distribution = EJMDistribution()
+def main(*, n: int = 4) -> None:
+    distribution = RGBDistribution()
     prep = PrepLP(
         n,
         distribution,
-        problem_name=f"EJM_n={n}",
+        problem_name=f"RGB_n={n}",
         auto_discover_symmetries=True,
         compress_rows_under_discovered_group=True,
     )

@@ -1,8 +1,7 @@
 """
-EJM_5_test.py
+NSI_5_test.py
 --------------------------------------------------------------------
-Test the ring inflation LP pipeline for n=5, outcomes=4 using the
-EJM loop distribution.
+Test the NSI ring inflation LP pipeline for n=5.
 --------------------------------------------------------------------
 """
 
@@ -11,21 +10,22 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
-# Ensure repo root is on sys.path so "import inflation" works when running directly.
+# Ensure repo root is on sys.path so "import inflation" works when running this file directly.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from inflation.distributions import EJMDistribution
+from inflation.distributions import NSIPRDistribution
 from inflation.applications.Final_algo_numba import PrepLP
 
 
 def main(*, n: int = 5) -> None:
-    distribution = EJMDistribution()
+    print(f"\n\n New problem: exploring NSI with inflation level {n}.")
+    distribution = NSIPRDistribution()
     prep = PrepLP(
         n,
         distribution,
-        problem_name=f"EJM_n={n}",
+        problem_name=f"NSI_n={n}",
         auto_discover_symmetries=True,
         compress_rows_under_discovered_group=True,
     )

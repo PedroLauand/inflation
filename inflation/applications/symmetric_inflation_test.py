@@ -172,6 +172,6 @@ if __name__ == "__main__":
     )
     print(solution["status"])
     print(
-        f"Exact feasibility: {solution['success']}. "
+        f"Feasible within tolerance: {solution['success']}. "
         f"Incompatible fraction: {solution['incompatible_fraction']:.12g}"
     )

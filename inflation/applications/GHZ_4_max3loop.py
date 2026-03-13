@@ -1,13 +1,11 @@
 """
-GHZ_4_debug.py
+GHZ_4_max3loop.py
 --------------------------------------------------------------------
-Debug the GHZ ring pipeline at n=4 with the closest currently-available
-filter to:
-  "keep loops of length exactly 3, or lines of length 2 or 1".
+Explore the GHZ ring pipeline at n=4 with a filter that keeps any
+disjoint union of loops of length at most 3.
 
 In this branch, PrepLP only generates disjoint unions of cycles, so open
-line marginals are not represented. As a result, the effective filter in
-this script is "keep only single 3-cycles".
+line marginals are not represented.
 --------------------------------------------------------------------
 """
 
@@ -21,23 +19,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from inflation.applications.Final_algo_numba import (
-    PrepLP,
-    _cycles_from_J,
-    _perm_from_marginal,
-)
+from inflation.applications.Final_algo_numba import PrepLP, keep_up_to_three_cycles
 from inflation.distributions import GHZDistribution
-
-
-def keep_three_cycles_or_short_lines_if_available(marginal) -> bool:
-    """
-    Keep only marginals that are exactly one 3-cycle.
-
-    Open line marginals of length 1 or 2 are not generated in the current
-    ring pipeline, so they cannot be admitted here via marginal_filter_fn.
-    """
-    cycles = _cycles_from_J(_perm_from_marginal(marginal))
-    return len(cycles) == 1 and len(cycles[0]) == 3
 
 
 def main(*, n: int = 4) -> None:
@@ -45,8 +28,8 @@ def main(*, n: int = 4) -> None:
     prep = PrepLP(
         n,
         distribution,
-        problem_name=None,
-        marginal_filter_fn=keep_three_cycles_or_short_lines_if_available,
+        problem_name=f"GHZ_n={n}_max3loop",
+        marginal_filter_fn=keep_up_to_three_cycles,
         auto_discover_symmetries=True,
         compress_rows_under_discovered_group=True,
     )
@@ -55,14 +38,13 @@ def main(*, n: int = 4) -> None:
         "Open line marginals of length 2 or 1 are not represented in this branch."
     )
     print(
-        "A loop of length 3 does not automatically imply that lines of length 2 or 1 "
-        "are generated or included. This debug run therefore keeps only single 3-cycles "
-        "via marginal_filter_fn, with inflation level still fixed at 4."
+        "This max-3-loop run keeps any disjoint union of loops of length at most 3, "
+        "with inflation level still fixed at 4."
     )
-    print(f"PrepLP initialized for GHZ debug n={n}; materializing LP inputs before Mosek.")
+    print(f"PrepLP initialized for GHZ max3loop n={n}; materializing LP inputs before Mosek.")
     _ = prep.global_keys
     print(
-        f"Filtered LP inputs ready for GHZ debug n={n}: "
+        f"Filtered LP inputs ready for GHZ max3loop n={n}: "
         f"base_rows={prep.base_nof_marginals}, rows={prep.nof_lp_constraints}, cols={prep.nof_lp_vars}. "
         "Starting relaxed incompatibility solve."
     )
@@ -71,9 +53,9 @@ def main(*, n: int = 4) -> None:
         optimizer="free_simplex",
         verbose=2,
     )
-    print(f"Relaxed LP status for GHZ debug n={n}: {relaxed_solution['status']}")
+    print(f"Relaxed LP status for GHZ max3loop n={n}: {relaxed_solution['status']}")
     print(
-        f"Exact feasibility for GHZ debug n={n}: {relaxed_solution['success']}. "
+        f"Feasible within tolerance for GHZ max3loop n={n}: {relaxed_solution['success']}. "
         f"Incompatible fraction: {relaxed_solution['incompatible_fraction']:.12g}"
     )
     print(
@@ -82,13 +64,16 @@ def main(*, n: int = 4) -> None:
     )
     if relaxed_solution["success"]:
         print(
-            "With only single 3-cycles retained, the filtered GHZ n=4 problem is compatible "
-            "in the current ring LP."
+            "With only disjoint unions of loops of length at most 3 retained, "
+            "the filtered GHZ n=4 problem is COMPATIBLE in the current ring LP."
         )
     else:
-        print("The filtered GHZ n=4 problem is still detected as incompatible.")
+        print("The filtered GHZ n=4 problem is detected as INCOMPATIBLE.")
         print("Dual certificate from the relaxed LP:")
         prep.print_certificate(relaxed_solution)
+    if prep.output_path is not None:
+        prep.save_solution(relaxed_solution)
+        print(f"Saved relaxed LP solution archive to {prep.output_path}")
 
 
 if __name__ == "__main__":

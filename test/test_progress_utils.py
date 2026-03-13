@@ -221,12 +221,12 @@ class TestProgressUtils(unittest.TestCase):
             "LP inputs ready for n=3: rows=7, cols=11. Starting Mosek setup.",
             "Starting pre-processing for the LP solver...",
             "Optimizer started.",
-            "Exact feasibility for n=3: True. Incompatible fraction: 0",
+            "Feasible within tolerance for n=3: True. Incompatible fraction: 0",
         ]
         positions = [output.index(marker) for marker in expected_markers]
         self.assertEqual(positions, sorted(positions))
         self.assertEqual(fake_prep.solve_calls[0]["verbose"], 2)
-        self.assertEqual(fake_prep.solve_calls[0]["optimizer"], "interior_point")
+        self.assertEqual(fake_prep.solve_calls[0]["optimizer"], "primal_simplex")
 
 
 if __name__ == "__main__":

@@ -1,8 +1,8 @@
 """
-GHZ_4_test.py
+EJM_4_max3loop.py
 --------------------------------------------------------------------
-Test the specified binary GHZ ring distribution at n=4 and print the
-direct row-basis certificate returned by the relaxed LP.
+Explore the EJM ring pipeline at n=4 with a filter that keeps any
+disjoint union of loops of length at most 3.
 --------------------------------------------------------------------
 """
 
@@ -16,26 +16,29 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from inflation.applications.Final_algo_numba import (
-    PrepLP,
-)
-from inflation.distributions import GHZDistribution
+from inflation.applications.Final_algo_numba import PrepLP, keep_up_to_three_cycles
+from inflation.distributions import EJMDistribution
 
 
 def main(*, n: int = 4) -> None:
-    distribution = GHZDistribution()
+    distribution = EJMDistribution()
     prep = PrepLP(
         n,
         distribution,
-        problem_name=f"GHZ_n={n}",
+        problem_name=f"EJM_n={n}_max3loop",
+        marginal_filter_fn=keep_up_to_three_cycles,
         auto_discover_symmetries=True,
         compress_rows_under_discovered_group=True,
     )
-    print(f"PrepLP initialized for GHZ n={n}; materializing LP inputs before Mosek.")
+    print(
+        "This max-3-loop run keeps any disjoint union of loops of length at most 3, "
+        "with inflation level fixed at 4."
+    )
+    print(f"PrepLP initialized for EJM max3loop n={n}; materializing LP inputs before Mosek.")
     _ = prep.global_keys
     print(
-        f"LP inputs ready for GHZ n={n}: "
-        f"rows={prep.nof_lp_constraints}, cols={prep.nof_lp_vars}. "
+        f"Filtered LP inputs ready for EJM max3loop n={n}: "
+        f"base_rows={prep.base_nof_marginals}, rows={prep.nof_lp_constraints}, cols={prep.nof_lp_vars}. "
         "Starting relaxed incompatibility solve."
     )
 
@@ -43,9 +46,9 @@ def main(*, n: int = 4) -> None:
         optimizer="free_simplex",
         verbose=2,
     )
-    print(f"Relaxed LP status for GHZ n={n}: {relaxed_solution['status']}")
+    print(f"Relaxed LP status for EJM max3loop n={n}: {relaxed_solution['status']}")
     print(
-        f"Feasible within tolerance for GHZ n={n}: {relaxed_solution['success']}. "
+        f"Feasible within tolerance for EJM max3loop n={n}: {relaxed_solution['success']}. "
         f"Incompatible fraction: {relaxed_solution['incompatible_fraction']:.12g}"
     )
     print(
@@ -53,15 +56,11 @@ def main(*, n: int = 4) -> None:
         f"Optimized compatible mass: {relaxed_solution['optimized_mass']:.12g}"
     )
     if relaxed_solution["success"]:
-        print(
-            "The specified all-equal GHZ distribution is feasible at n=4 in the current ring LP, "
-            "so the relaxed LP does not provide an incompatibility certificate."
-        )
+        print("The filtered EJM n=4 problem is COMPATIBLE.")
     else:
-        print("GHZ is detected as incompatible by the relaxed LP.")
+        print("The filtered EJM n=4 problem is detected as INCOMPATIBLE.")
         print("Dual certificate from the relaxed LP:")
         prep.print_certificate(relaxed_solution)
-
     if prep.output_path is not None:
         prep.save_solution(relaxed_solution)
         print(f"Saved relaxed LP solution archive to {prep.output_path}")
