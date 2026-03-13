@@ -1,21 +1,29 @@
 import tempfile
 import uuid
 import unittest
+import io
 from pathlib import Path
+from contextlib import redirect_stdout
 from unittest import mock
 
 import numpy as np
 import sympy as sp
 from scipy.sparse import coo_array, csr_array
 
+import inflation.applications.Final_algo_numba as final_algo_numba
 from inflation.applications.Final_algo_numba import (
     CACHE_FORMAT_VERSION,
     PrepLP,
+    _count_unique_global_extension_keys_per_row,
+    _detect_worker_count,
+    _detect_total_memory_budget_bytes,
+    _fill_unique_global_extension_keys_per_row,
     read_prep_lp_solution,
     _offdiag_slot_index,
+    _union_sorted_unique_uint64,
 )
 from inflation.applications.Group_utils import canonical_leximin_coset_chain_uint64
-from inflation.distributions import NSIPRDistribution
+from inflation.distributions import GHZDistribution, NSIPRDistribution
 from inflation.lp.lp_utils import solveLP_sparse
 
 
@@ -82,7 +90,11 @@ def _reference_global_keys_and_matrix(prep: PrepLP) -> tuple[np.ndarray, np.ndar
                 global_keys.append(key)
                 dense = np.pad(dense, ((0, 0), (0, 1)))
             dense[row_num, column] += 1.0
-    return np.asarray(global_keys, dtype=np.uint64), dense
+    ordered_keys = np.asarray(global_keys, dtype=np.uint64)
+    order = np.argsort(ordered_keys, kind="stable")
+    sorted_keys = ordered_keys[order]
+    sorted_dense = dense[:, order]
+    return sorted_keys, sorted_dense
 
 
 def _legacy_feasibility_args(prep: PrepLP) -> dict:
@@ -150,6 +162,175 @@ class TestClusterOptimizedRing(unittest.TestCase):
                 np.testing.assert_array_equal(prep.global_keys, expected_keys)
                 np.testing.assert_allclose(prep.inflation_matrix.toarray(), expected_dense)
 
+    def test_row_labels_use_grouped_cycle_notation(self):
+        prep = self._make_prep(4, distribution=GHZDistribution())
+        self.assertTrue(any("[{" in label for label in prep.row_labels.tolist()))
+        self.assertFalse(any("A^{" in label for label in prep.row_labels.tolist()))
+
+    def test_print_certificate_explains_incompatible_fraction_threshold(self):
+        prep = self._make_prep(4, distribution=GHZDistribution())
+        solution = prep.solve(verbose=0)
+        self.assertEqual(prep.solve_target, "incompatible_fraction")
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            prep.print_certificate(solution, max_terms=1)
+        output = stdout.getvalue()
+        self.assertIn("normalized certificate value on knowns:", output)
+        self.assertIn("certificate must be at least 0 for incompatible fraction 0", output)
+        self.assertIn("violation / negativity:", output)
+        self.assertIn("negativity certifies incompatible fraction >=", output)
+        self.assertIn("normalized affine certificate:", output)
+        self.assertIn("    - 1", output)
+        self.assertNotIn("[   0]", output)
+
+    def test_print_certificate_falls_back_to_prep_solve_target(self):
+        prep = self._make_prep(4, distribution=GHZDistribution())
+        solution = prep.solve(verbose=0)
+        solution_without_mode = dict(solution)
+        solution_without_mode.pop("mode", None)
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            prep.print_certificate(solution_without_mode, max_terms=1)
+        output = stdout.getvalue()
+        self.assertIn("certificate must be at least 0 for incompatible fraction 0", output)
+
+    def test_detect_worker_count_prefers_slurm_then_numba_then_fallback(self):
+        with mock.patch.dict(final_algo_numba.os.environ, {"SLURM_CPUS_PER_TASK": "5"}, clear=True):
+            with mock.patch.object(final_algo_numba, "get_num_threads", return_value=17):
+                self.assertEqual(_detect_worker_count(), 5)
+
+        with mock.patch.dict(final_algo_numba.os.environ, {}, clear=True):
+            with mock.patch.object(final_algo_numba, "get_num_threads", return_value=6):
+                self.assertEqual(_detect_worker_count(), 6)
+
+        with mock.patch.dict(final_algo_numba.os.environ, {}, clear=True):
+            with mock.patch.object(final_algo_numba, "get_num_threads", side_effect=RuntimeError("boom")):
+                with mock.patch.object(final_algo_numba.os, "sched_getaffinity", new=None, create=True):
+                    with mock.patch.object(final_algo_numba.os, "cpu_count", return_value=None):
+                        self.assertEqual(_detect_worker_count(), 8)
+
+    def test_worker_count_aligns_numba_threads_only_for_slurm(self):
+        with mock.patch.dict(final_algo_numba.os.environ, {"SLURM_CPUS_PER_TASK": "4"}, clear=True):
+            with mock.patch.object(final_algo_numba, "set_num_threads") as set_threads:
+                prep = self._make_prep(3)
+                self.assertEqual(prep.worker_count, 4)
+                set_threads.assert_called_once_with(4)
+
+        with mock.patch.dict(final_algo_numba.os.environ, {}, clear=True):
+            with mock.patch.object(final_algo_numba, "set_num_threads") as set_threads:
+                with mock.patch.object(final_algo_numba, "get_num_threads", return_value=3):
+                    prep = self._make_prep(3)
+                    self.assertEqual(prep.worker_count, 3)
+                set_threads.assert_not_called()
+
+    def test_detect_total_memory_budget_prefers_slurm_then_local(self):
+        with mock.patch.dict(final_algo_numba.os.environ, {"SLURM_MEM_PER_NODE": "200000"}, clear=True):
+            self.assertEqual(_detect_total_memory_budget_bytes(16), 200000 * 1024 ** 2)
+
+        with mock.patch.dict(final_algo_numba.os.environ, {"SLURM_MEM_PER_CPU": "125G"}, clear=True):
+            self.assertEqual(_detect_total_memory_budget_bytes(4), 125 * 4 * 1024 ** 3)
+
+        with mock.patch.dict(final_algo_numba.os.environ, {}, clear=True):
+            with mock.patch.object(final_algo_numba, "_detect_local_memory_bytes", return_value=99):
+                self.assertEqual(_detect_total_memory_budget_bytes(8), 99)
+
+    def test_two_pass_row_pipeline_emits_exact_sorted_unique_counts(self):
+        prep = self._make_prep(4, distribution=NSIPRDistribution())
+        (
+            _row_entry_ptr,
+            row_fixed_ptr,
+            fixed_slots_flat,
+            fixed_vals_flat,
+            row_remaining_ptr,
+            remaining_slots_flat,
+        ) = prep._row_extension_descriptor_payload
+        wave_rows = np.arange(min(4, prep.nof_marginals), dtype=np.int64)
+        row_unique_nnz = np.empty(wave_rows.size, dtype=np.int64)
+        _count_unique_global_extension_keys_per_row(
+            row_unique_nnz,
+            wave_rows,
+            prep.row_extension_counts.astype(np.int64, copy=False),
+            row_fixed_ptr,
+            fixed_slots_flat,
+            fixed_vals_flat,
+            row_remaining_ptr,
+            remaining_slots_flat,
+            prep.nof_off_diagonal_slots,
+            prep.outcomes,
+            prep.level_invperms,
+        )
+        output_ptr = np.empty(wave_rows.size + 1, dtype=np.int64)
+        output_ptr[0] = 0
+        output_ptr[1:] = np.cumsum(row_unique_nnz, dtype=np.int64)
+        flat_keys = np.empty(int(output_ptr[-1]), dtype=np.uint64)
+        flat_counts = np.empty(int(output_ptr[-1]), dtype=np.uint64)
+        _fill_unique_global_extension_keys_per_row(
+            flat_keys,
+            flat_counts,
+            output_ptr,
+            wave_rows,
+            prep.row_extension_counts.astype(np.int64, copy=False),
+            row_fixed_ptr,
+            fixed_slots_flat,
+            fixed_vals_flat,
+            row_remaining_ptr,
+            remaining_slots_flat,
+            prep.nof_off_diagonal_slots,
+            prep.outcomes,
+            prep.level_invperms,
+        )
+        for local_row, row_num in enumerate(wave_rows.tolist()):
+            start = int(output_ptr[local_row])
+            stop = int(output_ptr[local_row + 1])
+            row_keys = flat_keys[start:stop]
+            row_counts = flat_counts[start:stop]
+            self.assertEqual(stop - start, int(row_unique_nnz[local_row]))
+            self.assertTrue(np.all(row_counts > 0))
+            if row_keys.size > 1:
+                self.assertTrue(np.all(row_keys[1:] > row_keys[:-1]))
+            self.assertEqual(int(row_counts.sum()), int(prep.row_extension_counts[row_num]))
+
+    def test_row_archives_are_written_once_per_row_and_preserve_row_totals(self):
+        prep = self._make_prep(4, distribution=NSIPRDistribution())
+        archived_rows: list[tuple[int, np.ndarray, np.ndarray]] = []
+        original_write = final_algo_numba._write_row_counts_archive
+
+        def capture_write(path, keys, counts):
+            row_num = int(Path(path).stem.split("_")[1])
+            archived_rows.append(
+                (
+                    row_num,
+                    np.asarray(keys, dtype=np.uint64).copy(),
+                    np.asarray(counts, dtype=np.uint64).copy(),
+                )
+            )
+            return original_write(path, keys, counts)
+
+        with mock.patch.object(final_algo_numba, "_write_row_counts_archive", side_effect=capture_write):
+            _ = prep.global_keys
+
+        self.assertEqual(len(archived_rows), prep.nof_marginals)
+        self.assertEqual(sorted(row_num for row_num, _keys, _counts in archived_rows), list(range(prep.nof_marginals)))
+        for row_num, keys, counts in archived_rows:
+            self.assertEqual(keys.size, counts.size)
+            self.assertTrue(np.all(counts > 0))
+            if keys.size > 1:
+                self.assertTrue(np.all(keys[1:] > keys[:-1]))
+            self.assertEqual(int(counts.sum()), int(prep.row_extension_counts[row_num]))
+
+    def test_sorted_key_union_helper(self):
+        union = _union_sorted_unique_uint64(
+            np.asarray([1, 4, 8], dtype=np.uint64),
+            np.asarray([1, 3, 8, 10], dtype=np.uint64),
+        )
+        np.testing.assert_array_equal(union, np.asarray([1, 3, 4, 8, 10], dtype=np.uint64))
+
+    def test_largest_row_buffer_budget_violation_fails_fast(self):
+        prep = self._make_prep(3)
+        with mock.patch.object(final_algo_numba, "_detect_total_memory_budget_bytes", return_value=1):
+            with self.assertRaisesRegex(MemoryError, "largest marginal row requires a raw uint64 key buffer"):
+                _ = prep.global_keys
+
     def test_direct_matrix_public_api_shape(self):
         prep = self._make_prep(3)
         self.assertEqual(prep.inflation_matrix.shape, (prep.nof_marginals, prep.nof_lp_vars))
@@ -180,6 +361,7 @@ class TestClusterOptimizedRing(unittest.TestCase):
             self.assertTrue(prep.cache_path.exists())
 
             cached = self._make_prep(3, problem_name=cache_name)
+            self.assertIsNone(cached._cached_inflation_matrix)
             np.testing.assert_array_equal(cached.global_keys, prep.global_keys)
             np.testing.assert_allclose(cached.inflation_matrix.toarray(), prep.inflation_matrix.toarray())
             np.testing.assert_array_equal(cached.global_keys, prep.global_keys)
@@ -210,9 +392,10 @@ class TestClusterOptimizedRing(unittest.TestCase):
 
     def test_prep_solve_feasibility_matches_generic_padded_formulation(self):
         prep = self._make_prep(3)
-        self.assertIsInstance(prep.inflation_matrix, csr_array)
-        self.assertEqual(prep.inflation_matrix.indptr.dtype, np.int64)
-        self.assertEqual(prep.inflation_matrix.data.dtype, np.float64)
+        matrix = prep.inflation_matrix
+        self.assertIsInstance(matrix, csr_array)
+        self.assertEqual(matrix.indptr.dtype, np.int64)
+        self.assertEqual(matrix.data.dtype, np.float64)
 
         generic_solution = solveLP_sparse(**_legacy_feasibility_args(prep))
 
@@ -232,6 +415,12 @@ class TestClusterOptimizedRing(unittest.TestCase):
             float(generic_solution["primal_value"]),
             places=9,
         )
+
+        payload_only_prep = self._make_prep(3)
+        _ = payload_only_prep.global_keys
+        self.assertIsNone(payload_only_prep._cached_inflation_matrix)
+        _ = payload_only_prep.solve(mode="feasibility", verbose=0)
+        self.assertIsNone(payload_only_prep._cached_inflation_matrix)
 
     def test_default_mode_reports_zero_incompatible_fraction_on_nsi_n4(self):
         prep = self._make_prep(4, distribution=NSIPRDistribution())
@@ -260,6 +449,20 @@ class TestClusterOptimizedRing(unittest.TestCase):
         self.assertFalse(generalized_robustness_solution["success"])
         self.assertGreater(float(generalized_robustness_solution["generalized_robustness"]), 0.0)
 
+    def test_ghz_n3_all_equal_distribution_is_feasible(self):
+        prep = self._make_prep(3, distribution=GHZDistribution())
+
+        relaxed_solution = prep.solve(mode="incompatible_fraction", verbose=0)
+        feasibility_solution = prep.solve(mode="feasibility", verbose=0)
+
+        self.assertTrue(relaxed_solution["solver_success"])
+        self.assertTrue(relaxed_solution["success"])
+        self.assertAlmostEqual(float(relaxed_solution["incompatible_fraction"]), 0.0, places=9)
+        self.assertTrue(feasibility_solution["solver_success"])
+        self.assertTrue(feasibility_solution["success"])
+        self.assertEqual(feasibility_solution["status"], "optimal")
+        self.assertEqual(feasibility_solution["sparse_certificate"].nnz, 0)
+
     def test_solution_roundtrip_preserves_direct_basis_metadata(self):
         prep = self._make_prep(4, distribution=NSIPRDistribution())
         solution = prep.solve(verbose=0)
@@ -282,6 +485,14 @@ class TestClusterOptimizedRing(unittest.TestCase):
             solution["incompatible_fraction"],
             places=12,
         )
+
+    def test_inflation_matrix_is_reconstructed_lazily_from_payload(self):
+        prep = self._make_prep(4)
+        _ = prep.global_keys
+        self.assertIsNone(prep._cached_inflation_matrix)
+        matrix = prep.inflation_matrix
+        self.assertIsInstance(matrix, csr_array)
+        self.assertIs(prep._cached_inflation_matrix, matrix)
 
     def test_prep_solve_rejects_unknown_optimizer_name(self):
         prep = self._make_prep(3)

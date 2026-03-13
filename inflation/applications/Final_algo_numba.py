@@ -13,14 +13,16 @@ from __future__ import annotations
 from collections import Counter
 from functools import cached_property
 from itertools import combinations, permutations, product
+import os
 from pathlib import Path
+import tempfile
 from time import perf_counter
 from typing import Dict, Iterable, Iterator, List, Sequence, Tuple
 import sys
 
 import numpy as np
 import sympy as sp
-from numba import njit, prange
+from numba import get_num_threads, njit, prange, set_num_threads
 from numba.typed import List as NumbaList
 from scipy.sparse import coo_array, csr_array
 from inflation.progress_utils import make_tqdm as tqdm, progress_stage
@@ -41,7 +43,7 @@ from inflation.applications.ring_utils import build_off_diagonal_ring_problem
 from inflation.distributions.protocols import RingDistributionProtocol
 from inflation.symmetry_utils import discovery_symmetries_from_predicate
 
-CACHE_FORMAT_VERSION = np.int64(6)
+CACHE_FORMAT_VERSION = np.int64(7)
 
 
 def ring_problem(inflation_level: int, distribution: RingDistributionProtocol) -> InflationProblem:
@@ -150,9 +152,230 @@ def _average_orbit_label(labels: Sequence[str]) -> str:
     return f"({' + '.join(weighted_terms)})/{len(labels)}"
 
 
-@njit(cache=True, parallel=True, fastmath=True)
-def _fill_global_extension_keys_parallel(
-    row_entry_ptr: np.ndarray,
+def _sum_orbit_label(labels: Sequence[str]) -> str:
+    """Render an orbit as a summed label without averaging by orbit size."""
+    if len(labels) == 1:
+        return labels[0]
+    counts = Counter(labels)
+    weighted_terms = []
+    for label in sorted(counts):
+        mult = counts[label]
+        if mult == 1:
+            weighted_terms.append(label)
+        else:
+            weighted_terms.append(f"{mult}*{label}")
+    return f"({' + '.join(weighted_terms)})"
+
+
+def _format_marginal_display_label(marginal: List[List[int]]) -> str:
+    """Format a marginal as grouped cycle blocks instead of raw operator names."""
+    J = _perm_from_marginal(marginal)
+    cycles = _cycles_from_J(J)
+    by_i = {int(row[1]): row for row in marginal}
+    cycle_blocks: List[str] = []
+    for cyc in cycles:
+        pair_terms: List[str] = []
+        outcome_terms: List[str] = []
+        for i in cyc:
+            row = by_i[int(i)]
+            pair_terms.append(f"{{{int(row[1])},{int(row[2])}}}")
+            outcome_terms.append(str(int(row[4])))
+        cycle_blocks.append("[" + ",".join(pair_terms) + f" = {','.join(outcome_terms)}]")
+    return " ".join(cycle_blocks)
+
+
+def _parse_positive_int(value) -> int | None:
+    """Parse a positive integer from an environment-style value."""
+    if value is None:
+        return None
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _detect_worker_count() -> int:
+    """Detect the usable worker count, preferring SLURM task CPU allocation."""
+    slurm_workers = _parse_positive_int(os.environ.get("SLURM_CPUS_PER_TASK"))
+    if slurm_workers is not None:
+        return slurm_workers
+    try:
+        numba_workers = int(get_num_threads())
+    except Exception:
+        numba_workers = None
+    if numba_workers is not None and numba_workers > 0:
+        return numba_workers
+    sched_getaffinity = getattr(os, "sched_getaffinity", None)
+    if sched_getaffinity is not None:
+        try:
+            affinity_workers = len(sched_getaffinity(0))
+        except OSError:
+            affinity_workers = 0
+        if affinity_workers > 0:
+            return affinity_workers
+    cpu_count = os.cpu_count() or 0
+    return int(cpu_count) if cpu_count > 0 else 8
+
+
+def _align_numba_threads_to_slurm() -> int | None:
+    """Align Numba's thread pool with SLURM when an explicit task CPU count is set."""
+    slurm_workers = _parse_positive_int(os.environ.get("SLURM_CPUS_PER_TASK"))
+    if slurm_workers is None:
+        return None
+    set_num_threads(slurm_workers)
+    return slurm_workers
+
+
+def _build_row_batches(row_entry_ptr: np.ndarray, batch_count: int) -> np.ndarray:
+    """Split contiguous rows into entry-balanced batches."""
+    nof_rows = max(0, int(row_entry_ptr.size) - 1)
+    if nof_rows == 0:
+        return np.asarray([0, 0], dtype=np.int64)
+    batches = max(1, min(int(batch_count), nof_rows))
+    boundaries = np.empty(batches + 1, dtype=np.int64)
+    boundaries[0] = 0
+    boundaries[-1] = nof_rows
+    total_entries = int(row_entry_ptr[-1])
+    for batch_idx in range(1, batches):
+        target = (total_entries * batch_idx) / batches
+        candidate = int(np.searchsorted(row_entry_ptr, target, side="left"))
+        min_allowed = int(boundaries[batch_idx - 1] + 1)
+        max_allowed = nof_rows - (batches - batch_idx)
+        if candidate < min_allowed:
+            candidate = min_allowed
+        elif candidate > max_allowed:
+            candidate = max_allowed
+        boundaries[batch_idx] = candidate
+    return boundaries
+
+
+def _parse_memory_bytes(value, *, default_unit: str = "mib") -> int | None:
+    """Parse a SLURM-style memory specification into bytes."""
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    split_at = len(text)
+    for idx, ch in enumerate(text):
+        if not (ch.isdigit() or ch == "."):
+            split_at = idx
+            break
+    number_text = text[:split_at]
+    suffix = text[split_at:].strip()
+    try:
+        number = float(number_text)
+    except ValueError:
+        return None
+    if number <= 0:
+        return None
+    unit_map = {
+        "": {
+            "bytes": 1,
+            "mib": 1024 ** 2,
+            "gib": 1024 ** 3,
+        }.get(default_unit, 1),
+        "b": 1,
+        "k": 1024,
+        "kb": 1024,
+        "kib": 1024,
+        "m": 1024 ** 2,
+        "mb": 1024 ** 2,
+        "mib": 1024 ** 2,
+        "g": 1024 ** 3,
+        "gb": 1024 ** 3,
+        "gib": 1024 ** 3,
+        "t": 1024 ** 4,
+        "tb": 1024 ** 4,
+        "tib": 1024 ** 4,
+    }
+    multiplier = unit_map.get(suffix)
+    if multiplier is None:
+        return None
+    return int(number * multiplier)
+
+
+def _detect_local_memory_bytes() -> int:
+    """Best-effort local physical-memory detection with a conservative fallback."""
+    if hasattr(os, "sysconf"):
+        try:
+            page_size = int(os.sysconf("SC_PAGE_SIZE"))
+            phys_pages = int(os.sysconf("SC_PHYS_PAGES"))
+            if page_size > 0 and phys_pages > 0:
+                return page_size * phys_pages
+        except (AttributeError, OSError, ValueError):
+            pass
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            class _MemoryStatusEx(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_uint32),
+                    ("dwMemoryLoad", ctypes.c_uint32),
+                    ("ullTotalPhys", ctypes.c_uint64),
+                    ("ullAvailPhys", ctypes.c_uint64),
+                    ("ullTotalPageFile", ctypes.c_uint64),
+                    ("ullAvailPageFile", ctypes.c_uint64),
+                    ("ullTotalVirtual", ctypes.c_uint64),
+                    ("ullAvailVirtual", ctypes.c_uint64),
+                    ("ullAvailExtendedVirtual", ctypes.c_uint64),
+                ]
+
+            status = _MemoryStatusEx()
+            status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return int(status.ullTotalPhys)
+        except Exception:
+            pass
+    return 16 * 1024 ** 3
+
+
+def _detect_total_memory_budget_bytes(worker_count: int) -> int:
+    """Detect total memory budget, preferring explicit SLURM limits."""
+    slurm_node_mem = _parse_memory_bytes(os.environ.get("SLURM_MEM_PER_NODE"), default_unit="mib")
+    if slurm_node_mem is not None:
+        return slurm_node_mem
+    slurm_mem_per_cpu = _parse_memory_bytes(os.environ.get("SLURM_MEM_PER_CPU"), default_unit="mib")
+    if slurm_mem_per_cpu is not None:
+        return slurm_mem_per_cpu * max(1, int(worker_count))
+    return _detect_local_memory_bytes()
+
+
+def _detect_scratch_root() -> Path:
+    """Choose a local scratch root for temporary streaming-build artifacts."""
+    slurm_tmpdir = os.environ.get("SLURM_TMPDIR")
+    if slurm_tmpdir:
+        return Path(slurm_tmpdir)
+    return Path(__file__).resolve().parent / "scratch"
+
+
+def _estimate_exact_solver_payload_bytes(nof_cols: int, nnz: int) -> int:
+    """Exact bytes for the persisted direct LP payload and canonical key array."""
+    return (
+        8 * int(nof_cols) +   # global_keys
+        16 * int(nof_cols) +  # aptrb + aptre
+        4 * int(nnz) +        # asub
+        8 * int(nnz)          # aval
+    )
+
+
+def _slot_index_dtype(nof_slots: int):
+    """Choose the smallest safe dtype for off-diagonal slot indices."""
+    if nof_slots <= np.iinfo(np.uint8).max:
+        return np.uint8
+    if nof_slots <= np.iinfo(np.uint16).max:
+        return np.uint16
+    if nof_slots <= np.iinfo(np.uint32).max:
+        return np.uint32
+    return np.uint64
+
+
+@njit(cache=True, fastmath=True)
+def _fill_sorted_global_extension_keys_for_row(
+    raw_keys: np.ndarray,
+    row_num: int,
     row_fixed_ptr: np.ndarray,
     fixed_slots_flat: np.ndarray,
     fixed_vals_flat: np.ndarray,
@@ -161,34 +384,221 @@ def _fill_global_extension_keys_parallel(
     nof_off_diagonal_slots: int,
     outcomes: int,
     level_invperms: NumbaList,
-) -> np.ndarray:
-    """Enumerate canonical uint64 global-event keys for each row in parallel."""
-    nof_rows = row_entry_ptr.size - 1
-    total_entries = int(row_entry_ptr[-1])
-    all_keys = np.empty(total_entries, dtype=np.uint64)
-    for row_num in prange(nof_rows):
-        evt = np.zeros(nof_off_diagonal_slots, dtype=np.uint8)
-        fixed_start = int(row_fixed_ptr[row_num])
-        fixed_end = int(row_fixed_ptr[row_num + 1])
-        for pos in range(fixed_start, fixed_end):
-            evt[fixed_slots_flat[pos]] = fixed_vals_flat[pos]
-        remaining_start = int(row_remaining_ptr[row_num])
-        remaining_end = int(row_remaining_ptr[row_num + 1])
-        remaining_size = remaining_end - remaining_start
-        entry_start = int(row_entry_ptr[row_num])
-        entry_end = int(row_entry_ptr[row_num + 1])
-        for offset in range(entry_end - entry_start):
-            tmp = offset
-            for rem_pos in range(remaining_size - 1, -1, -1):
-                idx = remaining_slots_flat[remaining_start + rem_pos]
-                evt[idx] = tmp % outcomes
-                tmp //= outcomes
-            all_keys[entry_start + offset] = canonical_leximin_coset_chain_uint64(
-                evt,
-                outcomes,
-                level_invperms,
-            )
-    return all_keys
+) -> None:
+    """Enumerate and sort one row's canonical uint64 global-extension keys."""
+    evt = np.zeros(nof_off_diagonal_slots, dtype=np.uint8)
+    fixed_start = int(row_fixed_ptr[row_num])
+    fixed_end = int(row_fixed_ptr[row_num + 1])
+    for pos in range(fixed_start, fixed_end):
+        evt[int(fixed_slots_flat[pos])] = fixed_vals_flat[pos]
+    remaining_start = int(row_remaining_ptr[row_num])
+    remaining_end = int(row_remaining_ptr[row_num + 1])
+    remaining_size = remaining_end - remaining_start
+    total = raw_keys.size
+    for pos in range(total):
+        tmp = pos
+        for rem_pos in range(remaining_size - 1, -1, -1):
+            idx = int(remaining_slots_flat[remaining_start + rem_pos])
+            evt[idx] = tmp % outcomes
+            tmp //= outcomes
+        raw_keys[pos] = canonical_leximin_coset_chain_uint64(
+            evt,
+            outcomes,
+            level_invperms,
+        )
+    raw_keys.sort()
+
+
+@njit(cache=True, fastmath=True)
+def _count_unique_sorted_uint64(sorted_keys: np.ndarray) -> np.int64:
+    """Count unique values in a sorted uint64 array."""
+    if sorted_keys.size == 0:
+        return np.int64(0)
+    unique_count = 1
+    current_key = sorted_keys[0]
+    for idx in range(1, sorted_keys.size):
+        key = sorted_keys[idx]
+        if key != current_key:
+            unique_count += 1
+            current_key = key
+    return np.int64(unique_count)
+
+
+@njit(cache=True, fastmath=True)
+def _write_rle_sorted_uint64_to_flat(
+    sorted_keys: np.ndarray,
+    out_keys: np.ndarray,
+    out_counts: np.ndarray,
+    write_start: int,
+) -> np.int64:
+    """Write the RLE of a sorted uint64 array into flat output buffers."""
+    if sorted_keys.size == 0:
+        return np.int64(write_start)
+    write_pos = int(write_start)
+    current_key = sorted_keys[0]
+    current_count = np.uint64(1)
+    for idx in range(1, sorted_keys.size):
+        key = sorted_keys[idx]
+        if key == current_key:
+            current_count += np.uint64(1)
+        else:
+            out_keys[write_pos] = current_key
+            out_counts[write_pos] = current_count
+            write_pos += 1
+            current_key = key
+            current_count = np.uint64(1)
+    out_keys[write_pos] = current_key
+    out_counts[write_pos] = current_count
+    return np.int64(write_pos + 1)
+
+
+@njit(cache=True, parallel=True, fastmath=True)
+def _count_unique_global_extension_keys_per_row(
+    row_unique_nnz: np.ndarray,
+    wave_rows: np.ndarray,
+    row_extension_counts: np.ndarray,
+    row_fixed_ptr: np.ndarray,
+    fixed_slots_flat: np.ndarray,
+    fixed_vals_flat: np.ndarray,
+    row_remaining_ptr: np.ndarray,
+    remaining_slots_flat: np.ndarray,
+    nof_off_diagonal_slots: int,
+    outcomes: int,
+    level_invperms: NumbaList,
+) -> None:
+    """Pass 1: count exact unique canonical keys for each row in a wave."""
+    for local_row in prange(wave_rows.size):
+        row_num = int(wave_rows[local_row])
+        total = int(row_extension_counts[row_num])
+        raw_keys = np.empty(total, dtype=np.uint64)
+        _fill_sorted_global_extension_keys_for_row(
+            raw_keys,
+            row_num,
+            row_fixed_ptr,
+            fixed_slots_flat,
+            fixed_vals_flat,
+            row_remaining_ptr,
+            remaining_slots_flat,
+            nof_off_diagonal_slots,
+            outcomes,
+            level_invperms,
+        )
+        row_unique_nnz[local_row] = _count_unique_sorted_uint64(raw_keys)
+
+
+@njit(cache=True, parallel=True, fastmath=True)
+def _fill_unique_global_extension_keys_per_row(
+    wave_unique_keys_flat: np.ndarray,
+    wave_unique_counts_flat: np.ndarray,
+    wave_output_ptr: np.ndarray,
+    wave_rows: np.ndarray,
+    row_extension_counts: np.ndarray,
+    row_fixed_ptr: np.ndarray,
+    fixed_slots_flat: np.ndarray,
+    fixed_vals_flat: np.ndarray,
+    row_remaining_ptr: np.ndarray,
+    remaining_slots_flat: np.ndarray,
+    nof_off_diagonal_slots: int,
+    outcomes: int,
+    level_invperms: NumbaList,
+) -> None:
+    """Pass 2: materialize exact sorted `(key, count)` row streams for a wave."""
+    for local_row in prange(wave_rows.size):
+        row_num = int(wave_rows[local_row])
+        total = int(row_extension_counts[row_num])
+        raw_keys = np.empty(total, dtype=np.uint64)
+        _fill_sorted_global_extension_keys_for_row(
+            raw_keys,
+            row_num,
+            row_fixed_ptr,
+            fixed_slots_flat,
+            fixed_vals_flat,
+            row_remaining_ptr,
+            remaining_slots_flat,
+            nof_off_diagonal_slots,
+            outcomes,
+            level_invperms,
+        )
+        _write_rle_sorted_uint64_to_flat(
+            raw_keys,
+            wave_unique_keys_flat,
+            wave_unique_counts_flat,
+            int(wave_output_ptr[local_row]),
+        )
+
+
+@njit(cache=True)
+def _union_sorted_unique_uint64(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    """Merge two sorted unique uint64 arrays into one sorted unique union."""
+    if left.size == 0:
+        return right.copy()
+    if right.size == 0:
+        return left.copy()
+    merged = np.empty(left.size + right.size, dtype=np.uint64)
+    left_pos = 0
+    right_pos = 0
+    write_pos = 0
+    while left_pos < left.size and right_pos < right.size:
+        left_key = left[left_pos]
+        right_key = right[right_pos]
+        if left_key == right_key:
+            merged[write_pos] = left_key
+            left_pos += 1
+            right_pos += 1
+        elif left_key < right_key:
+            merged[write_pos] = left_key
+            left_pos += 1
+        else:
+            merged[write_pos] = right_key
+            right_pos += 1
+        write_pos += 1
+    while left_pos < left.size:
+        merged[write_pos] = left[left_pos]
+        left_pos += 1
+        write_pos += 1
+    while right_pos < right.size:
+        merged[write_pos] = right[right_pos]
+        right_pos += 1
+        write_pos += 1
+    return merged[:write_pos].copy()
+
+
+def _estimate_global_extension_ram_bytes(
+    *,
+    total_entries: int,
+    nof_rows: int,
+    worker_count: int,
+    safety_factor: float = 1.25,
+) -> Tuple[int, int]:
+    """Conservative RAM recommendation for global-extension build and assembly."""
+    total_entries_i = int(total_entries)
+    nof_rows_i = int(nof_rows)
+    worker_count_i = max(1, int(worker_count))
+    nnz_upper_bound = total_entries_i
+    nof_cols_upper_bound = total_entries_i
+    estimated_bytes = (
+        8 * total_entries_i +   # all_keys
+        8 * total_entries_i +   # inverse
+        16 * nnz_upper_bound +  # CSR indices + data
+        12 * nnz_upper_bound +  # MOSEK asub + aval
+        32 * nof_cols_upper_bound +  # pointer/count temporaries
+        64 * (nof_rows_i + 1)   # small row-wise pointer/count terms
+    )
+    recommended_total = int(np.ceil(float(estimated_bytes) * float(safety_factor)))
+    recommended_per_cpu = int(np.ceil(recommended_total / worker_count_i))
+    return recommended_total, recommended_per_cpu
+
+
+def _format_gib(num_bytes: int) -> str:
+    """Format byte counts in GiB with one decimal place."""
+    gib = float(num_bytes) / float(1024 ** 3)
+    return f"{gib:.1f} GiB"
+
+
+def _log_progress_line(message: str, *, enabled: bool) -> None:
+    """Emit a clean stdout status line when progress reporting is enabled."""
+    if enabled:
+        print(message, flush=True)
 
 
 @njit(cache=True, parallel=True, fastmath=True)
@@ -303,6 +713,60 @@ def _csr_weighted_column_sums(
         for pos in range(start, end):
             result[int(indices[pos])] += weight * data[pos]
     return result
+
+
+@njit(cache=True, fastmath=True)
+def _column_payload_weighted_sums(
+    aptrb: np.ndarray,
+    aptre: np.ndarray,
+    asub: np.ndarray,
+    aval: np.ndarray,
+    row_weights: np.ndarray,
+) -> np.ndarray:
+    """Compute weighted column sums directly from the cached column payload."""
+    result = np.zeros(aptrb.size, dtype=np.float64)
+    for col in range(aptrb.size):
+        start = int(aptrb[col])
+        end = int(aptre[col])
+        total = 0.0
+        for pos in range(start, end):
+            total += row_weights[int(asub[pos])] * aval[pos]
+        result[col] = total
+    return result
+
+
+@njit(cache=True, fastmath=True)
+def _column_payload_row_counts(asub: np.ndarray, nof_rows: int) -> np.ndarray:
+    """Count row nonzeros from a MOSEK-style column payload."""
+    counts = np.zeros(nof_rows, dtype=np.int64)
+    for pos in range(asub.size):
+        counts[int(asub[pos])] += 1
+    return counts
+
+
+@njit(cache=True, fastmath=True)
+def _fill_csr_from_column_payload(
+    aptrb: np.ndarray,
+    aptre: np.ndarray,
+    asub: np.ndarray,
+    aval: np.ndarray,
+    indptr: np.ndarray,
+    indices: np.ndarray,
+    data: np.ndarray,
+) -> None:
+    """Fill CSR arrays from a sorted column-major payload."""
+    next_pos = indptr[:-1].copy()
+    nof_cols = aptrb.size
+    for col in range(nof_cols):
+        start = int(aptrb[col])
+        end = int(aptre[col])
+        for pos in range(start, end):
+            row = int(asub[pos])
+            write_pos = int(next_pos[row])
+            indices[write_pos] = col
+            data[write_pos] = aval[pos]
+            next_pos[row] = write_pos + 1
+    return None
 
 def _stable_unique_inverse(keys: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """Return first-appearance unique keys and inverse indices preserving row-major order."""
@@ -458,6 +922,168 @@ def load_prep_lp_solution(path: str | Path, *, allow_pickle: bool = True) -> Dic
     return read_prep_lp_solution(path, allow_pickle=allow_pickle)
 
 
+def _write_row_counts_archive(path: Path, keys: np.ndarray, counts: np.ndarray) -> None:
+    """Write one row's sorted `(key, multiplicity)` stream to scratch."""
+    np.savez(
+        path,
+        keys=np.asarray(keys, dtype=np.uint64),
+        counts=np.asarray(counts, dtype=np.uint64),
+    )
+
+
+def _read_row_counts_archive(path: Path) -> Tuple[np.ndarray, np.ndarray]:
+    """Read one row's sorted `(key, multiplicity)` stream from scratch."""
+    with np.load(path, allow_pickle=False) as z:
+        return (
+            np.asarray(z["keys"], dtype=np.uint64),
+            np.asarray(z["counts"], dtype=np.uint64),
+        )
+
+
+def _reconstruct_csr_from_column_payload(
+    solver_payload: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    *,
+    nof_rows: int,
+    nof_cols: int,
+) -> csr_array:
+    """Reconstruct the direct CSR matrix lazily from the cached column payload."""
+    aptrb, aptre, asub, aval = solver_payload
+    row_counts = _column_payload_row_counts(asub.astype(np.int32, copy=False), int(nof_rows))
+    indptr = np.empty(int(nof_rows) + 1, dtype=np.int64)
+    indptr[0] = 0
+    if row_counts.size:
+        indptr[1:] = np.cumsum(row_counts, dtype=np.int64)
+    indices = np.empty(int(indptr[-1]), dtype=np.int64)
+    data = np.empty(int(indptr[-1]), dtype=np.float64)
+    _fill_csr_from_column_payload(
+        aptrb.astype(np.int64, copy=False),
+        aptre.astype(np.int64, copy=False),
+        asub.astype(np.int32, copy=False),
+        aval.astype(np.float64, copy=False),
+        indptr,
+        indices,
+        data,
+    )
+    return csr_array((data, indices, indptr), shape=(int(nof_rows), int(nof_cols)))
+
+
+def evaluate_prep_lp_certificate_on_knowns(
+    sparse_certificate: coo_array,
+    known_values: np.ndarray,
+) -> float:
+    """Evaluate a direct row-basis certificate on the known marginal values."""
+    cert_coo = sparse_certificate.tocoo(copy=False)
+    value = 0.0
+    for col, coeff in zip(cert_coo.col.tolist(), cert_coo.data.tolist()):
+        value += float(coeff) * float(known_values[int(col)])
+    return value
+
+
+def print_prep_lp_infeasibility_certificate_analysis(
+    solution_dict: dict,
+    known_values: np.ndarray,
+    *,
+    chop_tol: float = 1e-10,
+    max_terms: int | None = None,
+) -> None:
+    """Print a row-basis dual-certificate summary for a direct PrepLP solve."""
+    sparse_certificate = solution_dict.get("sparse_certificate")
+    if sparse_certificate is None:
+        print("No sparse_certificate was returned.")
+        return
+
+    constraint_names = np.asarray(solution_dict.get("constraint_names", ()), dtype=str)
+    cert_coo = sparse_certificate.tocoo(copy=False)
+    cleaned_values: dict[int, float] = {}
+    for col, coeff in zip(cert_coo.col.tolist(), cert_coo.data.tolist()):
+        coeff_f = float(coeff)
+        if abs(coeff_f) > chop_tol:
+            cleaned_values[int(col)] = coeff_f
+
+    if not cleaned_values:
+        print(f"Dual certificate is numerically zero after chop_tol={chop_tol:g}.")
+        return
+
+    cert_value = evaluate_prep_lp_certificate_on_knowns(cert_coo, known_values)
+    ordered_rows = sorted(cleaned_values)
+    if max_terms is not None:
+        ordered_rows = ordered_rows[: max(0, int(max_terms))]
+
+    print("\nCertificate analysis:")
+    print(f"  nonzero row terms (after chop): {len(cleaned_values)}")
+    print(f"  certificate value on knowns: {cert_value:.12g}")
+    mode = str(solution_dict.get("mode", ""))
+    known_mass = solution_dict.get("known_mass")
+    for line in _certificate_mode_explanation_lines(
+        mode=mode,
+        cert_value=cert_value,
+        known_mass=(None if known_mass is None else float(known_mass)),
+    ):
+        print(line)
+    print("  row-basis terms in constraint order:")
+    for row_idx in ordered_rows:
+        row_name = constraint_names[row_idx] if row_idx < constraint_names.size else f"<row {row_idx}>"
+        print(f"    [{row_idx:>4}] {cleaned_values[row_idx]:+.12g} * {row_name}")
+
+
+def _certificate_mode_explanation_lines(
+    *,
+    mode: str,
+    cert_value: float,
+    known_mass: float | None,
+) -> List[str]:
+    """Human-readable interpretation lines for direct-ring dual certificates."""
+    lines: List[str] = []
+    if mode == "incompatible_fraction":
+        if known_mass is None or not np.isfinite(known_mass):
+            return lines
+        lines.append("  compatible inequality: certificate value on knowns >= known_mass")
+        lines.append("  threshold for incompatible fraction 0:")
+        lines.append(f"    certificate value on knowns must be at least {known_mass:.12g}")
+        if cert_value < known_mass:
+            lines.append(f"    here it is only {cert_value:.12g}")
+            lines.append(f"    violated by {known_mass - cert_value:.12g}")
+            lines.append(
+                f"    this certifies incompatible fraction >= {max(0.0, 1.0 - cert_value / known_mass):.12g}"
+            )
+        else:
+            lines.append(f"    here it is {cert_value:.12g}")
+            lines.append("    no incompatibility violation is certified by this inequality")
+        return lines
+
+    if mode == "generalized_robustness":
+        if known_mass is None or not np.isfinite(known_mass):
+            return lines
+        lines.append("  compatible inequality: certificate value on knowns <= known_mass")
+        lines.append("  threshold for generalized robustness 0:")
+        lines.append(f"    certificate value on knowns must be at most {known_mass:.12g}")
+        if cert_value > known_mass:
+            lines.append(f"    here it is {cert_value:.12g}")
+            lines.append(f"    violated by {cert_value - known_mass:.12g}")
+            lines.append(
+                f"    this certifies generalized robustness >= {max(0.0, cert_value / known_mass - 1.0):.12g}"
+            )
+        else:
+            lines.append(f"    here it is {cert_value:.12g}")
+            lines.append("    no generalized-robustness violation is certified by this inequality")
+        return lines
+
+    if mode == "feasibility":
+        lines.append("  compatible inequality: certificate value on knowns >= 0")
+        lines.append("  threshold for exact feasibility:")
+        lines.append("    certificate value on knowns must be nonnegative")
+        if cert_value < 0.0:
+            lines.append(f"    here it is only {cert_value:.12g}")
+            lines.append(f"    violated by {-cert_value:.12g}")
+            lines.append("    this is a Farkas-type certificate of primal infeasibility")
+        else:
+            lines.append(f"    here it is {cert_value:.12g}")
+            lines.append("    this does not certify primal infeasibility")
+        return lines
+
+    return lines
+
+
 # =========================
 # Cycle extraction & factorized value for a marginal
 # =========================
@@ -540,6 +1166,7 @@ def _build_row_extension_descriptors(
     """Flatten per-row fixed/remaining slot metadata for Numba parallel kernels."""
     nof_rows = len(marginals)
     nof_slots = n * (n - 1)
+    slot_dtype = _slot_index_dtype(nof_slots)
 
     row_entry_ptr = np.empty(nof_rows + 1, dtype=np.int64)
     row_fixed_ptr = np.empty(nof_rows + 1, dtype=np.int64)
@@ -553,7 +1180,7 @@ def _build_row_extension_descriptors(
     remaining_slots_chunks: List[np.ndarray] = []
 
     for row_num, marginal in enumerate(marginals):
-        fixed_slots = np.empty(len(marginal), dtype=np.int64)
+        fixed_slots = np.empty(len(marginal), dtype=slot_dtype)
         fixed_vals = np.empty(len(marginal), dtype=np.uint8)
         seen_slots: set[int] = set()
         for idx, (_one, i, j, _zero, a) in enumerate(marginal):
@@ -566,7 +1193,7 @@ def _build_row_extension_descriptors(
         mask = np.ones(nof_slots, dtype=bool)
         if fixed_slots.size:
             mask[fixed_slots] = False
-        remaining_slots = np.nonzero(mask)[0].astype(np.int64, copy=False)
+        remaining_slots = np.nonzero(mask)[0].astype(slot_dtype, copy=False)
         total = pow(outcomes, int(remaining_slots.size))
         row_entry_ptr[row_num + 1] = row_entry_ptr[row_num] + np.int64(total)
         row_fixed_ptr[row_num + 1] = row_fixed_ptr[row_num] + np.int64(fixed_slots.size)
@@ -576,9 +1203,9 @@ def _build_row_extension_descriptors(
         remaining_slots_chunks.append(remaining_slots)
 
     fixed_slots_flat = (
-        np.concatenate(fixed_slots_chunks).astype(np.int64, copy=False)
+        np.concatenate(fixed_slots_chunks).astype(slot_dtype, copy=False)
         if fixed_slots_chunks
-        else np.empty(0, dtype=np.int64)
+        else np.empty(0, dtype=slot_dtype)
     )
     fixed_vals_flat = (
         np.concatenate(fixed_vals_chunks).astype(np.uint8, copy=False)
@@ -586,9 +1213,9 @@ def _build_row_extension_descriptors(
         else np.empty(0, dtype=np.uint8)
     )
     remaining_slots_flat = (
-        np.concatenate(remaining_slots_chunks).astype(np.int64, copy=False)
+        np.concatenate(remaining_slots_chunks).astype(slot_dtype, copy=False)
         if remaining_slots_chunks
-        else np.empty(0, dtype=np.int64)
+        else np.empty(0, dtype=slot_dtype)
     )
     return (
         row_entry_ptr,
@@ -641,6 +1268,8 @@ class PrepLP:
         self._cached_global_keys: np.ndarray | None = None
         self._cached_nof_caonical_global_events: int | None = None
         self._cached_solver_column_payload: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None
+        self._cached_mass_objective: np.ndarray | None = None
+        self._solve_target: str | None = None
         self._cache_written = False
         self._initialize_cache()
 
@@ -699,8 +1328,8 @@ class PrepLP:
                 end_message=lambda elapsed: (
                     "Loaded cached LP constraints from "
                     f"{self.cache_path} in {elapsed:.2f}s "
-                    f"(rows={self._cached_inflation_matrix.shape[0]}, "
-                    f"cols={self._cached_inflation_matrix.shape[1]})"
+                    f"(rows={self.nof_marginals}, "
+                    f"cols={self._cached_nof_caonical_global_events})"
                 ),
             ):
                 self._load_cache_if_available()
@@ -719,9 +1348,6 @@ class PrepLP:
                     "original_symmetry_generators",
                     "discovered_symmetry_generators",
                     "inflation_matrix_shape",
-                    "inflation_matrix_indptr",
-                    "inflation_matrix_indices",
-                    "inflation_matrix_data_entries",
                     "global_keys",
                     "solver_aptrb",
                     "solver_aptre",
@@ -766,9 +1392,6 @@ class PrepLP:
                     raise self._incompatible_cache_error()
 
                 try:
-                    indptr = np.asarray(z["inflation_matrix_indptr"], dtype=np.int64)
-                    indices = np.asarray(z["inflation_matrix_indices"], dtype=np.int64)
-                    data = np.asarray(z["inflation_matrix_data_entries"], dtype=np.float64)
                     solver_aptrb = np.asarray(z["solver_aptrb"], dtype=np.int64)
                     solver_aptre = np.asarray(z["solver_aptre"], dtype=np.int64)
                     solver_asub = np.asarray(z["solver_asub"], dtype=np.int32)
@@ -776,10 +1399,6 @@ class PrepLP:
                 except (TypeError, ValueError) as exc:
                     raise self._incompatible_cache_error() from exc
 
-                self._cached_inflation_matrix = csr_array(
-                    (data, indices, indptr),
-                    shape=inflation_shape,
-                )
                 self._cached_global_keys = global_keys
                 self._cached_nof_caonical_global_events = nof_caonical_global_events
                 self._cached_solver_column_payload = (
@@ -797,7 +1416,6 @@ class PrepLP:
 
     def _save_cache(
         self,
-        inflation_matrix: csr_array,
         solver_payload: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
     ) -> None:
         if self.cache_path is None or self._cache_written:
@@ -819,10 +1437,7 @@ class PrepLP:
                 ambient_dimension=np.int64(self.N),
                 original_symmetry_generators=np.asarray(self.core_symmetries, dtype=int),
                 discovered_symmetry_generators=np.asarray(self.discovered_symmetries, dtype=int),
-                inflation_matrix_shape=np.asarray(inflation_matrix.shape, dtype=np.int64),
-                inflation_matrix_indptr=np.asarray(inflation_matrix.indptr, dtype=np.int64),
-                inflation_matrix_indices=np.asarray(inflation_matrix.indices, dtype=np.int64),
-                inflation_matrix_data_entries=np.asarray(inflation_matrix.data, dtype=np.float64),
+                inflation_matrix_shape=np.asarray((self.nof_marginals, self.nof_lp_vars), dtype=np.int64),
                 global_keys=np.asarray(self.global_keys, dtype=np.uint64),
                 solver_aptrb=np.asarray(solver_aptrb, dtype=np.int64),
                 solver_aptre=np.asarray(solver_aptre, dtype=np.int64),
@@ -950,6 +1565,14 @@ class PrepLP:
             dtype=object,
         )
 
+    @cached_property
+    def base_display_row_labels(self) -> np.ndarray:
+        """Grouped cycle labels for each base marginal row."""
+        return np.asarray(
+            [_format_marginal_display_label(marginal) for marginal in self.base_marginals],
+            dtype=object,
+        )
+
     def _factorized_value_and_label(self, marginal: List[List[int]]) -> Tuple[sp.Expr, str]:
         """
         Compute value and copy-index-free cycle-factorized label for one marginal.
@@ -1062,7 +1685,7 @@ class PrepLP:
             orbit_members = [(idx,) for idx in range(self.base_nof_marginals)]
             multiplicities = np.ones(self.base_nof_marginals, dtype=np.int64)
             member_labels = [(self.base_known_labels[idx],) for idx in range(self.base_nof_marginals)]
-            row_labels = np.asarray([" ".join(label) for label in self.base_row_labels.tolist()], dtype=object)
+            row_labels = np.asarray(self.base_display_row_labels, dtype=object)
             return (
                 self.base_marginals,
                 self.base_known_values_symbolic,
@@ -1116,7 +1739,7 @@ class PrepLP:
             orbit_average_labels.append(avg_known_label)
             orbit_member_labels.append(member_known_labels)
 
-            member_row_labels = [" ".join(self.base_row_labels[m]) for m in members]
+            member_row_labels = [str(self.base_display_row_labels[m]) for m in members]
             row_labels_list.append(_average_orbit_label(member_row_labels))
 
         row_labels = np.asarray(row_labels_list, dtype=object)
@@ -1183,6 +1806,18 @@ class PrepLP:
         return len(self.marginals)
 
     @cached_property
+    def worker_count(self) -> int:
+        """Effective worker count for batch logging and Numba parallel kernels."""
+        slurm_workers = _parse_positive_int(os.environ.get("SLURM_CPUS_PER_TASK"))
+        if slurm_workers is not None:
+            try:
+                _align_numba_threads_to_slurm()
+            except Exception:
+                pass
+            return slurm_workers
+        return _detect_worker_count()
+
+    @cached_property
     def row_extension_counts(self) -> np.ndarray:
         """Number of compatible global extensions for each final marginal row."""
         counts = np.empty(self.nof_marginals, dtype=np.int64)
@@ -1208,18 +1843,17 @@ class PrepLP:
     def _canonical_global_lhs_payload(
         self,
     ) -> Tuple[
-        csr_array,
+        csr_array | None,
         int,
         np.ndarray,
         Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
     ]:
         """
-        Tuple `(inflation_matrix, nof_caonical_global_events, global_keys,
+        Tuple `(inflation_matrix_or_none, nof_caonical_global_events, global_keys,
         solver_column_payload)` for the direct ring LP system.
         """
         if (
-            self._cached_inflation_matrix is not None
-            and self._cached_global_keys is not None
+            self._cached_global_keys is not None
             and self._cached_nof_caonical_global_events is not None
             and self._cached_solver_column_payload is not None
         ):
@@ -1238,77 +1872,221 @@ class PrepLP:
             row_remaining_ptr,
             remaining_slots_flat,
         ) = self._row_extension_descriptor_payload
+        row_extension_counts = self.row_extension_counts.astype(np.int64, copy=False)
         total_entries = int(row_entry_ptr[-1]) if row_entry_ptr.size else 0
+        worker_count = self.worker_count
+        total_memory_budget = _detect_total_memory_budget_bytes(worker_count)
+        usable_memory_budget = max(1, int(np.floor(float(total_memory_budget) * 0.8)))
+        max_row_entries = int(row_extension_counts.max()) if row_extension_counts.size else 0
+        per_worker_raw_buffer_bytes = 8 * max_row_entries
+        active_wave_raw_buffer_bytes = max(1, int(worker_count)) * per_worker_raw_buffer_bytes
+        if per_worker_raw_buffer_bytes > usable_memory_budget:
+            raise MemoryError(
+                "The largest marginal row requires a raw uint64 key buffer of "
+                f"{_format_gib(per_worker_raw_buffer_bytes)}, which exceeds the usable build budget "
+                f"of {_format_gib(usable_memory_budget)}."
+            )
+        wave_count = max(1, (self.nof_marginals + worker_count - 1) // max(1, worker_count))
+        scratch_root = _detect_scratch_root()
+        scratch_root.mkdir(parents=True, exist_ok=True)
 
-        with progress_stage(
-            "Finding global extensions...",
+        _log_progress_line(
+            "Global extension plan: "
+            f"workers={worker_count}, "
+            f"rows={self.nof_marginals}, "
+            f"total_entries={total_entries}, "
+            f"max_row_entries={max_row_entries}, "
+            f"per_worker_raw_buffer={_format_gib(per_worker_raw_buffer_bytes)}, "
+            f"active_wave_raw_buffers={_format_gib(active_wave_raw_buffer_bytes)}, "
+            f"usable_memory={_format_gib(usable_memory_budget)}, "
+            f"waves={wave_count}, "
+            f"scratch={scratch_root}",
             enabled=self.show_progress,
-            end_message=lambda elapsed: (
-                f"Enumerated {total_entries} canonicalized extensions in {elapsed:.2f}s"
-            ),
-        ):
-            all_keys = _fill_global_extension_keys_parallel(
-                row_entry_ptr,
-                row_fixed_ptr,
-                fixed_slots_flat,
-                fixed_vals_flat,
-                row_remaining_ptr,
-                remaining_slots_flat,
-                self.nof_off_diagonal_slots,
-                self.outcomes,
-                self.level_invperms,
-            )
+        )
 
-        with progress_stage(
-            "Finalizing sparse extension matrix...",
-            enabled=self.show_progress,
-            end_message=lambda elapsed: (
-                "Constraint matrix finalized: "
-                f"rows={inflation_matrix.shape[0]}, "
-                f"cols={inflation_matrix.shape[1]}, "
-                f"nnz={inflation_matrix.nnz} "
-                f"in {elapsed:.2f}s"
-            ),
-        ):
-            global_keys, inverse = _stable_unique_inverse(all_keys)
-            nof_caonical_global_events = int(global_keys.size)
-            if nof_caonical_global_events > np.iinfo(np.int32).max:
-                raise ValueError("Ring LP exceeds the current MOSEK Python binding variable limit.")
+        row_archive_paths: List[Path | None] = [None] * self.nof_marginals
+        global_keys = np.empty(0, dtype=np.uint64)
+        nof_caonical_global_events = 0
+        total_nnz = 0
+        exact_payload_bytes = 0
+        solver_payload = (
+            np.empty(0, dtype=np.int64),
+            np.empty(0, dtype=np.int64),
+            np.empty(0, dtype=np.int32),
+            np.empty(0, dtype=np.float64),
+        )
+        mass_objective = np.empty(0, dtype=np.float64)
 
-            sparse_matrix_cols = inverse.astype(np.int64, copy=False)
-            top_row_nnz = _sort_rows_and_count_unique(sparse_matrix_cols, row_entry_ptr)
-            indptr = np.empty(self.nof_marginals + 1, dtype=np.int64)
-            indptr[0] = 0
-            if top_row_nnz.size > 0:
-                indptr[1:] = np.cumsum(top_row_nnz, dtype=np.int64)
-            indices = np.empty(int(indptr[-1]), dtype=np.int64)
-            data = np.empty(int(indptr[-1]), dtype=np.float64)
-            _fill_direct_csr_from_sorted_rows(
-                sparse_matrix_cols,
-                row_entry_ptr,
-                indptr,
-                indices,
-                data,
-            )
-            inflation_matrix = csr_array(
-                (data, indices, indptr),
-                shape=(self.nof_marginals, nof_caonical_global_events),
-            )
-            solver_payload = _csr_to_column_payload(
-                indptr,
-                indices,
-                data,
-                nof_caonical_global_events,
-            )
-            solver_payload = tuple(np.ascontiguousarray(arr) for arr in solver_payload)
+        with tempfile.TemporaryDirectory(dir=scratch_root, prefix="ring_lp_build_") as scratch_dir_str:
+            scratch_dir = Path(scratch_dir_str)
+            with progress_stage(
+                "Finding global extensions...",
+                enabled=self.show_progress,
+                end_message=lambda elapsed: (
+                    f"Enumerated {total_entries} canonicalized extensions in {elapsed:.2f}s"
+                ),
+            ):
+                entries_done = 0
+                wave_start_time = perf_counter()
+                for wave_idx in range(wave_count):
+                    row_start = wave_idx * worker_count
+                    row_stop = min(row_start + worker_count, self.nof_marginals)
+                    if row_start >= row_stop:
+                        break
+                    wave_rows = np.arange(row_start, row_stop, dtype=np.int64)
+                    row_unique_nnz = np.empty(wave_rows.size, dtype=np.int64)
+                    _count_unique_global_extension_keys_per_row(
+                        row_unique_nnz,
+                        wave_rows,
+                        row_extension_counts,
+                        row_fixed_ptr,
+                        fixed_slots_flat,
+                        fixed_vals_flat,
+                        row_remaining_ptr,
+                        remaining_slots_flat,
+                        self.nof_off_diagonal_slots,
+                        self.outcomes,
+                        self.level_invperms,
+                    )
+                    wave_output_ptr = np.empty(wave_rows.size + 1, dtype=np.int64)
+                    wave_output_ptr[0] = 0
+                    if row_unique_nnz.size:
+                        wave_output_ptr[1:] = np.cumsum(row_unique_nnz, dtype=np.int64)
+                    wave_unique_keys_flat = np.empty(int(wave_output_ptr[-1]), dtype=np.uint64)
+                    wave_unique_counts_flat = np.empty(int(wave_output_ptr[-1]), dtype=np.uint64)
+                    _fill_unique_global_extension_keys_per_row(
+                        wave_unique_keys_flat,
+                        wave_unique_counts_flat,
+                        wave_output_ptr,
+                        wave_rows,
+                        row_extension_counts,
+                        row_fixed_ptr,
+                        fixed_slots_flat,
+                        fixed_vals_flat,
+                        row_remaining_ptr,
+                        remaining_slots_flat,
+                        self.nof_off_diagonal_slots,
+                        self.outcomes,
+                        self.level_invperms,
+                    )
+                    for local_row_idx in range(wave_rows.size):
+                        row_num = int(wave_rows[local_row_idx])
+                        row_slice_start = int(wave_output_ptr[local_row_idx])
+                        row_slice_stop = int(wave_output_ptr[local_row_idx + 1])
+                        row_path = scratch_dir / f"row_{row_num:06d}.npz"
+                        _write_row_counts_archive(
+                            row_path,
+                            wave_unique_keys_flat[row_slice_start:row_slice_stop],
+                            wave_unique_counts_flat[row_slice_start:row_slice_stop],
+                        )
+                        row_archive_paths[row_num] = row_path
+                    entries_done += int(row_extension_counts[row_start:row_stop].sum())
+                    percent = (100.0 * entries_done / total_entries) if total_entries else 100.0
+                    _log_progress_line(
+                        "Global extensions wave "
+                        f"{wave_idx + 1}/{wave_count} complete: "
+                        f"rows={row_start}:{row_stop}, "
+                        f"rows_done={row_stop}/{self.nof_marginals}, "
+                        f"entries_done={entries_done}/{total_entries} "
+                        f"({percent:.1f}%), "
+                        f"elapsed={perf_counter() - wave_start_time:.2f}s",
+                        enabled=self.show_progress,
+                    )
 
-        self._cached_inflation_matrix = inflation_matrix
+            with progress_stage(
+                "Finalizing direct LP payload...",
+                enabled=self.show_progress,
+                end_message=lambda elapsed: (
+                    "Direct LP payload finalized: "
+                    f"rows={self.nof_marginals}, "
+                    f"cols={nof_caonical_global_events}, "
+                    f"nnz={total_nnz}, "
+                    f"exact payload ~{_format_gib(exact_payload_bytes)} "
+                    f"in {elapsed:.2f}s"
+                ),
+            ):
+                row_nnz = np.empty(self.nof_marginals, dtype=np.int64)
+                for row_num, row_path in enumerate(row_archive_paths):
+                    if row_path is None:
+                        raise ValueError(f"Missing streamed row archive for row {row_num}.")
+                    row_keys, _row_counts = _read_row_counts_archive(row_path)
+                    row_nnz[row_num] = row_keys.size
+                    global_keys = _union_sorted_unique_uint64(global_keys, row_keys)
+
+                nof_caonical_global_events = int(global_keys.size)
+                if nof_caonical_global_events > np.iinfo(np.int32).max:
+                    raise ValueError("Ring LP exceeds the current MOSEK Python binding variable limit.")
+
+                total_nnz = int(row_nnz.sum())
+                exact_payload_bytes = _estimate_exact_solver_payload_bytes(
+                    nof_caonical_global_events,
+                    total_nnz,
+                )
+                _log_progress_line(
+                    "Exact final payload: "
+                    f"cols={nof_caonical_global_events}, "
+                    f"nnz={total_nnz}, "
+                    f"payload={_format_gib(exact_payload_bytes)}",
+                    enabled=self.show_progress,
+                )
+                if exact_payload_bytes > usable_memory_budget:
+                    raise MemoryError(
+                        "Exact final LP payload requires "
+                        f"{_format_gib(exact_payload_bytes)}, which exceeds the usable build budget "
+                        f"of {_format_gib(usable_memory_budget)}."
+                    )
+
+                column_counts = np.zeros(nof_caonical_global_events, dtype=np.int64)
+                for row_path in row_archive_paths:
+                    row_keys, _row_counts = _read_row_counts_archive(row_path)
+                    if row_keys.size == 0:
+                        continue
+                    cols = np.searchsorted(global_keys, row_keys)
+                    if not np.array_equal(global_keys[cols], row_keys):
+                        raise ValueError("Global key merge produced a missing row key.")
+                    column_counts[cols] += 1
+
+                aptrb = np.empty(nof_caonical_global_events, dtype=np.int64)
+                aptre = np.empty(nof_caonical_global_events, dtype=np.int64)
+                running = np.int64(0)
+                for col in range(nof_caonical_global_events):
+                    aptrb[col] = running
+                    running += column_counts[col]
+                    aptre[col] = running
+
+                asub = np.empty(total_nnz, dtype=np.int32)
+                aval = np.empty(total_nnz, dtype=np.float64)
+                next_pos = aptrb.copy()
+                mass_objective = np.zeros(nof_caonical_global_events, dtype=np.float64)
+                row_weights = self._mass_weights.astype(np.float64, copy=False)
+                for row_num, row_path in enumerate(row_archive_paths):
+                    row_keys, row_counts = _read_row_counts_archive(row_path)
+                    if row_keys.size == 0:
+                        continue
+                    cols = np.searchsorted(global_keys, row_keys)
+                    if not np.array_equal(global_keys[cols], row_keys):
+                        raise ValueError("Global key merge produced a missing row key.")
+                    write_pos = next_pos[cols].copy()
+                    asub[write_pos] = np.int32(row_num)
+                    row_counts_float = row_counts.astype(np.float64, copy=False)
+                    aval[write_pos] = row_counts_float
+                    next_pos[cols] = write_pos + 1
+                    mass_objective[cols] += row_weights[row_num] * row_counts_float
+
+                solver_payload = (
+                    np.ascontiguousarray(aptrb),
+                    np.ascontiguousarray(aptre),
+                    np.ascontiguousarray(asub),
+                    np.ascontiguousarray(aval),
+                )
+
         self._cached_global_keys = global_keys
         self._cached_nof_caonical_global_events = nof_caonical_global_events
         self._cached_solver_column_payload = solver_payload
-        self._save_cache(inflation_matrix, solver_payload)
+        self._cached_mass_objective = np.ascontiguousarray(mass_objective, dtype=np.float64)
+        self._save_cache(solver_payload)
         return (
-            inflation_matrix,
+            None,
             nof_caonical_global_events,
             global_keys,
             solver_payload,
@@ -1333,7 +2111,14 @@ class PrepLP:
         """Direct marginal-form sparse matrix `A_direct`."""
         if self._cached_inflation_matrix is not None:
             return self._cached_inflation_matrix
-        return self._canonical_global_lhs_payload[0]
+        if self._cached_solver_column_payload is None or self._cached_nof_caonical_global_events is None:
+            _ = self._canonical_global_lhs_payload
+        self._cached_inflation_matrix = _reconstruct_csr_from_column_payload(
+            self._cached_solver_column_payload,
+            nof_rows=self.nof_marginals,
+            nof_cols=self.nof_lp_vars,
+        )
+        return self._cached_inflation_matrix
 
     @property
     def solver_column_payload(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -1370,19 +2155,38 @@ class PrepLP:
     @cached_property
     def _mass_objective(self) -> np.ndarray:
         """Column objective giving the multiplicity-corrected global mass."""
-        matrix = self.inflation_matrix
-        return _csr_weighted_column_sums(
-            matrix.indptr.astype(np.int64, copy=False),
-            matrix.indices.astype(np.int64, copy=False),
-            matrix.data.astype(np.float64, copy=False),
-            self._mass_weights,
-            self.nof_lp_vars,
+        if self._cached_mass_objective is not None:
+            return self._cached_mass_objective
+        aptrb, aptre, asub, aval = self.solver_column_payload
+        self._cached_mass_objective = _column_payload_weighted_sums(
+            aptrb.astype(np.int64, copy=False),
+            aptre.astype(np.int64, copy=False),
+            asub.astype(np.int32, copy=False),
+            aval.astype(np.float64, copy=False),
+            self._mass_weights.astype(np.float64, copy=False),
         )
+        return self._cached_mass_objective
 
     @cached_property
     def _known_mass(self) -> float:
         """Multiplicity-corrected total known mass for direct relaxations."""
         return float(np.dot(self._mass_weights, self.known_values.astype(np.float64, copy=False)))
+
+    @cached_property
+    def _known_mass_symbolic(self) -> sp.Expr:
+        """Exact multiplicity-corrected total known mass for certificate display."""
+        total = sp.Integer(0)
+        for multiplicity, value in zip(
+            self.row_orbit_multiplicities.tolist(),
+            self.known_values_symbolic.tolist(),
+        ):
+            total += sp.Integer(int(multiplicity)) * sp.sympify(value)
+        return sp.simplify(total)
+
+    @property
+    def solve_target(self) -> str | None:
+        """Most recent normalized solve target used by `solve()`."""
+        return self._solve_target
 
     def solve(
         self,
@@ -1393,7 +2197,7 @@ class PrepLP:
     ) -> Dict:
         """Solve the direct ring LP in feasibility or relaxed incompatibility modes."""
         import mosek
-        from inflation.lp.lp_utils import streamprinter
+        from inflation.lp.lp_utils import make_streamprinter
 
         if verbose > 1:
             t0 = perf_counter()
@@ -1401,6 +2205,7 @@ class PrepLP:
             print("Starting pre-processing for the LP solver...")
 
         solve_mode = _resolve_ring_solve_mode(mode)
+        self._solve_target = solve_mode
         aptrb, aptre, asub, aval = self.solver_column_payload
         nof_lp_vars = self.nof_lp_vars
         nof_constraints = self.nof_lp_constraints
@@ -1462,12 +2267,14 @@ class PrepLP:
 
         with mosek.Env() as env:
             with mosek.Task(env) as task:
+                log_printer = None
                 task.putintparam(mosek.iparam.sim_reformulation, mosek.simreform.aggressive)
                 task.putintparam(mosek.iparam.sim_switch_optimizer, mosek.onoffkey.on)
                 task.putintparam(mosek.iparam.optimizer, optimizer_choice)
                 task.putintparam(mosek.iparam.sim_solve_form, mosek.solveform.primal)
                 if verbose > 0:
-                    task.set_Stream(mosek.streamtype.log, streamprinter)
+                    log_printer = make_streamprinter()
+                    task.set_Stream(mosek.streamtype.log, log_printer)
                     task.putintparam(mosek.iparam.log_include_summary, mosek.onoffkey.on)
                     task.putintparam(mosek.iparam.log_storage, 1)
                 if verbose < 2:
@@ -1514,6 +2321,8 @@ class PrepLP:
                 if verbose > 0:
                     print("\nSolving the problem...\n")
                 trmcode = task.optimize()
+                if log_printer is not None:
+                    log_printer.flush()
                 if verbose > 1:
                     print("Solving took", format(perf_counter() - t0, ".4f"), "seconds.")
 
@@ -1628,6 +2437,108 @@ class PrepLP:
         """Compatibility alias for `read_solution()`."""
         return read_prep_lp_solution(path, allow_pickle=allow_pickle)
 
+    def print_certificate(
+        self,
+        solution_dict: dict,
+        *,
+        chop_tol: float = 1e-10,
+        max_terms: int | None = None,
+    ) -> None:
+        """Print a row-basis dual-certificate summary and its mode-specific interpretation."""
+        sparse_certificate = solution_dict.get("sparse_certificate")
+        if sparse_certificate is None:
+            print("No sparse_certificate was returned.")
+            return
+
+        constraint_names = np.asarray(solution_dict.get("constraint_names", self.row_labels), dtype=str)
+        cert_coo = sparse_certificate.tocoo(copy=False)
+        cleaned_values: dict[int, float] = {}
+        for col, coeff in zip(cert_coo.col.tolist(), cert_coo.data.tolist()):
+            coeff_f = float(coeff)
+            if abs(coeff_f) > chop_tol:
+                cleaned_values[int(col)] = coeff_f
+
+        if not cleaned_values:
+            print(f"Dual certificate is numerically zero after chop_tol={chop_tol:g}.")
+            return
+
+        cert_value = evaluate_prep_lp_certificate_on_knowns(
+            cert_coo,
+            self.known_values.astype(np.float64, copy=False),
+        )
+        ordered_rows = sorted(cleaned_values)
+        if max_terms is not None:
+            ordered_rows = ordered_rows[: max(0, int(max_terms))]
+
+        mode = str(solution_dict.get("mode", self.solve_target or ""))
+        known_mass = solution_dict.get("known_mass")
+        known_mass_float = None if known_mass is None else float(known_mass)
+        known_mass_symbolic = self._known_mass_symbolic
+        constant_term = sp.Integer(0)
+        normalized_value = cert_value
+        threshold_label = "certificate must be nonnegative"
+        violation_label = "negativity certifies primal infeasibility"
+
+        if mode == "incompatible_fraction":
+            constant_term = -sp.Integer(1)
+            if known_mass_float is not None and np.isfinite(known_mass_float) and known_mass_float != 0.0:
+                normalized_value = cert_value / known_mass_float - 1.0
+            threshold_label = "certificate must be at least 0 for incompatible fraction 0"
+            violation_label = "negativity certifies incompatible fraction"
+        elif mode == "generalized_robustness":
+            constant_term = sp.Integer(1)
+            if known_mass_float is not None and np.isfinite(known_mass_float) and known_mass_float != 0.0:
+                normalized_value = 1.0 - cert_value / known_mass_float
+            threshold_label = "certificate must be at least 0 for generalized robustness 0"
+            violation_label = "negativity certifies generalized robustness"
+
+        def _format_affine_term(coeff_expr: sp.Expr, label: str | None = None) -> str | None:
+            coeff_s = sp.simplify(coeff_expr)
+            coeff_f = float(sp.N(coeff_s))
+            if abs(coeff_f) <= chop_tol:
+                return None
+            sign = "+" if coeff_f >= 0 else "-"
+            magnitude = sp.simplify(-coeff_s if coeff_f < 0 else coeff_s)
+            if label is None:
+                body = str(magnitude)
+            elif magnitude == 1:
+                body = label
+            else:
+                body = f"{magnitude} * {label}"
+            return f"    {sign} {body}"
+
+        print("\nCertificate analysis:")
+        print(f"  nonzero row terms (after chop): {len(cleaned_values)}")
+        print(f"  raw certificate value on knowns: {cert_value:.12g}")
+        print(f"  normalized certificate value on knowns: {normalized_value:.12g}")
+        print(f"  normalized compatibility threshold: {threshold_label}")
+        if normalized_value < -chop_tol:
+            print(f"  violation / negativity: {-normalized_value:.12g}")
+            print(f"  {violation_label} >= {-normalized_value:.12g}")
+        else:
+            print("  normalized certificate is nonnegative on the target point")
+        print("  normalized affine certificate:")
+        constant_line = _format_affine_term(constant_term)
+        if constant_line is not None:
+            print(constant_line)
+        for row_idx in ordered_rows:
+            if row_idx < self.row_orbit_members.__len__():
+                member_row_labels = [str(self.base_display_row_labels[m]) for m in self.row_orbit_members[row_idx]]
+                row_name = _sum_orbit_label(member_row_labels)
+                orbit_multiplicity = int(self.row_orbit_multiplicities[row_idx])
+            else:
+                row_name = constraint_names[row_idx] if row_idx < constraint_names.size else f"<row {row_idx}>"
+                orbit_multiplicity = 1
+            coeff_expr = sp.nsimplify(cleaned_values[row_idx], tolerance=chop_tol, rational=True)
+            coeff_expr = sp.simplify(coeff_expr / orbit_multiplicity)
+            if mode == "incompatible_fraction":
+                coeff_expr = sp.simplify(coeff_expr / known_mass_symbolic)
+            elif mode == "generalized_robustness":
+                coeff_expr = sp.simplify(-coeff_expr / known_mass_symbolic)
+            term_line = _format_affine_term(coeff_expr, row_name)
+            if term_line is not None:
+                print(term_line)
+
 
 # =========================
 # Example usage
@@ -1681,57 +2592,5 @@ if __name__ == "__main__":
         prep_nsi.save_solution(solution)
         print(f"Saved LP solution archive to {prep_nsi.output_path}")
 
-    def _evaluate_sparse_certificate_on_knowns(
-        sparse_certificate: coo_array,
-        known_values: np.ndarray,
-    ) -> float:
-        """Evaluate a direct row-basis certificate on the known marginal values."""
-        cert_coo = sparse_certificate
-        value = 0.0
-        for col, coeff in zip(cert_coo.col.tolist(), cert_coo.data.tolist()):
-            value += float(coeff) * float(known_values[int(col)])
-        return value
-
-    def _print_infeasibility_certificate_analysis(
-        solution_dict: dict,
-        known_values: np.ndarray,
-        *,
-        chop_tol: float = 1e-10,
-        top_k: int = 25,
-    ) -> None:
-        """Print a concise analysis of the dual infeasibility certificate."""
-        cert_dict = solution_dict.get("dual_certificate", {})
-        if not cert_dict:
-            print("No dual certificate entries were returned.")
-            return
-
-        # Mimic InflationLP-style coefficient cleanup by chopping tiny entries.
-        cleaned = {
-            str(var): float(coeff)
-            for var, coeff in cert_dict.items()
-            if abs(float(coeff)) > chop_tol
-        }
-        if not cleaned:
-            print(f"Dual certificate is numerically zero after chop_tol={chop_tol:g}.")
-            return
-
-        cert_value = _evaluate_sparse_certificate_on_knowns(
-            solution_dict["sparse_certificate"], known_values
-        )
-
-        print("\nCertificate analysis:")
-        print(f"  nonzero terms (after chop): {len(cleaned)}")
-        print(f"  constraint-row terms: {len(cleaned)}")
-        print(f"  certificate value on knowns: {cert_value:.12g}")
-        print("  incompatibility witness criterion: certificate < 0")
-
-        top_terms = sorted(cleaned.items(), key=lambda kv: abs(kv[1]), reverse=True)[:top_k]
-        print(f"  top {len(top_terms)} terms by |coefficient|:")
-        for var, coeff in top_terms:
-            print(f"    {coeff:+.12g} * {var}")
-
     if not solution.get("success", False):
-        _print_infeasibility_certificate_analysis(
-            solution,
-            prep_nsi.known_values.astype(np.float64, copy=False),
-        )
+        prep_nsi.print_certificate(solution)
