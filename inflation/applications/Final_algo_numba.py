@@ -1177,21 +1177,24 @@ def _cycles_from_J(J: Dict[int, int]) -> List[List[int]]:
     return cycles
 
 
-def keep_cycles_up_to_length(max_cycle_length: int):
-    """Return a marginal filter that admits only disjoint cycles of length <= `max_cycle_length`."""
-    max_cycle_length = int(max_cycle_length)
-    if max_cycle_length < 2:
-        raise ValueError("Cycle-length filter requires max_cycle_length >= 2.")
+def keep_loops_of_length(loop_lengths):
+    """Return a marginal filter that admits only disjoint loops with lengths in `loop_lengths`."""
+    allowed_lengths = frozenset(int(length) for length in loop_lengths)
+    if not allowed_lengths:
+        raise ValueError("Loop-length filter requires at least one allowed loop length.")
+    if any(length < 1 for length in allowed_lengths):
+        raise ValueError("Loop-length filter requires positive loop lengths.")
 
     def _filter(marginal: List[List[int]]) -> bool:
         cycles = _cycles_from_J(_perm_from_marginal(marginal))
-        return len(cycles) > 0 and all(len(cycle) <= max_cycle_length for cycle in cycles)
+        return len(cycles) > 0 and all(len(cycle) in allowed_lengths for cycle in cycles)
 
-    _filter.__name__ = f"keep_cycles_up_to_length_{max_cycle_length}"
+    loop_suffix = "_".join(str(length) for length in sorted(allowed_lengths))
+    _filter.__name__ = f"keep_loops_of_length_{loop_suffix}"
     return _filter
 
 
-keep_up_to_three_cycles = keep_cycles_up_to_length(3)
+keep_loops_up_to_three = keep_loops_of_length([1, 2, 3])
 
 
 def factorized_marginal_value(

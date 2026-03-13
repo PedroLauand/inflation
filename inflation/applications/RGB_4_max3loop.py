@@ -16,7 +16,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from inflation.applications.Final_algo_numba import PrepLP, keep_up_to_three_cycles
+from inflation.applications.Final_algo_numba import PrepLP, keep_loops_up_to_three
 from inflation.distributions import RGBDistribution
 
 
@@ -26,7 +26,7 @@ def main(*, n: int = 4) -> None:
         n,
         distribution,
         problem_name=f"RGB_n={n}_max3loop",
-        marginal_filter_fn=keep_up_to_three_cycles,
+        marginal_filter_fn=keep_loops_up_to_three,
         auto_discover_symmetries=True,
         compress_rows_under_discovered_group=True,
     )
