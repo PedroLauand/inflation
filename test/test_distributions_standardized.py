@@ -5,7 +5,7 @@ from pathlib import Path
 
 import sympy as sp
 
-from inflation.distributions import EJMDistribution, NSIPRDistribution, RGBDistribution
+from inflation.distributions import EJMDistribution, GHZDistribution, NSIPRDistribution, RGBDistribution
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -22,15 +22,25 @@ def _load_module_from_path(module_name: str, path: Path):
 
 class TestStandardizedDistributionAPIs(unittest.TestCase):
     def test_api_availability(self):
-        for distribution in (EJMDistribution(), RGBDistribution(), NSIPRDistribution()):
+        for distribution in (EJMDistribution(), GHZDistribution(), RGBDistribution(), NSIPRDistribution()):
             self.assertTrue(callable(distribution.prob_event_loop))
             self.assertTrue(callable(distribution.prob_event_line))
             self.assertIsInstance(distribution.nof_outcomes, int)
 
     def test_returns_symbolic_expressions(self):
         self.assertIsInstance(EJMDistribution().prob_event_loop([0]), sp.Expr)
+        self.assertIsInstance(GHZDistribution().prob_event_loop([0]), sp.Expr)
         self.assertIsInstance(RGBDistribution().prob_event_loop([0]), sp.Expr)
         self.assertIsInstance(NSIPRDistribution().prob_event_loop([0]), sp.Expr)
+
+    def test_ghz_support_is_only_all_equal(self):
+        ghz = GHZDistribution()
+        self.assertEqual(ghz.prob_event_loop([0, 0, 0]), sp.Rational(1, 2))
+        self.assertEqual(ghz.prob_event_loop([1, 1, 1]), sp.Rational(1, 2))
+        self.assertEqual(ghz.prob_event_loop([0, 1, 0]), 0)
+        self.assertEqual(ghz.prob_event_line([0, 0, 0]), sp.Rational(1, 2))
+        self.assertEqual(ghz.prob_event_line([1, 1, 1]), sp.Rational(1, 2))
+        self.assertEqual(ghz.prob_event_line([1, 0, 1]), 0)
 
     def test_coarsen_strict_partition_validation(self):
         with self.assertRaises(ValueError):
@@ -92,8 +102,14 @@ class TestStandardizedDistributionAPIs(unittest.TestCase):
         self.assertEqual(sp.simplify(rgb_loop_sum - 1), 0)
         self.assertEqual(sp.simplify(rgb_line_sum - 1), 0)
 
-        nsi = NSIPRDistribution()
         n = 3
+        ghz = GHZDistribution()
+        ghz_loop_sum = sum(ghz.prob_event_loop(evt) for evt in product((0, 1), repeat=n))
+        ghz_line_sum = sum(ghz.prob_event_line(evt) for evt in product((0, 1), repeat=n))
+        self.assertEqual(sp.simplify(ghz_loop_sum - 1), 0)
+        self.assertEqual(sp.simplify(ghz_line_sum - 1), 0)
+
+        nsi = NSIPRDistribution()
         nsi_loop_sum = sum(nsi.prob_event_loop(evt) for evt in product((0, 1), repeat=n))
         nsi_line_sum = sum(nsi.prob_event_line(evt) for evt in product((0, 1), repeat=n))
         self.assertEqual(sp.simplify(nsi_loop_sum - 1), 0)
