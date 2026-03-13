@@ -18,7 +18,10 @@ from inflation.applications.Final_algo_numba import (
     _detect_worker_count,
     _detect_total_memory_budget_bytes,
     _cycles_from_J,
+    _estimate_wave_peak_bytes,
     _fill_unique_global_extension_keys_per_row,
+    keep_loops_of_length,
+    keep_loops_up_to_three,
     _relaxed_mass_gap,
     _relaxed_mass_tolerance,
     _perm_from_marginal,
@@ -325,6 +328,30 @@ class TestClusterOptimizedRing(unittest.TestCase):
             with mock.patch.object(final_algo_numba, "_detect_local_memory_bytes", return_value=99):
                 self.assertEqual(_detect_total_memory_budget_bytes(8), 99)
 
+    def test_structural_memory_estimator_defaults_and_filter_metadata(self):
+        default_prep = self._make_prep(3)
+        self.assertEqual(default_prep.smallest_marginal_size, 2)
+
+        filtered_prep = self._make_prep(4, marginal_filter_fn=keep_loops_of_length([2, 4]))
+        self.assertEqual(filtered_prep.smallest_marginal_size, 2)
+
+        max3_prep = self._make_prep(4, marginal_filter_fn=keep_loops_up_to_three)
+        self.assertEqual(max3_prep.smallest_marginal_size, 1)
+
+        custom_prep = self._make_prep(4, marginal_filter_fn=lambda _m: True)
+        self.assertEqual(custom_prep.smallest_marginal_size, 2)
+
+    def test_wave_peak_estimator_accounts_for_shared_wave_arrays(self):
+        peak = _estimate_wave_peak_bytes(
+            np.asarray([4, 8], dtype=np.int64),
+            wave_rows_count=2,
+            wave_unique_nnz_total=5,
+        )
+        raw_buffers = 8 * (4 + 8)
+        pass1 = raw_buffers + 8 * 2 + 8 * 2
+        pass2 = raw_buffers + 8 * 2 + 8 * 3 + 8 * 5 + 8 * 5
+        self.assertEqual(peak, max(pass1, pass2))
+
     def test_two_pass_row_pipeline_emits_exact_sorted_unique_counts(self):
         prep = self._make_prep(4, distribution=NSIPRDistribution())
         (
@@ -419,9 +446,15 @@ class TestClusterOptimizedRing(unittest.TestCase):
         np.testing.assert_array_equal(union, np.asarray([1, 3, 4, 8, 10], dtype=np.uint64))
 
     def test_largest_row_buffer_budget_violation_fails_fast(self):
-        prep = self._make_prep(3)
         with mock.patch.object(final_algo_numba, "_detect_total_memory_budget_bytes", return_value=1):
-            with self.assertRaisesRegex(MemoryError, "largest marginal row requires a raw uint64 key buffer"):
+            prep = self._make_prep(3)
+            with self.assertRaisesRegex(MemoryError, "structural worst-case marginal row requires a raw uint64 key buffer"):
+                _ = prep.global_keys
+
+    def test_active_wave_budget_violation_fails_fast(self):
+        prep = self._make_prep(3)
+        with mock.patch.object(final_algo_numba, "_estimate_wave_peak_bytes", return_value=prep.usable_memory_budget_bytes + 1):
+            with self.assertRaisesRegex(MemoryError, "Active global-extension wave requires"):
                 _ = prep.global_keys
 
     def test_direct_matrix_public_api_shape(self):

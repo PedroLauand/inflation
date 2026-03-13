@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=ejm-5
-#SBATCH --partition=defq
+#SBATCH --partition=amdq
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=180G
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=250G
 #SBATCH --time=24:00:00
 #SBATCH --output=%x-%j.out
 #SBATCH --error=%x-%j.err

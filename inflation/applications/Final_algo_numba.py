@@ -226,29 +226,6 @@ def _align_numba_threads_to_slurm() -> int | None:
     return slurm_workers
 
 
-def _build_row_batches(row_entry_ptr: np.ndarray, batch_count: int) -> np.ndarray:
-    """Split contiguous rows into entry-balanced batches."""
-    nof_rows = max(0, int(row_entry_ptr.size) - 1)
-    if nof_rows == 0:
-        return np.asarray([0, 0], dtype=np.int64)
-    batches = max(1, min(int(batch_count), nof_rows))
-    boundaries = np.empty(batches + 1, dtype=np.int64)
-    boundaries[0] = 0
-    boundaries[-1] = nof_rows
-    total_entries = int(row_entry_ptr[-1])
-    for batch_idx in range(1, batches):
-        target = (total_entries * batch_idx) / batches
-        candidate = int(np.searchsorted(row_entry_ptr, target, side="left"))
-        min_allowed = int(boundaries[batch_idx - 1] + 1)
-        max_allowed = nof_rows - (batches - batch_idx)
-        if candidate < min_allowed:
-            candidate = min_allowed
-        elif candidate > max_allowed:
-            candidate = max_allowed
-        boundaries[batch_idx] = candidate
-    return boundaries
-
-
 def _parse_memory_bytes(value, *, default_unit: str = "mib") -> int | None:
     """Parse a SLURM-style memory specification into bytes."""
     if value is None:
@@ -358,6 +335,34 @@ def _estimate_exact_solver_payload_bytes(nof_cols: int, nnz: int) -> int:
         4 * int(nnz) +        # asub
         8 * int(nnz)          # aval
     )
+
+
+def _estimate_per_worker_raw_buffer_bytes(max_row_entries: int) -> int:
+    """Bytes required for one worker's raw uint64 key buffer for the worst structural row."""
+    return 8 * max(0, int(max_row_entries))
+
+def _estimate_wave_peak_bytes(
+    row_extension_counts_slice: np.ndarray,
+    *,
+    wave_rows_count: int,
+    wave_unique_nnz_total: int,
+) -> int:
+    """Exact wave-local peak bytes for the current two-pass row-at-a-time builder."""
+    raw_buffers_bytes = 8 * int(np.asarray(row_extension_counts_slice, dtype=np.int64).sum())
+    wave_rows_bytes = 8 * int(wave_rows_count)
+    row_unique_nnz_bytes = 8 * int(wave_rows_count)
+    pass1_peak = raw_buffers_bytes + wave_rows_bytes + row_unique_nnz_bytes
+    wave_output_ptr_bytes = 8 * (int(wave_rows_count) + 1)
+    wave_unique_keys_bytes = 8 * int(wave_unique_nnz_total)
+    wave_unique_counts_bytes = 8 * int(wave_unique_nnz_total)
+    pass2_peak = (
+        raw_buffers_bytes
+        + wave_rows_bytes
+        + wave_output_ptr_bytes
+        + wave_unique_keys_bytes
+        + wave_unique_counts_bytes
+    )
+    return max(pass1_peak, pass2_peak)
 
 
 def _slot_index_dtype(nof_slots: int):
@@ -566,32 +571,6 @@ def _union_sorted_unique_uint64(left: np.ndarray, right: np.ndarray) -> np.ndarr
         right_pos += 1
         write_pos += 1
     return merged[:write_pos].copy()
-
-
-def _estimate_global_extension_ram_bytes(
-    *,
-    total_entries: int,
-    nof_rows: int,
-    worker_count: int,
-    safety_factor: float = 1.25,
-) -> Tuple[int, int]:
-    """Conservative RAM recommendation for global-extension build and assembly."""
-    total_entries_i = int(total_entries)
-    nof_rows_i = int(nof_rows)
-    worker_count_i = max(1, int(worker_count))
-    nnz_upper_bound = total_entries_i
-    nof_cols_upper_bound = total_entries_i
-    estimated_bytes = (
-        8 * total_entries_i +   # all_keys
-        8 * total_entries_i +   # inverse
-        16 * nnz_upper_bound +  # CSR indices + data
-        12 * nnz_upper_bound +  # MOSEK asub + aval
-        32 * nof_cols_upper_bound +  # pointer/count temporaries
-        64 * (nof_rows_i + 1)   # small row-wise pointer/count terms
-    )
-    recommended_total = int(np.ceil(float(estimated_bytes) * float(safety_factor)))
-    recommended_per_cpu = int(np.ceil(recommended_total / worker_count_i))
-    return recommended_total, recommended_per_cpu
 
 
 def _format_gib(num_bytes: int) -> str:
@@ -1191,6 +1170,9 @@ def keep_loops_of_length(loop_lengths):
 
     loop_suffix = "_".join(str(length) for length in sorted(allowed_lengths))
     _filter.__name__ = f"keep_loops_of_length_{loop_suffix}"
+    _filter.allowed_loop_lengths = tuple(sorted(allowed_lengths))
+    _filter.smallest_marginal_size = min(allowed_lengths)
+    _filter.memory_estimate_name = _filter.__name__
     return _filter
 
 
@@ -1327,6 +1309,7 @@ class PrepLP:
         self._cached_mass_objective: np.ndarray | None = None
         self._solve_target: str | None = None
         self._cache_written = False
+        self._log_structural_memory_plan()
         self._initialize_cache()
 
     @staticmethod
@@ -1369,6 +1352,64 @@ class PrepLP:
             return None
         output_dir = Path(__file__).resolve().parent / "outputs"
         return output_dir / self.output_name
+
+    @cached_property
+    def total_memory_budget_bytes(self) -> int:
+        """Detected total memory budget for the current process."""
+        return _detect_total_memory_budget_bytes(self.worker_count)
+
+    @cached_property
+    def usable_memory_budget_bytes(self) -> int:
+        """Usable build budget after reserving scheduler/process headroom."""
+        return max(1, int(np.floor(float(self.total_memory_budget_bytes) * 0.8)))
+
+    @cached_property
+    def smallest_marginal_size(self) -> int:
+        """Earliest structural estimate of the smallest admitted marginal size."""
+        if self.marginal_filter_fn is None:
+            return 2
+        inferred = getattr(self.marginal_filter_fn, "smallest_marginal_size", None)
+        if inferred is None:
+            return 2
+        inferred_int = int(inferred)
+        if inferred_int < 1:
+            raise ValueError("smallest_marginal_size metadata must be positive.")
+        return inferred_int
+
+    @cached_property
+    def estimated_max_row_entries(self) -> int:
+        """Worst-case structural row size based on the smallest admitted marginal."""
+        free_slots = self.nof_off_diagonal_slots - self.smallest_marginal_size
+        if free_slots < 0:
+            raise ValueError("Smallest marginal size exceeds the number of off-diagonal slots.")
+        return int(pow(self.outcomes, free_slots))
+
+    @cached_property
+    def per_worker_raw_buffer_bytes(self) -> int:
+        """Worst-case per-worker raw key buffer bytes from the structural estimate."""
+        return _estimate_per_worker_raw_buffer_bytes(self.estimated_max_row_entries)
+
+    @cached_property
+    def worst_case_active_wave_raw_buffer_bytes(self) -> int:
+        """Worst-case raw worker-buffer footprint if an entire wave hits the structural maximum."""
+        return max(1, int(self.worker_count)) * self.per_worker_raw_buffer_bytes
+
+    def _log_structural_memory_plan(self) -> None:
+        """Emit an early structural memory estimate before marginal enumeration begins."""
+        estimate_name = getattr(self.marginal_filter_fn, "memory_estimate_name", None)
+        estimate_suffix = f", filter={estimate_name}" if estimate_name else ""
+        _log_progress_line(
+            "Structural memory estimate: "
+            f"workers={self.worker_count}, "
+            f"nof_off_diagonal_slots={self.nof_off_diagonal_slots}, "
+            f"smallest_marginal_size={self.smallest_marginal_size}, "
+            f"max_row_entries={self.estimated_max_row_entries}, "
+            f"per_worker_raw_buffer={_format_gib(self.per_worker_raw_buffer_bytes)}, "
+            f"worst_case_active_wave_raw_buffers={_format_gib(self.worst_case_active_wave_raw_buffer_bytes)}, "
+            f"usable_memory={_format_gib(self.usable_memory_budget_bytes)}"
+            f"{estimate_suffix}",
+            enabled=self.show_progress,
+        )
 
     @staticmethod
     def _incompatible_cache_error() -> ValueError:
@@ -2099,15 +2140,24 @@ class PrepLP:
         row_extension_counts = self.row_extension_counts.astype(np.int64, copy=False)
         total_entries = int(row_entry_ptr[-1]) if row_entry_ptr.size else 0
         worker_count = self.worker_count
-        total_memory_budget = _detect_total_memory_budget_bytes(worker_count)
-        usable_memory_budget = max(1, int(np.floor(float(total_memory_budget) * 0.8)))
-        max_row_entries = int(row_extension_counts.max()) if row_extension_counts.size else 0
-        per_worker_raw_buffer_bytes = 8 * max_row_entries
-        active_wave_raw_buffer_bytes = max(1, int(worker_count)) * per_worker_raw_buffer_bytes
-        if per_worker_raw_buffer_bytes > usable_memory_budget:
+        usable_memory_budget = self.usable_memory_budget_bytes
+        exact_max_row_entries = int(row_extension_counts.max()) if row_extension_counts.size else 0
+        exact_per_worker_raw_buffer_bytes = _estimate_per_worker_raw_buffer_bytes(exact_max_row_entries)
+        if exact_max_row_entries > self.estimated_max_row_entries:
+            raise AssertionError(
+                "Exact row-extension count exceeded the structural max-row estimate: "
+                f"exact={exact_max_row_entries}, structural={self.estimated_max_row_entries}."
+            )
+        if self.per_worker_raw_buffer_bytes > usable_memory_budget:
             raise MemoryError(
-                "The largest marginal row requires a raw uint64 key buffer of "
-                f"{_format_gib(per_worker_raw_buffer_bytes)}, which exceeds the usable build budget "
+                "The structural worst-case marginal row requires a raw uint64 key buffer of "
+                f"{_format_gib(self.per_worker_raw_buffer_bytes)}, which exceeds the usable build budget "
+                f"of {_format_gib(usable_memory_budget)}."
+            )
+        if self.worst_case_active_wave_raw_buffer_bytes > usable_memory_budget:
+            raise MemoryError(
+                "The structural active-wave raw worker buffers require "
+                f"{_format_gib(self.worst_case_active_wave_raw_buffer_bytes)}, which exceeds the usable build budget "
                 f"of {_format_gib(usable_memory_budget)}."
             )
         wave_count = max(1, (self.nof_marginals + worker_count - 1) // max(1, worker_count))
@@ -2115,14 +2165,12 @@ class PrepLP:
         scratch_root.mkdir(parents=True, exist_ok=True)
 
         _log_progress_line(
-            "Global extension plan: "
+            "Global extension workload: "
             f"workers={worker_count}, "
             f"rows={self.nof_marginals}, "
             f"total_entries={total_entries}, "
-            f"max_row_entries={max_row_entries}, "
-            f"per_worker_raw_buffer={_format_gib(per_worker_raw_buffer_bytes)}, "
-            f"active_wave_raw_buffers={_format_gib(active_wave_raw_buffer_bytes)}, "
-            f"usable_memory={_format_gib(usable_memory_budget)}, "
+            f"exact_max_row_entries={exact_max_row_entries}, "
+            f"exact_per_worker_raw_buffer={_format_gib(exact_per_worker_raw_buffer_bytes)}, "
             f"waves={wave_count}, "
             f"scratch={scratch_root}",
             enabled=self.show_progress,
@@ -2158,6 +2206,7 @@ class PrepLP:
                     if row_start >= row_stop:
                         break
                     wave_rows = np.arange(row_start, row_stop, dtype=np.int64)
+                    wave_extension_counts = row_extension_counts[row_start:row_stop]
                     row_unique_nnz = np.empty(wave_rows.size, dtype=np.int64)
                     _count_unique_global_extension_keys_per_row(
                         row_unique_nnz,
@@ -2177,6 +2226,17 @@ class PrepLP:
                     wave_output_ptr[0] = 0
                     if row_unique_nnz.size:
                         wave_output_ptr[1:] = np.cumsum(row_unique_nnz, dtype=np.int64)
+                    wave_peak_bytes = _estimate_wave_peak_bytes(
+                        wave_extension_counts,
+                        wave_rows_count=wave_rows.size,
+                        wave_unique_nnz_total=int(wave_output_ptr[-1]),
+                    )
+                    if wave_peak_bytes > usable_memory_budget:
+                        raise MemoryError(
+                            "Active global-extension wave requires "
+                            f"{_format_gib(wave_peak_bytes)}, which exceeds the usable build budget "
+                            f"of {_format_gib(usable_memory_budget)}."
+                        )
                     wave_unique_keys_flat = np.empty(int(wave_output_ptr[-1]), dtype=np.uint64)
                     wave_unique_counts_flat = np.empty(int(wave_output_ptr[-1]), dtype=np.uint64)
                     _fill_unique_global_extension_keys_per_row(
@@ -2206,7 +2266,7 @@ class PrepLP:
                             wave_unique_counts_flat[row_slice_start:row_slice_stop],
                         )
                         row_archive_paths[row_num] = row_path
-                    entries_done += int(row_extension_counts[row_start:row_stop].sum())
+                    entries_done += int(wave_extension_counts.sum())
                     percent = (100.0 * entries_done / total_entries) if total_entries else 100.0
                     _log_progress_line(
                         "Global extensions wave "
@@ -2215,9 +2275,16 @@ class PrepLP:
                         f"rows_done={row_stop}/{self.nof_marginals}, "
                         f"entries_done={entries_done}/{total_entries} "
                         f"({percent:.1f}%), "
+                        f"peak={_format_gib(wave_peak_bytes)}, "
                         f"elapsed={perf_counter() - wave_start_time:.2f}s",
                         enabled=self.show_progress,
                     )
+                    del wave_unique_counts_flat
+                    del wave_unique_keys_flat
+                    del wave_output_ptr
+                    del row_unique_nnz
+                    del wave_extension_counts
+                    del wave_rows
 
             with progress_stage(
                 "Finalizing direct LP payload...",
@@ -2249,6 +2316,7 @@ class PrepLP:
                     nof_caonical_global_events,
                     total_nnz,
                 )
+                del row_nnz
                 _log_progress_line(
                     "Exact final payload: "
                     f"cols={nof_caonical_global_events}, "
@@ -2306,6 +2374,15 @@ class PrepLP:
                     np.ascontiguousarray(asub),
                     np.ascontiguousarray(aval),
                 )
+                del column_counts
+                del row_archive_paths
+                del row_extension_counts
+                del row_entry_ptr
+                del row_fixed_ptr
+                del fixed_slots_flat
+                del fixed_vals_flat
+                del row_remaining_ptr
+                del remaining_slots_flat
 
         self._cached_global_keys = global_keys
         self._cached_nof_caonical_global_events = nof_caonical_global_events

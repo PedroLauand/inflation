@@ -146,17 +146,24 @@ class TestProgressUtils(unittest.TestCase):
             stdout_output = stdout_stream.getvalue()
             stderr_output = stderr_stream.getvalue()
 
+            self.assertIn("Structural memory estimate:", stdout_output)
+            self.assertIn("smallest_marginal_size=", stdout_output)
+            self.assertIn("per_worker_raw_buffer=", stdout_output)
+            self.assertIn("usable_memory=", stdout_output)
+            self.assertLess(
+                stdout_output.index("Structural memory estimate:"),
+                stdout_output.index("Canonicalizing marginals"),
+            )
             self.assertIn("Canonicalizing marginals", stdout_output)
             self.assertIn("Computing marginal values...", stdout_output)
-            self.assertIn("Global extension plan:", stdout_output)
-            self.assertIn("usable_memory=", stdout_output)
-            self.assertIn("per_worker_raw_buffer=", stdout_output)
-            self.assertIn("active_wave_raw_buffers=", stdout_output)
+            self.assertIn("Global extension workload:", stdout_output)
+            self.assertIn("exact_per_worker_raw_buffer=", stdout_output)
             self.assertIn("waves=", stdout_output)
             self.assertIn("Finding global extensions...", stdout_output)
             self.assertIn("Global extensions wave 1/", stdout_output)
             self.assertIn("Global extensions wave 2/", stdout_output)
             self.assertIn("rows_done=", stdout_output)
+            self.assertIn("peak=", stdout_output)
             self.assertIn("Finalizing direct LP payload...", stdout_output)
             self.assertIn("Exact final payload:", stdout_output)
             self.assertIn("Direct LP payload finalized:", stdout_output)
@@ -187,6 +194,7 @@ class TestProgressUtils(unittest.TestCase):
                 )
 
             cached_stdout = cached_stdout_stream.getvalue()
+            self.assertIn("Structural memory estimate:", cached_stdout)
             self.assertIn("Checking LP input cache at", cached_stdout)
             self.assertIn("Loaded cached LP constraints from", cached_stdout)
             self.assertNotIn("\r", cached_stdout)
