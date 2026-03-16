@@ -12,8 +12,9 @@ from __future__ import annotations
 
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
-from functools import cached_property
-from itertools import combinations, permutations, product
+from functools import cached_property, lru_cache
+from itertools import combinations, combinations_with_replacement, permutations, product
+from math import comb
 import multiprocessing as mp
 import os
 from pathlib import Path
@@ -43,8 +44,9 @@ from inflation.applications.Group_utils import (
 from inflation.applications.ring_utils import build_off_diagonal_ring_problem
 from inflation.distributions.protocols import RingDistributionProtocol
 from inflation.symmetry_utils import discovery_symmetries_from_predicate
+from inflation.utils import ndarray_bytes_key
 
-CACHE_FORMAT_VERSION = np.int64(8)
+CACHE_FORMAT_VERSION = np.int64(9)
 
 
 def ring_problem(inflation_level: int, distribution: RingDistributionProtocol) -> InflationProblem:
@@ -114,8 +116,166 @@ def _marginal_support_from_cycle_cover(
     return support
 
 
+@lru_cache(maxsize=None)
+def _cycle_partitions(total_size: int) -> Tuple[Tuple[int, ...], ...]:
+    """Partitions of `total_size` into cycle lengths >= 2 in nonincreasing order."""
+    if total_size < 2:
+        return tuple()
+
+    partitions: List[Tuple[int, ...]] = []
+
+    def _recurse(remaining: int, max_part: int, prefix: Tuple[int, ...]) -> None:
+        if remaining == 0:
+            partitions.append(prefix)
+            return
+        for part in range(min(remaining, max_part), 1, -1):
+            next_remaining = remaining - part
+            if next_remaining not in (0,) and next_remaining < 2:
+                continue
+            _recurse(next_remaining, part, prefix + (part,))
+
+    _recurse(total_size, total_size, tuple())
+    return tuple(partitions)
+
+
+@lru_cache(maxsize=None)
+def _cycle_rotations(pattern: Tuple[int, ...]) -> Tuple[Tuple[int, ...], ...]:
+    """All cyclic rotations of a cycle pattern."""
+    if not pattern:
+        return (tuple(),)
+    length = len(pattern)
+    return tuple(pattern[shift:] + pattern[:shift] for shift in range(length))
+
+
+@lru_cache(maxsize=None)
+def _cycle_block_support_signature(
+    length: int,
+    pattern: Tuple[int, ...],
+    n: int,
+    outcomes: int,
+) -> Tuple[int, ...]:
+    """
+    Lexicographic comparison key for one cycle block placed on the smallest labels.
+
+    This is the correct ordering primitive for deciding which unlabeled cycle
+    should occupy the smallest copy labels in a canonical support representative.
+    """
+    labels = tuple(range(1, length + 1))
+    coords = []
+    for offset, outcome in enumerate(pattern):
+        src = labels[offset]
+        dst = labels[(offset + 1) % length]
+        slot = _offdiag_slot_index(src, dst, n)
+        coords.append(slot * outcomes + int(outcome))
+    return tuple(sorted(coords))
+
+
+@lru_cache(maxsize=None)
+def _canonical_cycle_block_pattern(
+    length: int,
+    pattern: Tuple[int, ...],
+    n: int,
+    outcomes: int,
+) -> Tuple[int, ...]:
+    """
+    Canonical per-cycle representative chosen by minimal local support signature.
+
+    This is stronger than raw rotation-minimization on the pattern tuple and
+    matches the lexicographic comparison used by the full support canonicalizer.
+    """
+    best_pattern = pattern
+    best_signature = _cycle_block_support_signature(length, pattern, n, outcomes)
+    for candidate in _cycle_rotations(pattern):
+        signature = _cycle_block_support_signature(length, candidate, n, outcomes)
+        if signature < best_signature or (signature == best_signature and candidate < best_pattern):
+            best_signature = signature
+            best_pattern = candidate
+    return best_pattern
+
+
+@lru_cache(maxsize=None)
+def _cycle_block_representatives(
+    length: int,
+    outcomes: int,
+    n: int,
+) -> Tuple[Tuple[int, ...], ...]:
+    """Cycle-pattern representatives modulo cyclic symmetry of the loop."""
+    reps = {
+        _canonical_cycle_block_pattern(
+            length,
+            tuple(int(x) for x in pattern),
+            n,
+            outcomes,
+        )
+        for pattern in product(range(outcomes), repeat=length)
+    }
+    return tuple(
+        sorted(
+            reps,
+            key=lambda pattern: (
+                _cycle_block_support_signature(length, pattern, n, outcomes),
+                pattern,
+            ),
+        )
+    )
+
+
+def _count_reduced_base_candidates(n: int, outcomes: int) -> int:
+    """Candidate count for the reduced base-marginal generator before any safety dedup."""
+    total = 0
+    for support_size in range(2, n + 1):
+        for partition in _cycle_partitions(support_size):
+            by_length = Counter(partition)
+            partition_total = 1
+            for length, multiplicity in by_length.items():
+                nof_reps = len(_cycle_block_representatives(length, outcomes, n))
+                partition_total *= comb(nof_reps + multiplicity - 1, multiplicity)
+            total += partition_total
+    return total
+
+
+def _iter_reduced_base_supports(n: int, outcomes: int) -> Iterator[np.ndarray]:
+    """
+    Generate one representative support per cycle-cover orbit under the core `S_n` action.
+
+    Supports are emitted already sorted and use canonical cycle partitions together
+    with cyclic representatives for per-cycle outcome assignments.
+    """
+    for support_size in range(2, n + 1):
+        for partition in _cycle_partitions(support_size):
+            length_groups = sorted(Counter(partition).items())
+            grouped_pattern_choices = tuple(
+                combinations_with_replacement(_cycle_block_representatives(length, outcomes, n), multiplicity)
+                for length, multiplicity in length_groups
+            )
+            for grouped_patterns in product(*grouped_pattern_choices):
+                cycle_blocks = []
+                for (length, _multiplicity), cycle_patterns in zip(length_groups, grouped_patterns):
+                    for pattern in cycle_patterns:
+                        cycle_blocks.append((length, pattern))
+                cycle_blocks.sort(
+                    key=lambda block: _cycle_block_support_signature(
+                        block[0],
+                        block[1],
+                        n,
+                        outcomes,
+                    )
+                )
+                support_coords: List[int] = []
+                next_label = 1
+                for length, pattern in cycle_blocks:
+                    labels = tuple(range(next_label, next_label + length))
+                    for offset, outcome in enumerate(pattern):
+                        src = labels[offset]
+                        dst = labels[(offset + 1) % length]
+                        slot = _offdiag_slot_index(src, dst, n)
+                        support_coords.append(slot * outcomes + int(outcome))
+                    next_label += length
+                yield np.asarray(sorted(support_coords), dtype=np.int64)
+
+
 def _marginal_from_support_key(
-    support_key: Tuple[int, ...],
+    support_key: Sequence[int],
     n: int,
     outcomes: int,
 ) -> List[List[int]]:
@@ -1691,73 +1851,79 @@ class PrepLP:
         return self._effective_group_chain_data[5]
 
     @cached_property
-    def _base_marginal_payload(self) -> Tuple[List[List[List[int]]], List[Tuple[int, ...]]]:
+    def base_support_keys(self) -> List[np.ndarray]:
         """
-        Canonical marginal representatives under the initial core symmetries.
+        Canonical support keys for base marginals under the initial core symmetries.
+
+        Supports are generated directly from canonical cycle-cover representatives
+        under the coherent core `S_n` action. When `marginal_filter_fn` is provided,
+        it is applied to that raw pre-validation representative before any safety
+        assertions.
         """
-        seen_keys: set[Tuple[int, ...]] = set()
-        marginals: List[List[List[int]]] = []
-        support_keys: List[Tuple[int, ...]] = []
-        base_outcomes = tuple(range(self.outcomes))
-        copy_labels = tuple(range(1, self.n + 1))
-        total_candidates = sum(
-            sum(1 for _ in _derangements(subset)) * (self.outcomes ** len(subset))
-            for subset_size in range(2, self.n + 1)
-            for subset in combinations(copy_labels, subset_size)
-        )
+        seen_keys: set[bytes] = set()
+        support_keys: List[np.ndarray] = []
+        total_candidates = _count_reduced_base_candidates(self.n, self.outcomes)
         progress = tqdm(
             total=total_candidates,
             desc="Canonicalizing marginals",
             disable=not self.show_progress,
         )
-        for subset_size in range(2, self.n + 1):
-            for subset in combinations(copy_labels, subset_size):
-                for image in _derangements(subset):
-                    for pat in product(base_outcomes, repeat=subset_size):
-                        support = _marginal_support_from_cycle_cover(subset, image, pat, self.n, self.outcomes)
-                        canonical_support = canonical_leximin_support_indices(support, self.N, self.core_group_perms)
-                        key = tuple(int(x) for x in canonical_support.tolist())
-                        if key not in seen_keys:
-                            marginal = _marginal_from_support_key(key, self.n, self.outcomes)
-                            if self.marginal_filter_fn is None or self.marginal_filter_fn(marginal):
-                                seen_keys.add(key)
-                                marginals.append(marginal)
-                                support_keys.append(key)
+        filter_fn = self.marginal_filter_fn
+        try:
+            if filter_fn is None:
+                for support in _iter_reduced_base_supports(self.n, self.outcomes):
+                    key_bytes = ndarray_bytes_key(support, dtype=np.int64)
+                    if key_bytes not in seen_keys:
+                        seen_keys.add(key_bytes)
+                        support_keys.append(support)
+                    progress.update(1)
+            else:
+                for support in _iter_reduced_base_supports(self.n, self.outcomes):
+                    raw_marginal = _marginal_from_support_key(support, self.n, self.outcomes)
+                    if not filter_fn(raw_marginal):
                         progress.update(1)
-        progress.close()
-        return marginals, support_keys
-
-    @property
-    def base_marginals(self) -> List[List[List[int]]]:
-        """Canonical marginals under core symmetries before automatic compression."""
-        return self._base_marginal_payload[0]
-
-    @property
-    def base_support_keys(self) -> List[Tuple[int, ...]]:
-        """Sorted support keys for base marginals."""
-        return self._base_marginal_payload[1]
+                        continue
+                    key_bytes = ndarray_bytes_key(support, dtype=np.int64)
+                    if key_bytes not in seen_keys:
+                        seen_keys.add(key_bytes)
+                        support_keys.append(support)
+                    progress.update(1)
+        finally:
+            progress.close()
+        return support_keys
 
     @cached_property
-    def _base_support_index(self) -> Dict[Tuple[int, ...], int]:
+    def base_marginals(self) -> List[List[List[int]]]:
+        """Canonical marginals under core symmetries before automatic compression."""
+        return [
+            _marginal_from_support_key(key, self.n, self.outcomes)
+            for key in self.base_support_keys
+        ]
+
+    @cached_property
+    def _base_support_index(self) -> Dict[bytes, int]:
         """Lookup from canonical base support key to base-row index."""
-        return {key: idx for idx, key in enumerate(self.base_support_keys)}
+        return {
+            ndarray_bytes_key(key, dtype=np.int64): idx
+            for idx, key in enumerate(self.base_support_keys)
+        }
 
     @property
     def base_nof_marginals(self) -> int:
         """Number of base canonical marginals."""
-        return len(self.base_marginals)
+        return len(self.base_support_keys)
 
     @cached_property
     def _validated_base_support_keys(self) -> bool:
         """Ensure stored base support keys are fixed points of the core canonicalizer."""
         for idx, key in enumerate(self.base_support_keys):
-            support = np.asarray(key, dtype=np.int64)
+            support = np.ascontiguousarray(key, dtype=np.int64)
             canonical = canonical_leximin_support_indices(support, self.N, self.core_group_perms)
-            canonical_key = tuple(int(x) for x in canonical.tolist())
-            if canonical_key != key:
+            if not np.array_equal(canonical, support):
                 raise AssertionError(
                     "Stored base support key is not canonical under the core symmetry group: "
-                    f"row {idx}, stored={key}, canonical={canonical_key}."
+                    f"row {idx}, stored={tuple(int(x) for x in support)}, "
+                    f"canonical={tuple(int(x) for x in canonical)}."
                 )
         return True
 
@@ -1843,15 +2009,14 @@ class PrepLP:
         values = self.base_known_values_symbolic
 
         def _stabilizer_predicate(perm: np.ndarray) -> bool:
-            for idx, key in enumerate(self.base_support_keys):
-                mapped_support = np.asarray([int(perm[pos]) for pos in key], dtype=np.int64)
+            for idx, support in enumerate(self.base_support_keys):
+                mapped_support = np.asarray(perm[support], dtype=np.int64)
                 mapped_canon = canonical_leximin_support_indices(
                     mapped_support,
                     self.N,
                     self.core_group_perms,
                 )
-                mapped_key = tuple(int(x) for x in mapped_canon.tolist())
-                mapped_idx = support_to_idx.get(mapped_key)
+                mapped_idx = support_to_idx.get(ndarray_bytes_key(mapped_canon, dtype=np.int64))
                 if mapped_idx is None:
                     return False
                 if sp.simplify(values[idx] - values[mapped_idx]) != 0:
@@ -1890,20 +2055,20 @@ class PrepLP:
                     continue
                 orbit.add(idx)
                 visited[idx] = True
-                support = np.asarray(self.base_support_keys[idx], dtype=np.int64)
+                support = np.ascontiguousarray(self.base_support_keys[idx], dtype=np.int64)
                 for perm in self.discovered_symmetries:
-                    mapped_support = np.asarray([int(perm[pos]) for pos in support], dtype=np.int64)
+                    mapped_support = np.asarray(perm[support], dtype=np.int64)
                     mapped_canonical = canonical_leximin_support_indices(
                         mapped_support,
                         self.N,
                         self.core_group_perms,
                     )
-                    mapped_key = tuple(int(x) for x in mapped_canonical.tolist())
-                    mapped_idx = support_to_idx.get(mapped_key)
+                    mapped_idx = support_to_idx.get(ndarray_bytes_key(mapped_canonical, dtype=np.int64))
                     if mapped_idx is None:
                         raise AssertionError(
                             "Discovered symmetry moved a base support outside the core-canonical row set: "
-                            f"source={tuple(int(x) for x in support.tolist())}, mapped={mapped_key}."
+                            f"source={tuple(int(x) for x in support)}, "
+                            f"mapped={tuple(int(x) for x in mapped_canonical)}."
                         )
                     if mapped_idx not in orbit:
                         frontier.append(mapped_idx)

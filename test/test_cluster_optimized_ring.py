@@ -2,6 +2,7 @@ import tempfile
 import uuid
 import unittest
 import io
+from itertools import combinations, product
 from pathlib import Path
 from contextlib import redirect_stdout
 from unittest import mock
@@ -15,6 +16,7 @@ from inflation.applications.Final_algo_numba import (
     CACHE_FORMAT_VERSION,
     PrepLP,
     _compute_unique_global_extension_keys_for_row,
+    _count_reduced_base_candidates,
     _detect_worker_count,
     _detect_total_memory_budget_bytes,
     _cycles_from_J,
@@ -28,6 +30,7 @@ from inflation.applications.Final_algo_numba import (
     _perm_from_marginal,
     read_prep_lp_solution,
     _offdiag_slot_index,
+    _iter_reduced_base_supports,
     _union_sorted_unique_uint64,
 )
 from inflation.applications.Group_utils import (
@@ -35,7 +38,7 @@ from inflation.applications.Group_utils import (
     canonical_leximin_coset_chain_uint64,
     canonical_leximin_support_indices,
 )
-from inflation.distributions import GHZDistribution, NSIPRDistribution
+from inflation.distributions import EJMDistribution, GHZDistribution, NSIPRDistribution
 from inflation.lp.lp_utils import solveLP_sparse
 
 
@@ -66,6 +69,14 @@ class _ParityBinaryDistribution:
 def _keep_any_two_or_three_cycles(marginal) -> bool:
     cycles = _cycles_from_J(_perm_from_marginal(marginal))
     return len(cycles) > 0 and all(len(cycle) in (2, 3) for cycle in cycles)
+
+
+def _noninvariant_row_shape_filter(marginal) -> bool:
+    return (
+        len(marginal) > 1
+        and int(marginal[0][2]) == 2
+        and int(marginal[1][4]) == 1
+    )
 
 
 def _encode_event_key(evt: np.ndarray, outcomes: int) -> int:
@@ -155,6 +166,86 @@ def _reference_global_keys_and_matrix(prep: PrepLP) -> tuple[np.ndarray, np.ndar
     return sorted_keys, sorted_dense
 
 
+def _reference_base_support_keys(
+    prep: PrepLP,
+    *,
+    filter_fn=None,
+    filter_on_raw: bool = False,
+) -> list[tuple[int, ...]]:
+    seen: set[tuple[int, ...]] = set()
+    support_keys: list[tuple[int, ...]] = []
+    base_outcomes = tuple(range(prep.outcomes))
+    copy_labels = tuple(range(1, prep.n + 1))
+    for subset_size in range(2, prep.n + 1):
+        for subset in combinations(copy_labels, subset_size):
+            for image in final_algo_numba._derangements(subset):
+                for pat in product(base_outcomes, repeat=subset_size):
+                    support = final_algo_numba._marginal_support_from_cycle_cover(
+                        subset,
+                        image,
+                        pat,
+                        prep.n,
+                        prep.outcomes,
+                    )
+                    if filter_fn is not None and filter_on_raw:
+                        raw_marginal = final_algo_numba._marginal_from_support_key(
+                            support,
+                            prep.n,
+                            prep.outcomes,
+                        )
+                        if not filter_fn(raw_marginal):
+                            continue
+                    canonical = canonical_leximin_support_indices(
+                        support,
+                        prep.N,
+                        prep.core_group_perms,
+                    )
+                    key = tuple(int(x) for x in canonical.tolist())
+                    if filter_fn is not None and not filter_on_raw:
+                        marginal = final_algo_numba._marginal_from_support_key(
+                            key,
+                            prep.n,
+                            prep.outcomes,
+                        )
+                        if not filter_fn(marginal):
+                            continue
+                    if key not in seen:
+                        seen.add(key)
+                        support_keys.append(key)
+    return support_keys
+
+
+def _reference_reduced_base_support_keys(
+    prep: PrepLP,
+    *,
+    filter_fn=None,
+) -> list[np.ndarray]:
+    support_keys: list[np.ndarray] = []
+    for support in _iter_reduced_base_supports(prep.n, prep.outcomes):
+        if filter_fn is not None:
+            marginal = final_algo_numba._marginal_from_support_key(
+                support,
+                prep.n,
+                prep.outcomes,
+            )
+            if not filter_fn(marginal):
+                continue
+        support_keys.append(support)
+    return support_keys
+
+
+def _support_key_bytes(key) -> bytes:
+    return final_algo_numba.ndarray_bytes_key(np.asarray(key, dtype=np.int64), dtype=np.int64)
+
+
+def _support_key_bytes_list(keys) -> list[bytes]:
+    return [_support_key_bytes(key) for key in keys]
+
+
+def _support_key_bytes_set(keys) -> set[bytes]:
+    return set(_support_key_bytes_list(keys))
+
+
 def _legacy_feasibility_args(prep: PrepLP) -> dict:
     direct = prep.inflation_matrix.tocoo(copy=False)
     nof_marginals = prep.nof_marginals
@@ -226,10 +317,9 @@ class TestClusterOptimizedRing(unittest.TestCase):
         for key in prep.base_support_keys[: min(12, prep.base_nof_marginals)]:
             support = np.asarray(key, dtype=np.int64)
             canonical = canonical_leximin_support_indices(support, prep.N, prep.core_group_perms)
-            canonical_key = tuple(int(x) for x in canonical.tolist())
-            self.assertEqual(canonical_key, key)
+            np.testing.assert_array_equal(canonical, support)
             self.assertEqual(
-                canonical_key,
+                tuple(int(x) for x in canonical.tolist()),
                 _reference_support_canonicalizer(support, reference_elements),
             )
 
@@ -340,6 +430,83 @@ class TestClusterOptimizedRing(unittest.TestCase):
 
         custom_prep = self._make_prep(4, marginal_filter_fn=lambda _m: True)
         self.assertEqual(custom_prep.smallest_marginal_size, 2)
+
+    def test_base_support_keys_match_reference_on_unfiltered_nsi_small(self):
+        for n in (3, 4, 5):
+            with self.subTest(n=n):
+                prep = self._make_prep(n, distribution=NSIPRDistribution())
+                self.assertEqual(_support_key_bytes_set(prep.base_support_keys), _support_key_bytes_set(_reference_base_support_keys(prep)))
+                self.assertEqual(len(prep.base_support_keys), len(_reference_base_support_keys(prep)))
+
+    def test_base_nof_marginals_does_not_force_base_marginal_materialization(self):
+        prep = self._make_prep(4, distribution=NSIPRDistribution())
+        self.assertNotIn("base_support_keys", prep.__dict__)
+        self.assertNotIn("base_marginals", prep.__dict__)
+
+        self.assertEqual(prep.base_nof_marginals, len(prep.base_support_keys))
+        self.assertIn("base_support_keys", prep.__dict__)
+        self.assertNotIn("base_marginals", prep.__dict__)
+
+        _ = prep.base_marginals
+        self.assertIn("base_marginals", prep.__dict__)
+
+    def test_symmetry_invariant_helper_filter_matches_reference_canonical_semantics(self):
+        prep = self._make_prep(
+            4,
+            distribution=GHZDistribution(),
+            marginal_filter_fn=keep_loops_of_length([2, 4]),
+        )
+        expected = _reference_base_support_keys(
+            prep,
+            filter_fn=keep_loops_of_length([2, 4]),
+            filter_on_raw=False,
+        )
+        self.assertEqual(_support_key_bytes_set(prep.base_support_keys), _support_key_bytes_set(expected))
+        self.assertEqual(len(prep.base_support_keys), len(expected))
+
+    def test_reduced_base_candidates_match_bruteforce_and_are_fewer(self):
+        for n, outcomes in ((4, 2), (5, 2), (4, 4)):
+            with self.subTest(n=n, outcomes=outcomes):
+                brute_force_total = sum(
+                    sum(1 for _ in final_algo_numba._derangements(subset)) * (outcomes ** len(subset))
+                    for subset_size in range(2, n + 1)
+                    for subset in combinations(tuple(range(1, n + 1)), subset_size)
+                )
+                reduced_total = _count_reduced_base_candidates(n, outcomes)
+                self.assertLess(reduced_total, brute_force_total)
+
+    def test_reduced_base_supports_are_already_core_canonical_on_small_cases(self):
+        cases = (
+            (3, NSIPRDistribution()),
+            (4, NSIPRDistribution()),
+            (5, NSIPRDistribution()),
+            (6, NSIPRDistribution()),
+            (4, GHZDistribution()),
+            (4, EJMDistribution()),
+        )
+        for n, distribution in cases:
+            with self.subTest(n=n, outcomes=distribution.nof_outcomes):
+                prep = self._make_prep(n, distribution=distribution)
+                for support in _iter_reduced_base_supports(prep.n, prep.outcomes):
+                    canonical = canonical_leximin_support_indices(
+                        support,
+                        prep.N,
+                        prep.core_group_perms,
+                    )
+                    np.testing.assert_array_equal(support, canonical)
+
+    def test_non_invariant_filter_uses_generated_representative_semantics(self):
+        prep = self._make_prep(
+            4,
+            distribution=NSIPRDistribution(),
+            marginal_filter_fn=_noninvariant_row_shape_filter,
+        )
+        raw_keys = _reference_reduced_base_support_keys(
+            prep,
+            filter_fn=_noninvariant_row_shape_filter,
+        )
+        self.assertEqual(_support_key_bytes_list(prep.base_support_keys), _support_key_bytes_list(raw_keys))
+        self.assertGreater(len(raw_keys), 0)
 
     def test_one_pass_peak_estimators_match_worker_model(self):
         self.assertEqual(_estimate_per_worker_peak_bytes(12), 24 * 12)
