@@ -136,7 +136,7 @@ dmypy.json
 
 # inflation
 .vscode
-*ptf
+*.ptf
 *task.gz
 *.jtask
 *.json
