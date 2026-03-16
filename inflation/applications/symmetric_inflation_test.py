@@ -123,7 +123,7 @@ class PrepLPExpectations(PrepLP):
         marginal_filter_fn=None,
         auto_discover_symmetries: bool = True,
         compress_rows_under_discovered_group: bool = True,
-        verbose_symmetry_discovery: bool = True,
+        verbose_cache: bool | None = None,
     ) -> None:
         self.E_line = E_line
         self.E_loop = E_loop
@@ -136,7 +136,7 @@ class PrepLPExpectations(PrepLP):
             show_progress=show_progress,
             auto_discover_symmetries=auto_discover_symmetries,
             compress_rows_under_discovered_group=compress_rows_under_discovered_group,
-            verbose_symmetry_discovery=verbose_symmetry_discovery,
+            verbose_cache=verbose_cache,
         )
 
 

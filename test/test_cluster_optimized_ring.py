@@ -19,6 +19,7 @@ from inflation.applications.Final_algo_numba import (
     _detect_total_memory_budget_bytes,
     _cycles_from_J,
     _estimate_active_worker_peak_bytes,
+    _format_exact_row_memory_tally_lines,
     _estimate_per_worker_peak_bytes,
     keep_loops_of_length,
     keep_loops_up_to_three,
@@ -203,7 +204,6 @@ class TestClusterOptimizedRing(unittest.TestCase):
             "show_progress": False,
             "auto_discover_symmetries": True,
             "compress_rows_under_discovered_group": True,
-            "verbose_symmetry_discovery": False,
             "verbose_cache": False,
         }
         defaults.update(kwargs)
@@ -349,6 +349,23 @@ class TestClusterOptimizedRing(unittest.TestCase):
         )
         self.assertEqual(peak, 24 * (10 + 8))
 
+    def test_exact_row_memory_tally_lines_group_and_sort_descending(self):
+        lines = _format_exact_row_memory_tally_lines(
+            np.asarray([1 << 28, 1 << 28, 1 << 27], dtype=np.int64),
+            [
+                [[1, 1, 2, 0, 0], [1, 2, 3, 0, 0], [1, 3, 4, 0, 0], [1, 4, 5, 0, 0], [1, 5, 6, 0, 0], [1, 6, 1, 0, 0]],
+                [[1, 1, 2, 0, 0], [1, 2, 3, 0, 0], [1, 3, 1, 0, 0], [1, 4, 5, 0, 0], [1, 5, 6, 0, 0], [1, 6, 4, 0, 0]],
+                [[1, 1, 2, 0, 0], [1, 2, 3, 0, 0], [1, 3, 4, 0, 0], [1, 4, 1, 0, 0], [1, 5, 6, 0, 0], [1, 6, 5, 0, 0]],
+            ],
+        )
+        self.assertEqual(
+            lines,
+            [
+                "2 rows at 6.0 GiB each (marginal size 6; types: 1x loop of 6; 2x loop of 3)",
+                "1 row at 3.0 GiB each (marginal size 6; type: 1x loop of 4 + 1x loop of 2)",
+            ],
+        )
+
     def test_one_pass_row_kernel_emits_exact_sorted_unique_counts(self):
         prep = self._make_prep(4, distribution=NSIPRDistribution())
         (
@@ -428,8 +445,18 @@ class TestClusterOptimizedRing(unittest.TestCase):
             "_estimate_active_worker_peak_bytes",
             return_value=prep.usable_memory_budget_bytes + 1,
         ):
-            with self.assertRaisesRegex(MemoryError, "Active one-pass workers require"):
+            with self.assertRaisesRegex(MemoryError, "exact active-worker bound is based on the top"):
                 _ = prep.global_keys
+
+    def test_structural_active_worker_overestimate_is_informational_only(self):
+        prep = self._make_prep(3)
+        with mock.patch.object(
+            PrepLP,
+            "worst_case_active_worker_peak_bytes",
+            new_callable=mock.PropertyMock,
+            return_value=prep.usable_memory_budget_bytes + 1,
+        ):
+            _ = prep.global_keys
 
     def test_discovered_row_orbit_validation_is_opt_in(self):
         with mock.patch.object(
@@ -602,7 +629,6 @@ class TestClusterOptimizedRing(unittest.TestCase):
             "marginal_filter_fn": _keep_any_two_or_three_cycles,
             "auto_discover_symmetries": True,
             "show_progress": False,
-            "verbose_symmetry_discovery": False,
             "verbose_cache": False,
         }
         prep_uncompressed = self._make_prep(

@@ -27,7 +27,6 @@ class TestRingSymmetryDiscovery(unittest.TestCase):
             show_progress=False,
             auto_discover_symmetries=True,
             compress_rows_under_discovered_group=True,
-            verbose_symmetry_discovery=False,
             verbose_cache=False,
         )
         self.assertNotIn("variable_names", prep.__dict__)
@@ -50,7 +49,6 @@ class TestRingSymmetryDiscovery(unittest.TestCase):
             show_progress=False,
             auto_discover_symmetries=True,
             compress_rows_under_discovered_group=True,
-            verbose_symmetry_discovery=False,
             verbose_cache=False,
         )
 
@@ -95,7 +93,6 @@ class TestRingSymmetryDiscovery(unittest.TestCase):
             show_progress=False,
             auto_discover_symmetries=True,
             compress_rows_under_discovered_group=False,
-            verbose_symmetry_discovery=False,
             verbose_cache=False,
         )
 

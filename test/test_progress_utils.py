@@ -136,8 +136,6 @@ class TestProgressUtils(unittest.TestCase):
                             show_progress=True,
                             auto_discover_symmetries=True,
                             compress_rows_under_discovered_group=True,
-                            verbose_symmetry_discovery=True,
-                            verbose_cache=True,
                         )
                         _ = prep.global_keys
                         _ = prep.known_values
@@ -146,13 +144,16 @@ class TestProgressUtils(unittest.TestCase):
             stdout_output = stdout_stream.getvalue()
             stderr_output = stderr_stream.getvalue()
 
-            self.assertIn("Structural memory estimate:", stdout_output)
+            self.assertIn("Structural memory estimate", stdout_output)
+            self.assertIn("conservative worst-case", stdout_output)
             self.assertIn("smallest_marginal_size=", stdout_output)
-            self.assertIn("per_worker_raw_buffer=", stdout_output)
-            self.assertIn("per_worker_peak=", stdout_output)
+            self.assertIn("worst_case_row_entries=", stdout_output)
+            self.assertIn("worst_case_per_worker_raw_buffer=", stdout_output)
+            self.assertIn("worst_case_per_worker_peak=", stdout_output)
+            self.assertIn("worst_case_active_peak_if_all_workers_hit_max=", stdout_output)
             self.assertIn("usable_memory=", stdout_output)
             self.assertLess(
-                stdout_output.index("Structural memory estimate:"),
+                stdout_output.index("Structural memory estimate"),
                 stdout_output.index("Canonicalizing marginals"),
             )
             self.assertIn("Canonicalizing marginals", stdout_output)
@@ -161,6 +162,11 @@ class TestProgressUtils(unittest.TestCase):
             self.assertIn("exact_per_worker_raw_buffer=", stdout_output)
             self.assertIn("exact_per_worker_peak=", stdout_output)
             self.assertIn("exact_active_workers=", stdout_output)
+            self.assertIn("Exact row memory tally:", stdout_output)
+            self.assertIn("bytes per raw row entry", stdout_output)
+            self.assertIn("marginal size", stdout_output)
+            self.assertIn("loop of", stdout_output)
+            self.assertIn("Exact active-worker bound uses the top", stdout_output)
             self.assertIn("Finding global extensions...", stdout_output)
             self.assertIn("Global extensions task complete:", stdout_output)
             self.assertIn("rows_done=", stdout_output)
@@ -191,12 +197,11 @@ class TestProgressUtils(unittest.TestCase):
                     show_progress=True,
                     auto_discover_symmetries=True,
                     compress_rows_under_discovered_group=True,
-                    verbose_symmetry_discovery=True,
                     verbose_cache=True,
                 )
 
             cached_stdout = cached_stdout_stream.getvalue()
-            self.assertIn("Structural memory estimate:", cached_stdout)
+            self.assertIn("Structural memory estimate", cached_stdout)
             self.assertIn("Checking LP input cache at", cached_stdout)
             self.assertIn("Loaded cached LP constraints from", cached_stdout)
             self.assertNotIn("\r", cached_stdout)
@@ -209,6 +214,35 @@ class TestProgressUtils(unittest.TestCase):
                 cache_path = prep_cached.cache_path
             if cache_path is not None and cache_path.exists():
                 cache_path.unlink()
+
+    def test_verbose_cache_defaults_to_show_progress_but_explicit_false_suppresses_cache_chatter(self):
+        stdout_stream = _NonTtyStringIO()
+        stderr_stream = _NonTtyStringIO()
+        cache_name = f"test_progress_utils_{uuid.uuid4().hex}"
+        prep = None
+        try:
+            with mock.patch.dict("inflation.applications.Final_algo_numba.os.environ", {"SLURM_CPUS_PER_TASK": "2"}, clear=False):
+                with mock.patch("inflation.applications.Final_algo_numba.set_num_threads"):
+                    with redirect_stdout(stdout_stream), redirect_stderr(stderr_stream):
+                        prep = PrepLP(
+                            3,
+                            _UniformBinaryDistribution(),
+                            problem_name=cache_name,
+                            show_progress=True,
+                            auto_discover_symmetries=True,
+                            compress_rows_under_discovered_group=True,
+                            verbose_cache=False,
+                        )
+                        _ = prep.global_keys
+                        _ = prep.known_values
+                        _ = prep.inflation_matrix
+
+            stdout_output = stdout_stream.getvalue()
+            self.assertNotIn("Saving LP input cache to", stdout_output)
+            self.assertNotIn("Saved LP constraints cache to", stdout_output)
+        finally:
+            if prep is not None and prep.cache_path is not None and prep.cache_path.exists():
+                prep.cache_path.unlink()
 
     def test_ejm_entrypoint_materializes_inputs_before_solver_setup(self):
         stdout_stream = _NonTtyStringIO()

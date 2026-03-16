@@ -19,7 +19,7 @@ import os
 from pathlib import Path
 import tempfile
 from time import perf_counter
-from typing import Dict, Iterable, Iterator, List, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Sequence, Tuple, cast
 import sys
 
 import numpy as np
@@ -537,6 +537,62 @@ def _format_gib(num_bytes: int) -> str:
     """Format byte counts in GiB with one decimal place."""
     gib = float(num_bytes) / float(1024 ** 3)
     return f"{gib:.1f} GiB"
+
+
+def _format_cycle_length_signature(cycle_lengths: Sequence[int]) -> str:
+    """Format a cycle-length multiset like `(3, 2)` as `1x loop of 3 + 1x loop of 2`."""
+    counts = Counter(int(length) for length in cycle_lengths)
+    parts = [f"{counts[length]}x loop of {length}" for length in sorted(counts, reverse=True)]
+    return " + ".join(parts)
+
+
+def _marginal_cycle_length_signature(marginal: List[List[int]]) -> tuple[int, ...]:
+    """Canonical cycle-length signature for a marginal."""
+    cycles = _cycles_from_J(_perm_from_marginal(marginal))
+    return tuple(sorted((len(cycle) for cycle in cycles), reverse=True))
+
+
+def _format_exact_row_memory_tally_lines(
+    row_extension_counts: np.ndarray,
+    marginals: Sequence[List[List[int]]],
+) -> list[str]:
+    """Format grouped exact one-pass per-row peaks with marginal-size/type annotations."""
+    counts = np.asarray(row_extension_counts, dtype=np.int64)
+    if counts.size == 0:
+        return []
+    if len(marginals) != int(counts.size):
+        raise ValueError("Exact row memory tally requires one marginal per row-extension count.")
+
+    buckets: dict[int, dict[str, object]] = {}
+    for marginal, row_count in zip(marginals, counts.tolist()):
+        peak_bytes = 24 * int(row_count)
+        bucket = buckets.setdefault(
+            peak_bytes,
+            {
+                "count": 0,
+                "marginal_size": len(marginal),
+                "signatures": set(),
+            },
+        )
+        bucket["count"] = int(bucket["count"]) + 1
+        cast_signatures = bucket["signatures"]
+        assert isinstance(cast_signatures, set)
+        cast_signatures.add(_format_cycle_length_signature(_marginal_cycle_length_signature(marginal)))
+
+    lines: list[str] = []
+    for peak_bytes in sorted(buckets.keys(), reverse=True):
+        bucket = buckets[peak_bytes]
+        bucket_count = int(bucket["count"])
+        marginal_size = int(bucket["marginal_size"])
+        row_word = "row" if bucket_count == 1 else "rows"
+        signatures = sorted(cast(set[str], bucket["signatures"]))
+        type_word = "type" if len(signatures) == 1 else "types"
+        signature_text = "; ".join(signatures)
+        lines.append(
+            f"{bucket_count} {row_word} at {_format_gib(peak_bytes)} each "
+            f"(marginal size {marginal_size}; {type_word}: {signature_text})"
+        )
+    return lines
 
 
 def _log_progress_line(message: str, *, enabled: bool) -> None:
@@ -1297,8 +1353,7 @@ class PrepLP:
         auto_discover_symmetries: bool = True,
         compress_rows_under_discovered_group: bool = True,
         validate_discovered_row_orbits: bool = False,
-        verbose_symmetry_discovery: bool = True,
-        verbose_cache: bool = True,
+        verbose_cache: bool | None = None,
     ) -> None:
         self._requested_n = int(n)
         self.distribution = distribution
@@ -1308,8 +1363,7 @@ class PrepLP:
         self.auto_discover_symmetries = auto_discover_symmetries
         self.compress_rows_under_discovered_group = compress_rows_under_discovered_group
         self.validate_discovered_row_orbits = validate_discovered_row_orbits
-        self.verbose_symmetry_discovery = verbose_symmetry_discovery
-        self.verbose_cache = verbose_cache
+        self.verbose_cache = self.show_progress if verbose_cache is None else bool(verbose_cache)
         self.prob = ring_problem(self._requested_n, distribution)
         self._cached_inflation_matrix: csr_array | None = None
         self._cached_global_keys: np.ndarray | None = None
@@ -1413,14 +1467,13 @@ class PrepLP:
         estimate_name = getattr(self.marginal_filter_fn, "memory_estimate_name", None)
         estimate_suffix = f", filter={estimate_name}" if estimate_name else ""
         _log_progress_line(
-            "Structural memory estimate: "
+            "Structural memory estimate (conservative worst-case; assumes every worker gets a largest possible row): "
             f"workers={self.worker_count}, "
-            f"nof_off_diagonal_slots={self.nof_off_diagonal_slots}, "
             f"smallest_marginal_size={self.smallest_marginal_size}, "
-            f"max_row_entries={self.estimated_max_row_entries}, "
-            f"per_worker_raw_buffer={_format_gib(self.per_worker_raw_buffer_bytes)}, "
-            f"per_worker_peak={_format_gib(self.per_worker_peak_bytes)}, "
-            f"worst_case_active_workers={_format_gib(self.worst_case_active_worker_peak_bytes)}, "
+            f"worst_case_row_entries={self.estimated_max_row_entries}, "
+            f"worst_case_per_worker_raw_buffer={_format_gib(self.per_worker_raw_buffer_bytes)}, "
+            f"worst_case_per_worker_peak={_format_gib(self.per_worker_peak_bytes)}, "
+            f"worst_case_active_peak_if_all_workers_hit_max={_format_gib(self.worst_case_active_worker_peak_bytes)}, "
             f"usable_memory={_format_gib(self.usable_memory_budget_bytes)}"
             f"{estimate_suffix}",
             enabled=self.show_progress,
@@ -2156,6 +2209,7 @@ class PrepLP:
         exact_per_worker_raw_buffer_bytes = _estimate_per_worker_raw_buffer_bytes(exact_max_row_entries)
         exact_per_worker_peak_bytes = _estimate_per_worker_peak_bytes(exact_max_row_entries)
         exact_active_worker_peak_bytes = _estimate_active_worker_peak_bytes(row_extension_counts, max_workers)
+        active_worker_rows = min(max_workers, int(row_extension_counts.size))
         usable_memory_budget = self.usable_memory_budget_bytes
 
         if exact_max_row_entries > self.estimated_max_row_entries:
@@ -2163,25 +2217,6 @@ class PrepLP:
                 "Exact row-extension count exceeded the structural max-row estimate: "
                 f"exact={exact_max_row_entries}, structural={self.estimated_max_row_entries}."
             )
-        if self.per_worker_peak_bytes > usable_memory_budget:
-            raise MemoryError(
-                "The structural worst-case marginal row requires a one-pass worker peak of "
-                f"{_format_gib(self.per_worker_peak_bytes)}, which exceeds the usable build budget "
-                f"of {_format_gib(usable_memory_budget)}."
-            )
-        if self.worst_case_active_worker_peak_bytes > usable_memory_budget:
-            raise MemoryError(
-                "The structural active one-pass workers require "
-                f"{_format_gib(self.worst_case_active_worker_peak_bytes)}, which exceeds the usable build budget "
-                f"of {_format_gib(usable_memory_budget)}."
-            )
-        if exact_active_worker_peak_bytes > usable_memory_budget:
-            raise MemoryError(
-                "Active one-pass workers require "
-                f"{_format_gib(exact_active_worker_peak_bytes)}, which exceeds the usable build budget "
-                f"of {_format_gib(usable_memory_budget)}."
-            )
-
         _log_progress_line(
             "Global extension workload: "
             f"workers={max_workers}, "
@@ -2194,6 +2229,37 @@ class PrepLP:
             f"scratch={scratch_dir}",
             enabled=self.show_progress,
         )
+        _log_progress_line(
+            "Exact row memory tally: "
+            "one-pass worker peak = raw keys + unique keys + counts = 24 bytes per raw row entry.",
+            enabled=self.show_progress,
+        )
+        for tally_line in _format_exact_row_memory_tally_lines(row_extension_counts, self.marginals):
+            _log_progress_line(f"  {tally_line}", enabled=self.show_progress)
+        _log_progress_line(
+            "Exact active-worker bound uses the top "
+            f"{active_worker_rows} row peak{'s' if active_worker_rows != 1 else ''} "
+            f"because at most {max_workers} worker{'s' if max_workers != 1 else ''} "
+            "are active at once. "
+            f"Those top {active_worker_rows} rows require {_format_gib(exact_active_worker_peak_bytes)} in total. "
+            f"usable_memory={_format_gib(usable_memory_budget)}",
+            enabled=self.show_progress,
+        )
+
+        if self.per_worker_peak_bytes > usable_memory_budget:
+            raise MemoryError(
+                "The structural worst-case marginal row requires a one-pass worker peak of "
+                f"{_format_gib(self.per_worker_peak_bytes)}, which exceeds the usable build budget "
+                f"of {_format_gib(usable_memory_budget)}."
+            )
+        if exact_active_worker_peak_bytes > usable_memory_budget:
+            raise MemoryError(
+                "The exact active-worker bound is based on the top "
+                f"{active_worker_rows} row peak{'s' if active_worker_rows != 1 else ''} and requires "
+                f"{_format_gib(exact_active_worker_peak_bytes)}, which exceeds the usable build budget "
+                f"of {_format_gib(usable_memory_budget)} before workers are launched. "
+                "Reducing cpus-per-task lowers this exact active-worker bound."
+            )
 
         state = self._row_archive_worker_state(scratch_dir)
         rows_done = 0
@@ -2886,7 +2952,6 @@ if __name__ == "__main__":
             show_progress=True,
             auto_discover_symmetries=True,
             compress_rows_under_discovered_group=True,
-            verbose_symmetry_discovery=True,
         )
         print(f"  base rows={prep.base_nof_marginals}, compressed rows={prep.nof_marginals}")
         demo_preps[label] = prep
