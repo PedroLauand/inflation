@@ -28,7 +28,8 @@ from .symmetry_utils import group_elements_from_generators
 from .utils import (format_permutations,
                     partsextractor,
                     perm_combiner,
-                    all_and_maximal_cliques)
+                    all_and_maximal_cliques,
+                    ndarray_bytes_key)
 from .cliques_with_symmetry import all_and_maximal_cliques_symmetry
 
 # Force warnings.warn() to omit the source code line in the message
@@ -377,7 +378,7 @@ class InflationProblem:
             axis=0).astype(self._np_dtype)
         
         # Create hashes and overlap matrix for quick reference
-        self._inflation_indices_hash = {op.tobytes(): i for i, op
+        self._inflation_indices_hash = {ndarray_bytes_key(op, dtype=self._np_dtype): i for i, op
                                         in enumerate(
                 self._all_unique_inflation_indices)}
         if really_just_one_source:
@@ -446,7 +447,7 @@ class InflationProblem:
         self._nr_operators = len(self._lexorder)
 
         self._lexorder_for_factorization = np.array([
-            self._inflation_indices_hash[op.tobytes()]
+            self._inflation_indices_hash[ndarray_bytes_key(op, dtype=self._np_dtype)]
             for op in self._lexorder[:, 1:-2]],
             dtype=np.intc)
 
@@ -536,10 +537,13 @@ class InflationProblem:
         Returns
         -------
         dict
-            Mapping an operator in .tobytes() for quick lookup of its index
+            Mapping an operator byte key for quick lookup of its index
             in the lexorder.
         """
-        return {op.tobytes(): i for i, op in enumerate(self._lexorder)}
+        return {
+            ndarray_bytes_key(op, dtype=self._np_dtype): i
+            for i, op in enumerate(self._lexorder)
+        }
     
     def mon_to_lexrepr(self, mon: np.ndarray) -> np.ndarray:
         ops_as_hashes = list(map(self._from_2dndarray, mon))
@@ -557,7 +561,7 @@ class InflationProblem:
         array2d : numpy.ndarray
             Monomial encoded as a 2D array.
         """
-        return np.asarray(array2d, dtype=self._np_dtype).tobytes()
+        return ndarray_bytes_key(array2d, dtype=self._np_dtype)
 
     @cached_property
     def _any_inflation(self) -> bool:
@@ -945,7 +949,7 @@ class InflationProblem:
 
         if canonical_order:
             disconnected_components = tuple(sorted(disconnected_components,
-                                                   key=lambda x: x.tobytes()))
+                                                   key=lambda x: ndarray_bytes_key(x, dtype=self._np_dtype)))
         return disconnected_components
 
     ###########################################################################
@@ -985,7 +989,7 @@ class InflationProblem:
                                                      permutation)
                     try:
                         new_order = np.fromiter(
-                            (self._lexorder_lookup[op.tobytes()]
+                            (self._lexorder_lookup[ndarray_bytes_key(op, dtype=self._np_dtype)]
                              for op in adjusted_ops),
                             dtype=np.intc
                         )
@@ -1112,7 +1116,7 @@ class InflationProblem:
                 template[self._lexorder[:, 0] == p + 1, 0] = new_p + 1
             new_source_perm = np.argsort(source_perm)
             template = template[:, [0]+(1+new_source_perm).tolist() + [-2, -1]]
-            lexorder_perm = np.array([self._lexorder_lookup[op.tobytes()]
+            lexorder_perm = np.array([self._lexorder_lookup[ndarray_bytes_key(op, dtype=self._np_dtype)]
                                       for op in template])
             lexorder_perms += [lexorder_perm]
         return np.array(lexorder_perms)
@@ -1262,7 +1266,7 @@ class InflationProblem:
                                                  permutation)
                 try:
                     new_order = np.fromiter(
-                        (self._lexorder_lookup[op.tobytes()]
+                        (self._lexorder_lookup[ndarray_bytes_key(op, dtype=self._np_dtype)]
                          for op in adjusted_ops),
                         dtype=np.intc
                     )

@@ -54,6 +54,15 @@ def format_permutations(array: Union[
     return np.pad(source_permutation, ((0, 0), (1, 0)))
 
 
+def ndarray_bytes_key(array: np.ndarray, dtype: Optional[np.dtype] = None) -> bytes:
+    """Return a stable byte key for an ndarray-like object.
+
+    Normalizing through ``np.ascontiguousarray`` makes the key explicit and
+    independent of the input view layout before calling ``tobytes()``.
+    """
+    return np.ascontiguousarray(np.asarray(array, dtype=dtype)).tobytes()
+
+
 def clean_coefficients(cert: Dict[str, float],
                        chop_tol: float = 1e-10,
                        round_decimals: int = 3) -> Dict:

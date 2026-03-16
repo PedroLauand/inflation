@@ -12,6 +12,8 @@ import numpy as np
 from sympy.combinatorics import Permutation, PermutationGroup
 from tqdm import tqdm
 
+from .utils import ndarray_bytes_key
+
 if TYPE_CHECKING:
     from .InflationProblem import InflationProblem
 
@@ -197,10 +199,10 @@ def discover_distribution_symmetries(
             for p, (x, a) in enumerate(zip(ins, outs)):
                 original_dag_lexboolvec[original_dag_events_order[(p + 1, x, a)]] = True
             original_dag_monomials_lexboolvecs.append(original_dag_lexboolvec)
-            original_dag_monomials_values[original_dag_lexboolvec.tobytes()] = distribution[(*outs, *ins)]
+            original_dag_monomials_values[ndarray_bytes_key(original_dag_lexboolvec)] = distribution[(*outs, *ins)]
     original_dag_monomials_lexboolvecs = np.asarray(original_dag_monomials_lexboolvecs, dtype=bool)
     original_values_1d = np.asarray(
-        [original_dag_monomials_values[mon.tobytes()] for mon in original_dag_monomials_lexboolvecs],
+        [original_dag_monomials_values[ndarray_bytes_key(mon)] for mon in original_dag_monomials_lexboolvecs],
         dtype=float,
     )
 
@@ -208,7 +210,7 @@ def discover_distribution_symmetries(
         perm_orig = lexperm_to_origperm(perm_lexorder, scenario)
         lexboolvecs = original_dag_monomials_lexboolvecs[:, perm_orig]
         new_values_1d = np.asarray(
-            [original_dag_monomials_values[mon.tobytes()] for mon in lexboolvecs],
+            [original_dag_monomials_values[ndarray_bytes_key(mon)] for mon in lexboolvecs],
             dtype=float,
         )
         return bool(np.allclose(new_values_1d, original_values_1d))

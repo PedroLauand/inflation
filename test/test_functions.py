@@ -6,7 +6,7 @@ import numpy as np
 from sympy import Symbol
 
 from inflation import InflationProblem, InflationSDP, InflationLP
-from inflation.utils import all_and_maximal_cliques
+from inflation.utils import all_and_maximal_cliques, ndarray_bytes_key
 from itertools import product, permutations
 
 
@@ -233,7 +233,7 @@ class TestPhysicalMonomialGeneration(unittest.TestCase):
         initial_monomial[:, 0] = 1 + party
         for mon_idx in range(max_monomial_length):
             initial_monomial[mon_idx, 1:-2] = hypergraph[:, party] * (1 + mon_idx)
-        inflation_equivalents = {initial_monomial.tobytes(): initial_monomial}
+        inflation_equivalents = {ndarray_bytes_key(initial_monomial): initial_monomial}
         all_permutations_per_relevant_source = [
             format_permutations(list(permutations(range(inflevel))))
             for inflevel in relevant_inflevels.flat]
@@ -244,7 +244,7 @@ class TestPhysicalMonomialGeneration(unittest.TestCase):
                                                         source,
                                                         permutation[perm_idx]),
                                         lp._lexorder)
-            inflation_equivalents[permuted.tobytes()] = permuted
+            inflation_equivalents[ndarray_bytes_key(permuted)] = permuted
 
         # Insert all combinations of inputs and outputs
         template_mon = np.stack(tuple(inflation_equivalents.values()))

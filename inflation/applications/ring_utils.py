@@ -6,6 +6,7 @@ import numpy as np
 
 from ..InflationProblem import InflationProblem
 from ..sdp.fast_npa import commutation_matrix
+from ..utils import ndarray_bytes_key
 
 _RING_LEXORDER_CACHED_ATTRS = (
     "_lexorder_lookup",
@@ -98,7 +99,8 @@ def strip_ring_self_loops(prob: InflationProblem) -> InflationProblem:
         axis=0,
     ).astype(prob._np_dtype)
     prob._inflation_indices_hash = {
-        op.tobytes(): idx for idx, op in enumerate(prob._all_unique_inflation_indices)
+        ndarray_bytes_key(op, dtype=prob._np_dtype): idx
+        for idx, op in enumerate(prob._all_unique_inflation_indices)
     }
     prob._inflation_indices_overlap = prob.one_source_overlap_matrix(
         np.asarray(prob._all_unique_inflation_indices, dtype=prob._np_dtype)
@@ -112,7 +114,10 @@ def strip_ring_self_loops(prob: InflationProblem) -> InflationProblem:
     prob.party_from_templateidx = prob.party_from_lexidx[prob._template_idxs]
     prob._nr_operators = len(prob._lexorder)
     prob._lexorder_for_factorization = np.array(
-        [prob._inflation_indices_hash[op.tobytes()] for op in prob._lexorder[:, 1:-2]],
+        [
+            prob._inflation_indices_hash[ndarray_bytes_key(op, dtype=prob._np_dtype)]
+            for op in prob._lexorder[:, 1:-2]
+        ],
         dtype=np.intc,
     )
 
