@@ -43,7 +43,7 @@ class _FakePrep:
 
     @property
     def global_keys(self):
-        print("Canonicalizing marginals")
+        print("Enumerating base marginals")
         return self._global_keys
 
     @property
@@ -154,9 +154,9 @@ class TestProgressUtils(unittest.TestCase):
             self.assertIn("usable_memory=", stdout_output)
             self.assertLess(
                 stdout_output.index("Structural memory estimate"),
-                stdout_output.index("Canonicalizing marginals"),
+                stdout_output.index("Enumerating base marginals"),
             )
-            self.assertIn("Canonicalizing marginals", stdout_output)
+            self.assertIn("Enumerating base marginals", stdout_output)
             self.assertIn("Computing marginal values...", stdout_output)
             self.assertIn("Global extension workload:", stdout_output)
             self.assertIn("exact_per_worker_raw_buffer=", stdout_output)
@@ -181,7 +181,7 @@ class TestProgressUtils(unittest.TestCase):
             self.assertNotIn("waves=", stdout_output)
             self.assertNotIn("Discovering ring stabilizing symmetries", stdout_output)
             self.assertNotIn("Stabilizer subgroup summary", stdout_output)
-            self.assertNotIn("Canonicalizing marginals", stderr_output)
+            self.assertNotIn("Enumerating base marginals", stderr_output)
             self.assertNotIn("Computing marginal values...", stderr_output)
             self.assertNotIn("Finding global extensions...", stderr_output)
             self.assertNotIn("\r", stdout_output)
@@ -261,7 +261,7 @@ class TestProgressUtils(unittest.TestCase):
         output = stdout_stream.getvalue()
         expected_markers = [
             "PrepLP initialized for n=3; materializing LP inputs before Mosek.",
-            "Canonicalizing marginals",
+            "Enumerating base marginals",
             "LP inputs ready for n=3: rows=7, cols=11. Starting Mosek setup.",
             "Starting pre-processing for the LP solver...",
             "Optimizer started.",

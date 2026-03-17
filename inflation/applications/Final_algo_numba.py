@@ -1860,37 +1860,25 @@ class PrepLP:
         it is applied to that raw pre-validation representative before any safety
         assertions.
         """
-        seen_keys: set[bytes] = set()
-        support_keys: List[np.ndarray] = []
         total_candidates = _count_reduced_base_candidates(self.n, self.outcomes)
-        progress = tqdm(
+        progress_iter = tqdm(
+            _iter_reduced_base_supports(self.n, self.outcomes),
             total=total_candidates,
-            desc="Canonicalizing marginals",
+            desc="Enumerating base marginals",
             disable=not self.show_progress,
         )
         filter_fn = self.marginal_filter_fn
         try:
             if filter_fn is None:
-                for support in _iter_reduced_base_supports(self.n, self.outcomes):
-                    key_bytes = ndarray_bytes_key(support, dtype=np.int64)
-                    if key_bytes not in seen_keys:
-                        seen_keys.add(key_bytes)
-                        support_keys.append(support)
-                    progress.update(1)
-            else:
-                for support in _iter_reduced_base_supports(self.n, self.outcomes):
-                    raw_marginal = _marginal_from_support_key(support, self.n, self.outcomes)
-                    if not filter_fn(raw_marginal):
-                        progress.update(1)
-                        continue
-                    key_bytes = ndarray_bytes_key(support, dtype=np.int64)
-                    if key_bytes not in seen_keys:
-                        seen_keys.add(key_bytes)
-                        support_keys.append(support)
-                    progress.update(1)
+                return list(progress_iter)
+            support_keys: List[np.ndarray] = []
+            for support in progress_iter:
+                raw_marginal = _marginal_from_support_key(support, self.n, self.outcomes)
+                if filter_fn(raw_marginal):
+                    support_keys.append(support)
+            return support_keys
         finally:
-            progress.close()
-        return support_keys
+            progress_iter.close()
 
     @cached_property
     def base_marginals(self) -> List[List[List[int]]]:
