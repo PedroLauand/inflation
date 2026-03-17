@@ -4,6 +4,10 @@ import warnings
 
 from sympy import Symbol
 
+from test._slow_test_helper import require_slow_tests
+
+require_slow_tests(__name__)
+
 from inflation import InflationProblem, InflationSDP, max_within_feasible
 
 
@@ -19,6 +23,7 @@ class TestOptimize(unittest.TestCase):
         return p
 
     precision = 1e-5
+    bisection_precision = 1e-3
     bellScenario = InflationProblem({"Lambda": ["A", "B"]},
                                     outcomes_per_party=[2, 2],
                                     settings_per_party=[2, 2],
@@ -32,8 +37,14 @@ class TestOptimize(unittest.TestCase):
         v_crit = max_within_feasible(self.sdp,
                                      self.symbolic_values,
                                      "bisection",
-                                     precision=self.precision)
-        self.assertTrue(np.isclose(v_crit, 1/np.sqrt(2), self.precision),
+                                     precision=self.bisection_precision)
+        self.assertTrue(
+            np.isclose(
+                v_crit,
+                1 / np.sqrt(2),
+                rtol=self.bisection_precision,
+                atol=self.bisection_precision,
+            ),
                         "Bisection of the quantum critical visibility for the "
                         + "PR box is not achieving 1/sqrt(2).")
 

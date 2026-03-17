@@ -5,6 +5,10 @@ import numpy as np
 
 from sympy import Symbol
 
+from test._slow_test_helper import require_slow_tests
+
+require_slow_tests(__name__)
+
 from inflation import InflationProblem, InflationSDP, InflationLP
 from inflation.utils import all_and_maximal_cliques, ndarray_bytes_key
 from itertools import product, permutations

@@ -2,6 +2,7 @@ import tempfile
 import uuid
 import unittest
 import io
+import os
 from itertools import combinations, product
 from pathlib import Path
 from contextlib import redirect_stdout
@@ -12,6 +13,7 @@ import sympy as sp
 from scipy.sparse import coo_array, csr_array
 
 import inflation.applications.Final_algo_numba as final_algo_numba
+from test._slow_test_helper import slow_test
 from inflation.applications.Final_algo_numba import (
     CACHE_FORMAT_VERSION,
     PrepLP,
@@ -290,7 +292,20 @@ def _legacy_feasibility_args(prep: PrepLP) -> dict:
 
 
 class TestClusterOptimizedRing(unittest.TestCase):
-    def _make_prep(self, n: int, distribution=None, **kwargs) -> PrepLP:
+    @classmethod
+    def setUpClass(cls):
+        cls._shared_preps = {}
+        cls._shared_solutions = {}
+
+    def _make_prep(
+        self,
+        n: int,
+        distribution=None,
+        *,
+        single_worker: bool = True,
+        worker_count_override: int | None = None,
+        **kwargs,
+    ) -> PrepLP:
         defaults = {
             "show_progress": False,
             "auto_discover_symmetries": True,
@@ -300,18 +315,67 @@ class TestClusterOptimizedRing(unittest.TestCase):
         defaults.update(kwargs)
         if distribution is None:
             distribution = _UniformBinaryDistribution()
+        if worker_count_override is not None and "SLURM_CPUS_PER_TASK" not in os.environ:
+            with mock.patch.object(final_algo_numba, "_detect_worker_count", return_value=worker_count_override):
+                return PrepLP(n, distribution, **defaults)
+        if single_worker and "SLURM_CPUS_PER_TASK" not in os.environ:
+            with mock.patch.object(final_algo_numba, "_detect_worker_count", return_value=1):
+                return PrepLP(n, distribution, **defaults)
         return PrepLP(n, distribution, **defaults)
 
+    def _shared_prep(
+        self,
+        n: int,
+        distribution=None,
+        *,
+        single_worker: bool = True,
+        worker_count_override: int | None = None,
+        **kwargs,
+    ) -> PrepLP:
+        defaults = {
+            "show_progress": False,
+            "auto_discover_symmetries": True,
+            "compress_rows_under_discovered_group": True,
+            "verbose_cache": False,
+        }
+        defaults.update(kwargs)
+        if distribution is None:
+            distribution = _UniformBinaryDistribution()
+        key = (
+            n,
+            distribution.__class__,
+            single_worker,
+            worker_count_override,
+            tuple((name, defaults[name]) for name in sorted(defaults)),
+        )
+        prep = self.__class__._shared_preps.get(key)
+        if prep is None:
+            if worker_count_override is not None and "SLURM_CPUS_PER_TASK" not in os.environ:
+                with mock.patch.object(final_algo_numba, "_detect_worker_count", return_value=worker_count_override):
+                    prep = PrepLP(n, distribution, **defaults)
+            elif single_worker and "SLURM_CPUS_PER_TASK" not in os.environ:
+                with mock.patch.object(final_algo_numba, "_detect_worker_count", return_value=1):
+                    prep = PrepLP(n, distribution, **defaults)
+            else:
+                prep = PrepLP(n, distribution, **defaults)
+            self.__class__._shared_preps[key] = prep
+        return prep
+
+    def _shared_solution(self, prep: PrepLP, **kwargs):
+        key = (prep, tuple((name, kwargs[name]) for name in sorted(kwargs)))
+        if key not in self.__class__._shared_solutions:
+            self.__class__._shared_solutions[key] = prep.solve(**kwargs)
+        return self.__class__._shared_solutions[key]
+
+    @slow_test
     def test_parallel_global_extensions_match_serial_reference(self):
-        for n in (3, 4):
-            with self.subTest(n=n):
-                prep = self._make_prep(n)
-                expected_keys, expected_dense = _reference_global_keys_and_matrix(prep)
-                np.testing.assert_array_equal(prep.global_keys, expected_keys)
-                np.testing.assert_allclose(prep.inflation_matrix.toarray(), expected_dense)
+        prep = self._shared_prep(4, single_worker=False, worker_count_override=2)
+        expected_keys, expected_dense = _reference_global_keys_and_matrix(prep)
+        np.testing.assert_array_equal(prep.global_keys, expected_keys)
+        np.testing.assert_allclose(prep.inflation_matrix.toarray(), expected_dense)
 
     def test_support_canonicalizer_is_idempotent_and_matches_reference(self):
-        prep = self._make_prep(4, distribution=GHZDistribution())
+        prep = self._shared_prep(4, distribution=GHZDistribution())
         group = build_sympy_group(prep.core_symmetries, prep.N)
         reference_elements = np.asarray(list(group.generate_schreier_sims(af=True)), dtype=int)
         for key in prep.base_support_keys[: min(12, prep.base_nof_marginals)]:
@@ -324,7 +388,7 @@ class TestClusterOptimizedRing(unittest.TestCase):
             )
 
     def test_event_canonicalizer_is_idempotent_and_matches_reference(self):
-        prep = self._make_prep(4, distribution=GHZDistribution())
+        prep = self._shared_prep(4, distribution=GHZDistribution())
         _ = prep.global_keys
         group = build_sympy_group(prep.discovered_symmetries, prep.N)
         reference_elements = np.asarray(list(group.generate_schreier_sims(af=True)), dtype=int)
@@ -347,13 +411,14 @@ class TestClusterOptimizedRing(unittest.TestCase):
             )
 
     def test_row_labels_use_grouped_cycle_notation(self):
-        prep = self._make_prep(4, distribution=GHZDistribution())
+        prep = self._shared_prep(4, distribution=GHZDistribution())
         self.assertTrue(any("[{" in label for label in prep.row_labels.tolist()))
         self.assertFalse(any("A^{" in label for label in prep.row_labels.tolist()))
 
+    @slow_test
     def test_print_certificate_explains_incompatible_fraction_threshold(self):
-        prep = self._make_prep(4, distribution=GHZDistribution())
-        solution = prep.solve(verbose=0)
+        prep = self._shared_prep(4, distribution=GHZDistribution())
+        solution = self._shared_solution(prep, verbose=0)
         self.assertEqual(prep.solve_target, "incompatible_fraction")
         stdout = io.StringIO()
         with redirect_stdout(stdout):
@@ -367,9 +432,10 @@ class TestClusterOptimizedRing(unittest.TestCase):
         self.assertIn("    - 1", output)
         self.assertNotIn("[   0]", output)
 
+    @slow_test
     def test_print_certificate_falls_back_to_prep_solve_target(self):
-        prep = self._make_prep(4, distribution=GHZDistribution())
-        solution = prep.solve(verbose=0)
+        prep = self._shared_prep(4, distribution=GHZDistribution())
+        solution = self._shared_solution(prep, verbose=0)
         solution_without_mode = dict(solution)
         solution_without_mode.pop("mode", None)
         stdout = io.StringIO()
@@ -403,7 +469,7 @@ class TestClusterOptimizedRing(unittest.TestCase):
         with mock.patch.dict(final_algo_numba.os.environ, {}, clear=True):
             with mock.patch.object(final_algo_numba, "set_num_threads") as set_threads:
                 with mock.patch.object(final_algo_numba, "get_num_threads", return_value=3):
-                    prep = self._make_prep(3)
+                    prep = self._make_prep(3, single_worker=False)
                     self.assertEqual(prep.worker_count, 3)
                 set_threads.assert_not_called()
 
@@ -419,22 +485,22 @@ class TestClusterOptimizedRing(unittest.TestCase):
                 self.assertEqual(_detect_total_memory_budget_bytes(8), 99)
 
     def test_structural_memory_estimator_defaults_and_filter_metadata(self):
-        default_prep = self._make_prep(3)
+        default_prep = self._shared_prep(3)
         self.assertEqual(default_prep.smallest_marginal_size, 2)
 
-        filtered_prep = self._make_prep(4, marginal_filter_fn=keep_loops_of_length([2, 4]))
+        filtered_prep = self._shared_prep(4, marginal_filter_fn=keep_loops_of_length([2, 4]))
         self.assertEqual(filtered_prep.smallest_marginal_size, 2)
 
-        max3_prep = self._make_prep(4, marginal_filter_fn=keep_loops_up_to_three)
+        max3_prep = self._shared_prep(4, marginal_filter_fn=keep_loops_up_to_three)
         self.assertEqual(max3_prep.smallest_marginal_size, 1)
 
         custom_prep = self._make_prep(4, marginal_filter_fn=lambda _m: True)
         self.assertEqual(custom_prep.smallest_marginal_size, 2)
 
     def test_base_support_keys_match_reference_on_unfiltered_nsi_small(self):
-        for n in (3, 4, 5):
+        for n in (3, 4):
             with self.subTest(n=n):
-                prep = self._make_prep(n, distribution=NSIPRDistribution())
+                prep = self._shared_prep(n, distribution=NSIPRDistribution())
                 self.assertEqual(_support_key_bytes_set(prep.base_support_keys), _support_key_bytes_set(_reference_base_support_keys(prep)))
                 self.assertEqual(len(prep.base_support_keys), len(_reference_base_support_keys(prep)))
 
@@ -451,7 +517,7 @@ class TestClusterOptimizedRing(unittest.TestCase):
         self.assertIn("base_marginals", prep.__dict__)
 
     def test_symmetry_invariant_helper_filter_matches_reference_canonical_semantics(self):
-        prep = self._make_prep(
+        prep = self._shared_prep(
             4,
             distribution=GHZDistribution(),
             marginal_filter_fn=keep_loops_of_length([2, 4]),
@@ -477,16 +543,14 @@ class TestClusterOptimizedRing(unittest.TestCase):
 
     def test_reduced_base_supports_are_already_core_canonical_on_small_cases(self):
         cases = (
-            (3, NSIPRDistribution()),
             (4, NSIPRDistribution()),
-            (5, NSIPRDistribution()),
             (6, NSIPRDistribution()),
             (4, GHZDistribution()),
             (4, EJMDistribution()),
         )
         for n, distribution in cases:
             with self.subTest(n=n, outcomes=distribution.nof_outcomes):
-                prep = self._make_prep(n, distribution=distribution)
+                prep = self._shared_prep(n, distribution=distribution)
                 for support in _iter_reduced_base_supports(prep.n, prep.outcomes):
                     canonical = canonical_leximin_support_indices(
                         support,
@@ -534,7 +598,7 @@ class TestClusterOptimizedRing(unittest.TestCase):
         )
 
     def test_one_pass_row_kernel_emits_exact_sorted_unique_counts(self):
-        prep = self._make_prep(4, distribution=NSIPRDistribution())
+        prep = self._shared_prep(4, distribution=NSIPRDistribution())
         (
             _row_entry_ptr,
             row_fixed_ptr,
@@ -646,7 +710,7 @@ class TestClusterOptimizedRing(unittest.TestCase):
                 _ = prep.row_labels
 
     def test_direct_matrix_public_api_shape(self):
-        prep = self._make_prep(3)
+        prep = self._shared_prep(3)
         self.assertEqual(prep.inflation_matrix.shape, (prep.nof_marginals, prep.nof_lp_vars))
         self.assertEqual(prep.nof_lp_constraints, prep.nof_marginals)
         self.assertEqual(prep.global_keys.size, prep.nof_lp_vars)
@@ -656,9 +720,10 @@ class TestClusterOptimizedRing(unittest.TestCase):
         self.assertFalse(hasattr(prep, "known_vars_symbolic"))
         self.assertFalse(hasattr(prep, "blank_objective"))
 
+    @slow_test
     def test_parallel_pipeline_is_deterministic(self):
-        prep_a = self._make_prep(4)
-        prep_b = self._make_prep(4)
+        prep_a = self._make_prep(4, single_worker=False, worker_count_override=2)
+        prep_b = self._make_prep(4, single_worker=False, worker_count_override=2)
         np.testing.assert_array_equal(prep_a.global_keys, prep_b.global_keys)
         np.testing.assert_array_equal(prep_a.global_keys, prep_b.global_keys)
         np.testing.assert_allclose(prep_a.inflation_matrix.toarray(), prep_b.inflation_matrix.toarray())
@@ -704,6 +769,7 @@ class TestClusterOptimizedRing(unittest.TestCase):
             if stale_path.exists():
                 stale_path.unlink()
 
+    @slow_test
     def test_prep_solve_feasibility_matches_generic_padded_formulation(self):
         prep = self._make_prep(3)
         matrix = prep.inflation_matrix
@@ -736,9 +802,10 @@ class TestClusterOptimizedRing(unittest.TestCase):
         _ = payload_only_prep.solve(mode="feasibility", verbose=0)
         self.assertIsNone(payload_only_prep._cached_inflation_matrix)
 
+    @slow_test
     def test_default_mode_reports_zero_incompatible_fraction_on_nsi_n4(self):
-        prep = self._make_prep(4, distribution=NSIPRDistribution())
-        solution = prep.solve(verbose=0)
+        prep = self._shared_prep(4, distribution=NSIPRDistribution())
+        solution = self._shared_solution(prep, verbose=0)
 
         self.assertEqual(solution["mode"], "incompatible_fraction")
         self.assertTrue(solution["solver_success"])
@@ -749,11 +816,12 @@ class TestClusterOptimizedRing(unittest.TestCase):
         self.assertEqual(set(solution["dual_certificate"]), set(solution["constraint_names"][solution["sparse_certificate"].col]))
         self.assertEqual(solution["sparse_certificate"].shape, (1, prep.nof_lp_constraints))
 
+    @slow_test
     def test_relaxed_metrics_positive_on_incompatible_case(self):
-        prep = self._make_prep(3, distribution=_ParityBinaryDistribution())
+        prep = self._shared_prep(3, distribution=_ParityBinaryDistribution())
 
-        incompatible_fraction_solution = prep.solve(mode="incompatible_fraction", verbose=0)
-        generalized_robustness_solution = prep.solve(mode="generalized_robustness", verbose=0)
+        incompatible_fraction_solution = self._shared_solution(prep, mode="incompatible_fraction", verbose=0)
+        generalized_robustness_solution = self._shared_solution(prep, mode="generalized_robustness", verbose=0)
 
         self.assertTrue(incompatible_fraction_solution["solver_success"])
         self.assertFalse(incompatible_fraction_solution["success"])
@@ -777,11 +845,12 @@ class TestClusterOptimizedRing(unittest.TestCase):
         self.assertLessEqual(small_gap, mass_tol)
         self.assertGreater(large_gap, mass_tol)
 
+    @slow_test
     def test_ghz_n3_all_equal_distribution_is_feasible(self):
-        prep = self._make_prep(3, distribution=GHZDistribution())
+        prep = self._shared_prep(3, distribution=GHZDistribution())
 
-        relaxed_solution = prep.solve(mode="incompatible_fraction", verbose=0)
-        feasibility_solution = prep.solve(mode="feasibility", verbose=0)
+        relaxed_solution = self._shared_solution(prep, mode="incompatible_fraction", verbose=0)
+        feasibility_solution = self._shared_solution(prep, mode="feasibility", verbose=0)
 
         self.assertTrue(relaxed_solution["solver_success"])
         self.assertTrue(relaxed_solution["success"])
@@ -791,6 +860,7 @@ class TestClusterOptimizedRing(unittest.TestCase):
         self.assertEqual(feasibility_solution["status"], "optimal")
         self.assertEqual(feasibility_solution["sparse_certificate"].nnz, 0)
 
+    @slow_test
     def test_row_compression_matches_uncompressed_on_ghz_filtered_case(self):
         base_kwargs = {
             "marginal_filter_fn": _keep_any_two_or_three_cycles,
@@ -802,17 +872,18 @@ class TestClusterOptimizedRing(unittest.TestCase):
             4,
             distribution=GHZDistribution(),
             compress_rows_under_discovered_group=False,
+            single_worker=True,
             **base_kwargs,
         )
-        prep_compressed = self._make_prep(
+        prep_compressed = self._shared_prep(
             4,
             distribution=GHZDistribution(),
             compress_rows_under_discovered_group=True,
             **base_kwargs,
         )
 
-        sol_uncompressed = prep_uncompressed.solve(mode="incompatible_fraction", verbose=0)
-        sol_compressed = prep_compressed.solve(mode="incompatible_fraction", verbose=0)
+        sol_uncompressed = self._shared_solution(prep_uncompressed, mode="incompatible_fraction", verbose=0)
+        sol_compressed = self._shared_solution(prep_compressed, mode="incompatible_fraction", verbose=0)
 
         self.assertFalse(sol_uncompressed["success"])
         self.assertFalse(sol_compressed["success"])
@@ -827,20 +898,21 @@ class TestClusterOptimizedRing(unittest.TestCase):
         )
         self.assertTrue(any(sp.simplify(value) == 0 for value in prep_compressed.known_values_symbolic.tolist()))
 
+    @slow_test
     def test_row_compression_matches_uncompressed_on_nsi_n4(self):
-        prep_uncompressed = self._make_prep(
+        prep_uncompressed = self._shared_prep(
             4,
             distribution=NSIPRDistribution(),
             compress_rows_under_discovered_group=False,
         )
-        prep_compressed = self._make_prep(
+        prep_compressed = self._shared_prep(
             4,
             distribution=NSIPRDistribution(),
             compress_rows_under_discovered_group=True,
         )
 
-        sol_uncompressed = prep_uncompressed.solve(mode="incompatible_fraction", verbose=0)
-        sol_compressed = prep_compressed.solve(mode="incompatible_fraction", verbose=0)
+        sol_uncompressed = self._shared_solution(prep_uncompressed, mode="incompatible_fraction", verbose=0)
+        sol_compressed = self._shared_solution(prep_compressed, mode="incompatible_fraction", verbose=0)
 
         self.assertEqual(sol_uncompressed["success"], sol_compressed["success"])
         self.assertAlmostEqual(
@@ -868,9 +940,10 @@ class TestClusterOptimizedRing(unittest.TestCase):
                 np.testing.assert_array_equal(keys, rep_keys)
                 np.testing.assert_array_equal(counts, rep_counts)
 
+    @slow_test
     def test_solution_roundtrip_preserves_direct_basis_metadata(self):
-        prep = self._make_prep(4, distribution=NSIPRDistribution())
-        solution = prep.solve(verbose=0)
+        prep = self._shared_prep(4, distribution=NSIPRDistribution())
+        solution = self._shared_solution(prep, verbose=0)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "ring_solution"

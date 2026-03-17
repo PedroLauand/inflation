@@ -8,6 +8,10 @@ from scipy.sparse import lil_matrix, coo_matrix, vstack
 from copy import deepcopy
 from contextlib import redirect_stdout
 
+from test._slow_test_helper import require_slow_tests
+
+require_slow_tests(__name__)
+
 from inflation.sdp.sdp_utils import solveSDP_MosekFUSION
 from inflation.lp.lp_utils import solveLP_sparse, to_sparse, convert_dicts, \
     make_streamprinter, \

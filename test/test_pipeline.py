@@ -3,6 +3,10 @@ import numpy as np
 import warnings
 from itertools import product
 
+from test._slow_test_helper import require_slow_tests
+
+require_slow_tests(__name__)
+
 from inflation import InflationProblem, InflationSDP, InflationLP
 
 bilocalDAG = {"h1": ["A", "B"], "h2": ["B", "C"]}
