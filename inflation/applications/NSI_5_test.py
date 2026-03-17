@@ -25,7 +25,7 @@ def main(*, n: int = 5) -> None:
     prep = PrepLP(
         n,
         distribution,
-        problem_name=f"NSI_n={n}",
+        problem_name=None,
         auto_discover_symmetries=True,
         compress_rows_under_discovered_group=True,
     )

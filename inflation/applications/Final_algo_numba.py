@@ -11,17 +11,17 @@
 from __future__ import annotations
 
 from collections import Counter
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from functools import cached_property, lru_cache
 from itertools import combinations, combinations_with_replacement, permutations, product
 from math import comb
-import multiprocessing as mp
 import os
 from pathlib import Path
 import tempfile
 from time import perf_counter
 from typing import Dict, Iterable, Iterator, List, Sequence, Tuple, cast
 import sys
+import warnings
 
 import numpy as np
 import sympy as sp
@@ -46,7 +46,7 @@ from inflation.distributions.protocols import RingDistributionProtocol
 from inflation.symmetry_utils import discovery_symmetries_from_predicate
 from inflation.utils import ndarray_bytes_key
 
-CACHE_FORMAT_VERSION = np.int64(9)
+CACHE_FORMAT_VERSION = np.int64(10)
 
 
 def ring_problem(inflation_level: int, distribution: RingDistributionProtocol) -> InflationProblem:
@@ -272,6 +272,67 @@ def _iter_reduced_base_supports(n: int, outcomes: int) -> Iterator[np.ndarray]:
                         support_coords.append(slot * outcomes + int(outcome))
                     next_label += length
                 yield np.asarray(sorted(support_coords), dtype=np.int64)
+
+
+@lru_cache(maxsize=None)
+def _proper_subset_index_combinations(size: int) -> Tuple[Tuple[int, ...], ...]:
+    """All proper subset index combinations of a support with cardinality >= 2."""
+    if size < 3:
+        return tuple()
+    indices = tuple(range(size))
+    combos: List[Tuple[int, ...]] = []
+    for subset_size in range(size - 1, 1, -1):
+        combos.extend(combinations(indices, subset_size))
+    return tuple(combos)
+
+
+def _prune_dominated_support_keys(
+    support_keys: Sequence[Sequence[int] | np.ndarray],
+    ambient_dimension: int,
+    core_group_perms: np.ndarray,
+) -> List[np.ndarray]:
+    """
+    Keep only maximal canonical supports under exact outcome-aware subset dominance.
+
+    A support is dropped when some strictly larger retained support has a proper
+    subset whose canonical representative under the core group matches it.
+    """
+    if not support_keys:
+        return []
+
+    support_records: List[Tuple[np.ndarray, bytes]] = []
+    for support in support_keys:
+        arr = np.ascontiguousarray(support, dtype=np.int64)
+        support_records.append((arr, ndarray_bytes_key(arr, dtype=np.int64)))
+
+    sorted_records = sorted(
+        support_records,
+        key=lambda item: (-int(item[0].size), item[1]),
+    )
+
+    dominated_keys: set[bytes] = set()
+    retained_keys: set[bytes] = set()
+
+    for support, key in sorted_records:
+        if key in dominated_keys:
+            continue
+        retained_keys.add(key)
+        for subset_indices in _proper_subset_index_combinations(int(support.size)):
+            subset = np.ascontiguousarray(support[np.asarray(subset_indices, dtype=np.int64)], dtype=np.int64)
+            canonical_subset = canonical_leximin_support_indices(
+                subset,
+                ambient_dimension,
+                core_group_perms,
+            )
+            dominated_keys.add(ndarray_bytes_key(canonical_subset, dtype=np.int64))
+
+    retained_supports: List[np.ndarray] = []
+    emitted: set[bytes] = set()
+    for support, key in support_records:
+        if key in retained_keys and key not in emitted:
+            retained_supports.append(support)
+            emitted.add(key)
+    return retained_supports
 
 
 def _marginal_from_support_key(
@@ -693,10 +754,21 @@ def _union_sorted_unique_uint64(left: np.ndarray, right: np.ndarray) -> np.ndarr
     return merged[:write_pos].copy()
 
 
-def _format_gib(num_bytes: int) -> str:
-    """Format byte counts in GiB with one decimal place."""
-    gib = float(num_bytes) / float(1024 ** 3)
-    return f"{gib:.1f} GiB"
+def _format_bytes_human(num_bytes: int) -> str:
+    """Format byte counts using the largest sensible binary unit."""
+    num = int(num_bytes)
+    if num < 1024:
+        unit = "byte" if num == 1 else "bytes"
+        return f"{num} {unit}"
+
+    units = ("KiB", "MiB", "GiB", "TiB")
+    value = float(num)
+    for unit in units:
+        value /= 1024.0
+        if value < 1024.0 or unit == units[-1]:
+            return f"{value:.1f} {unit}"
+
+    raise AssertionError("Unreachable byte-formatting branch.")
 
 
 def _format_cycle_length_signature(cycle_lengths: Sequence[int]) -> str:
@@ -710,6 +782,42 @@ def _marginal_cycle_length_signature(marginal: List[List[int]]) -> tuple[int, ..
     """Canonical cycle-length signature for a marginal."""
     cycles = _cycles_from_J(_perm_from_marginal(marginal))
     return tuple(sorted((len(cycle) for cycle in cycles), reverse=True))
+
+
+def _support_cycle_length_signature(
+    support_key: Sequence[int],
+    n: int,
+    outcomes: int,
+) -> tuple[int, ...]:
+    """Canonical cycle-length signature for a support-key representative."""
+    J: Dict[int, int] = {}
+    for coord in support_key:
+        slot = int(coord) // outcomes
+        i, j = _slot_index_to_pair(slot, n)
+        J[i] = j
+    cycles = _cycles_from_J(J)
+    return tuple(sorted((len(cycle) for cycle in cycles), reverse=True))
+
+
+def _format_marginal_type_summary_lines(
+    signatures: Iterable[tuple[int, ...]],
+    *,
+    header: str,
+) -> list[str]:
+    """Format a concise summary of marginal types grouped by cycle-length signature."""
+    counts = Counter(tuple(int(length) for length in signature) for signature in signatures)
+    if not counts:
+        return [header, "  none"]
+
+    def _signature_sort_key(item: tuple[tuple[int, ...], int]) -> tuple[int, tuple[int, ...]]:
+        signature = item[0]
+        return (-sum(signature), tuple(-length for length in signature))
+
+    lines = [header]
+    for signature, count in sorted(counts.items(), key=_signature_sort_key):
+        row_word = "row" if count == 1 else "rows"
+        lines.append(f"  {count} {row_word} of type {_format_cycle_length_signature(signature)}")
+    return lines
 
 
 def _format_exact_row_memory_tally_lines(
@@ -748,9 +856,9 @@ def _format_exact_row_memory_tally_lines(
         signatures = sorted(cast(set[str], bucket["signatures"]))
         type_word = "type" if len(signatures) == 1 else "types"
         signature_text = "; ".join(signatures)
+        lines.append(f"{bucket_count} {row_word} at {_format_bytes_human(peak_bytes)} each")
         lines.append(
-            f"{bucket_count} {row_word} at {_format_gib(peak_bytes)} each "
-            f"(marginal size {marginal_size}; {type_word}: {signature_text})"
+            f"marginal size {marginal_size}; {type_word}: {signature_text}"
         )
     return lines
 
@@ -759,6 +867,21 @@ def _log_progress_line(message: str, *, enabled: bool) -> None:
     """Emit a clean stdout status line when progress reporting is enabled."""
     if enabled:
         print(message, flush=True)
+
+
+def _log_progress_block(header: str, lines: Sequence[str], *, enabled: bool) -> None:
+    """Emit a multi-line progress block when reporting is enabled."""
+    if not enabled:
+        return
+    print(header, flush=True)
+    for line in lines:
+        print(f"  {line}", flush=True)
+
+
+def _warn_runtime_block(header: str, lines: Sequence[str]) -> None:
+    """Emit a multi-line runtime warning block."""
+    message = "\n".join((header, *(f"  {line}" for line in lines)))
+    warnings.warn(message, RuntimeWarning, stacklevel=2)
 
 
 @njit(cache=True, fastmath=True)
@@ -1135,17 +1258,13 @@ _ROW_ARCHIVE_WORKER_STATE: dict | None = None
 
 
 def _init_row_archive_worker(state: dict) -> None:
-    """Install shared read-only row-build state in each process worker."""
+    """Install shared read-only row-build state for threaded row workers."""
     global _ROW_ARCHIVE_WORKER_STATE
     _ROW_ARCHIVE_WORKER_STATE = state
-    try:
-        set_num_threads(1)
-    except Exception:
-        pass
 
 
 def _build_row_archive_worker(row_num: int) -> Tuple[int, str, int, int]:
-    """Build one row archive in a process worker and return lightweight metadata."""
+    """Build one row archive in a worker thread and return lightweight metadata."""
     state = _ROW_ARCHIVE_WORKER_STATE
     if state is None:
         raise RuntimeError("Row-archive worker state was not initialized.")
@@ -1166,16 +1285,6 @@ def _build_row_archive_worker(row_num: int) -> Tuple[int, str, int, int]:
     row_path = Path(state["scratch_dir"]) / f"row_{row_idx:06d}.npz"
     _write_row_counts_archive(row_path, unique_keys, unique_counts)
     return row_idx, str(row_path), int(state["row_extension_counts"][row_idx]), int(unique_keys.size)
-
-
-def _row_archive_pool_context():
-    """Pick the process start method for external row parallelism."""
-    if os.name != "nt":
-        try:
-            return mp.get_context("fork")
-        except ValueError:
-            pass
-    return mp.get_context("spawn")
 
 
 def _reconstruct_csr_from_column_payload(
@@ -1510,6 +1619,7 @@ class PrepLP:
         problem_name: str | None = None,
         marginal_filter_fn=None,
         show_progress: bool = True,
+        early_memory_estimate: bool = False,
         auto_discover_symmetries: bool = True,
         compress_rows_under_discovered_group: bool = True,
         validate_discovered_row_orbits: bool = False,
@@ -1520,6 +1630,7 @@ class PrepLP:
         self._problem_name = self._normalize_problem_name(problem_name)
         self.marginal_filter_fn = marginal_filter_fn
         self.show_progress = show_progress
+        self.early_memory_estimate = bool(early_memory_estimate)
         self.auto_discover_symmetries = auto_discover_symmetries
         self.compress_rows_under_discovered_group = compress_rows_under_discovered_group
         self.validate_discovered_row_orbits = validate_discovered_row_orbits
@@ -1532,7 +1643,9 @@ class PrepLP:
         self._cached_mass_objective: np.ndarray | None = None
         self._solve_target: str | None = None
         self._cache_written = False
-        self._log_structural_memory_plan()
+        self._log_startup_resources()
+        if self.early_memory_estimate:
+            self._log_structural_memory_plan()
         self._initialize_cache()
 
     @staticmethod
@@ -1584,7 +1697,7 @@ class PrepLP:
     @cached_property
     def usable_memory_budget_bytes(self) -> int:
         """Usable build budget after reserving scheduler/process headroom."""
-        return max(1, int(np.floor(float(self.total_memory_budget_bytes) * 0.8)))
+        return max(1, int(np.floor(float(self.total_memory_budget_bytes) * 1)))
 
     @cached_property
     def smallest_marginal_size(self) -> int:
@@ -1622,20 +1735,35 @@ class PrepLP:
         """Worst-case one-pass active-worker peak if every worker hits the structural maximum."""
         return max(1, int(self.worker_count)) * self.per_worker_peak_bytes
 
+    def _log_startup_resources(self) -> None:
+        """Emit a concise startup resource summary."""
+        _log_progress_block(
+            "Build resources:",
+            (
+                f"workers={self.worker_count}",
+                f"usable_memory={_format_bytes_human(self.usable_memory_budget_bytes)}",
+            ),
+            enabled=self.show_progress,
+        )
+
     def _log_structural_memory_plan(self) -> None:
         """Emit an early structural memory estimate before marginal enumeration begins."""
         estimate_name = getattr(self.marginal_filter_fn, "memory_estimate_name", None)
-        estimate_suffix = f", filter={estimate_name}" if estimate_name else ""
-        _log_progress_line(
-            "Structural memory estimate (conservative worst-case; assumes every worker gets a largest possible row): "
-            f"workers={self.worker_count}, "
-            f"smallest_marginal_size={self.smallest_marginal_size}, "
-            f"worst_case_row_entries={self.estimated_max_row_entries}, "
-            f"worst_case_per_worker_raw_buffer={_format_gib(self.per_worker_raw_buffer_bytes)}, "
-            f"worst_case_per_worker_peak={_format_gib(self.per_worker_peak_bytes)}, "
-            f"worst_case_active_peak_if_all_workers_hit_max={_format_gib(self.worst_case_active_worker_peak_bytes)}, "
-            f"usable_memory={_format_gib(self.usable_memory_budget_bytes)}"
-            f"{estimate_suffix}",
+        lines = [
+            f"smallest_marginal_size={self.smallest_marginal_size}",
+            f"worst_case_row_entries={self.estimated_max_row_entries}",
+            f"worst_case_per_worker_raw_buffer={_format_bytes_human(self.per_worker_raw_buffer_bytes)}",
+            f"worst_case_per_worker_peak={_format_bytes_human(self.per_worker_peak_bytes)}",
+            (
+                "worst_case_active_peak_if_all_workers_hit_max="
+                f"{_format_bytes_human(self.worst_case_active_worker_peak_bytes)}"
+            ),
+        ]
+        if estimate_name:
+            lines.append(f"filter={estimate_name}")
+        _log_progress_block(
+            "Structural memory estimate (conservative worst-case):",
+            lines,
             enabled=self.show_progress,
         )
 
@@ -1836,6 +1964,11 @@ class PrepLP:
         return self._core_group_chain_data[5]
 
     @property
+    def core_group_order(self) -> int:
+        """Order of the initial core symmetry group."""
+        return int(self.core_group_perms.shape[0])
+
+    @property
     def group_perms(self) -> np.ndarray:
         """Exact forward coordinate permutations for the discovered symmetry group."""
         return self._effective_group_chain_data[3]
@@ -1850,39 +1983,66 @@ class PrepLP:
         """Output-outcome lookup per discovered symmetry element, slot, and input outcome."""
         return self._effective_group_chain_data[5]
 
+    @property
+    def discovered_group_order(self) -> int:
+        """Order of the discovered stabilizing subgroup."""
+        return int(self.group_perms.shape[0])
+
+    @property
+    def has_new_discovered_symmetries(self) -> bool:
+        """Whether the discovered subgroup is larger than the core group by order."""
+        return self.discovered_group_order != self.core_group_order
+
+    @property
+    def _filtered_reduced_base_supports(self) -> List[np.ndarray]:
+        """
+        Materialized reduced base supports after optional raw-candidate filtering.
+
+        This property is intentionally uncached so `base_support_keys` remains the
+        sole cached base-support stage.
+        """
+        filter_fn = self.marginal_filter_fn
+        if filter_fn is None:
+            return list(_iter_reduced_base_supports(self.n, self.outcomes))
+        return [
+            support
+            for support in _iter_reduced_base_supports(self.n, self.outcomes)
+            if filter_fn(_marginal_from_support_key(support, self.n, self.outcomes))
+        ]
+
     @cached_property
     def base_support_keys(self) -> List[np.ndarray]:
         """
-        Canonical support keys for base marginals under the initial core symmetries.
+        Maximal canonical support keys for base marginals under the initial core symmetries.
 
         Supports are generated directly from canonical cycle-cover representatives
-        under the coherent core `S_n` action. When `marginal_filter_fn` is provided,
-        it is applied to that raw pre-validation representative before any safety
-        assertions.
+        under the coherent core `S_n` action, optionally filtered on raw candidates,
+        then pruned so smaller exact subset-marginals covered by larger retained
+        supports are discarded.
         """
-        total_candidates = _count_reduced_base_candidates(self.n, self.outcomes)
-        progress_iter = tqdm(
-            _iter_reduced_base_supports(self.n, self.outcomes),
-            total=total_candidates,
-            desc="Enumerating base marginals",
-            disable=not self.show_progress,
+        _log_progress_line(
+            f"Core group order: {self.core_group_order}",
+            enabled=self.show_progress,
         )
-        filter_fn = self.marginal_filter_fn
-        try:
-            if filter_fn is None:
-                return list(progress_iter)
-            support_keys: List[np.ndarray] = []
-            for support in progress_iter:
-                raw_marginal = _marginal_from_support_key(support, self.n, self.outcomes)
-                if filter_fn(raw_marginal):
-                    support_keys.append(support)
-            return support_keys
-        finally:
-            progress_iter.close()
+        _log_progress_line("Enumerating base marginals", enabled=self.show_progress)
+        support_keys = _prune_dominated_support_keys(
+            self._filtered_reduced_base_supports,
+            self.N,
+            self.core_group_perms,
+        )
+        for summary_line in _format_marginal_type_summary_lines(
+            (
+                _support_cycle_length_signature(support, self.n, self.outcomes)
+                for support in support_keys
+            ),
+            header=f"Base marginal type summary ({len(support_keys)} rows):",
+        ):
+            _log_progress_line(summary_line, enabled=self.show_progress)
+        return support_keys
 
     @cached_property
     def base_marginals(self) -> List[List[List[int]]]:
-        """Canonical marginals under core symmetries before automatic compression."""
+        """Maximal base marginals before optional discovered-group row compression."""
         return [
             _marginal_from_support_key(key, self.n, self.outcomes)
             for key in self.base_support_keys
@@ -2020,6 +2180,10 @@ class PrepLP:
             return_group=True,
             progress_desc="Discovering ring stabilizing symmetries",
         )
+        _log_progress_line(
+            f"Discovered group order: {int(_group.order())}",
+            enabled=self.show_progress,
+        )
         if discovered.size == 0:
             return self.core_symmetries
         return np.asarray(discovered, dtype=int)
@@ -2104,7 +2268,7 @@ class PrepLP:
     @cached_property
     def _validated_discovered_row_orbits(self) -> bool:
         """Small-case exact validation that compressed row orbits are quotient-row consistent."""
-        if not self.compress_rows_under_discovered_group:
+        if not self.compress_rows_under_discovered_group or not self.has_new_discovered_symmetries:
             return True
         max_validation_rows = 64
         max_validation_entries = 250_000
@@ -2157,7 +2321,7 @@ class PrepLP:
         List[Tuple[str, ...]],
     ]:
         """Compress base rows by discovered symmetry orbits and keep orbit metadata."""
-        if not self.compress_rows_under_discovered_group:
+        if not self.compress_rows_under_discovered_group or not self.has_new_discovered_symmetries:
             orbit_members = [(idx,) for idx in range(self.base_nof_marginals)]
             multiplicities = np.ones(self.base_nof_marginals, dtype=np.int64)
             member_labels = [(self.base_known_labels[idx],) for idx in range(self.base_nof_marginals)]
@@ -2212,6 +2376,14 @@ class PrepLP:
             row_labels_list.append(_average_orbit_label(member_row_labels))
 
         row_labels = np.asarray(row_labels_list, dtype=object)
+        for summary_line in _format_marginal_type_summary_lines(
+            (_marginal_cycle_length_signature(marginal) for marginal in marginals),
+            header=(
+                "Final marginal type summary after discovered symmetry compression "
+                f"({len(marginals)} rows):"
+            ),
+        ):
+            _log_progress_line(summary_line, enabled=self.show_progress)
         return (
             marginals,
             known_values_symbolic,
@@ -2326,7 +2498,7 @@ class PrepLP:
                 )
 
     def _row_archive_worker_state(self, scratch_dir: Path) -> dict:
-        """Shared read-only state passed once to row-archive process workers."""
+        """Shared read-only state installed once for threaded row workers."""
         (
             _row_entry_ptr,
             row_fixed_ptr,
@@ -2350,7 +2522,7 @@ class PrepLP:
         }
 
     def _build_row_archives(self, scratch_dir: Path) -> List[Path | None]:
-        """Build one exact `(key, count)` scratch archive per row using external task parallelism."""
+        """Build one exact `(key, count)` scratch archive per row using threaded task parallelism."""
         row_archive_paths: List[Path | None] = [None] * self.nof_marginals
         if self.nof_marginals == 0:
             return row_archive_paths
@@ -2370,48 +2542,62 @@ class PrepLP:
                 "Exact row-extension count exceeded the structural max-row estimate: "
                 f"exact={exact_max_row_entries}, structural={self.estimated_max_row_entries}."
             )
-        _log_progress_line(
-            "Global extension workload: "
-            f"workers={max_workers}, "
-            f"rows={self.nof_marginals}, "
-            f"total_entries={total_entries}, "
-            f"exact_max_row_entries={exact_max_row_entries}, "
-            f"exact_per_worker_raw_buffer={_format_gib(exact_per_worker_raw_buffer_bytes)}, "
-            f"exact_per_worker_peak={_format_gib(exact_per_worker_peak_bytes)}, "
-            f"exact_active_workers={_format_gib(exact_active_worker_peak_bytes)}, "
-            f"scratch={scratch_dir}",
+        _log_progress_block(
+            "Global extension workload:",
+            (
+                f"rows={self.nof_marginals}",
+                f"total_entries={total_entries}",
+                f"exact_max_row_entries={exact_max_row_entries}",
+                f"exact_per_worker_raw_buffer={_format_bytes_human(exact_per_worker_raw_buffer_bytes)}",
+                f"exact_per_worker_peak={_format_bytes_human(exact_per_worker_peak_bytes)}",
+                f"exact_active_peak={_format_bytes_human(exact_active_worker_peak_bytes)}",
+                f"scratch={scratch_dir}",
+            ),
             enabled=self.show_progress,
         )
-        _log_progress_line(
-            "Exact row memory tally: "
-            "one-pass worker peak = raw keys + unique keys + counts = 24 bytes per raw row entry.",
+        _log_progress_block(
+            "Exact row memory tally:",
+            (
+                "one-pass worker peak = raw keys + unique keys + counts",
+                "24 bytes per raw row entry",
+            ),
             enabled=self.show_progress,
         )
         for tally_line in _format_exact_row_memory_tally_lines(row_extension_counts, self.marginals):
             _log_progress_line(f"  {tally_line}", enabled=self.show_progress)
-        _log_progress_line(
-            "Exact active-worker bound uses the top "
-            f"{active_worker_rows} row peak{'s' if active_worker_rows != 1 else ''} "
-            f"because at most {max_workers} worker{'s' if max_workers != 1 else ''} "
-            "are active at once. "
-            f"Those top {active_worker_rows} rows require {_format_gib(exact_active_worker_peak_bytes)} in total. "
-            f"usable_memory={_format_gib(usable_memory_budget)}",
+        _log_progress_block(
+            "Exact active-worker bound:",
+            (
+                (
+                    "uses the top "
+                    f"{active_worker_rows} row peak{'s' if active_worker_rows != 1 else ''}"
+                ),
+                f"exact_active_peak={_format_bytes_human(exact_active_worker_peak_bytes)}",
+            ),
             enabled=self.show_progress,
         )
 
         if self.per_worker_peak_bytes > usable_memory_budget:
-            raise MemoryError(
-                "The structural worst-case marginal row requires a one-pass worker peak of "
-                f"{_format_gib(self.per_worker_peak_bytes)}, which exceeds the usable build budget "
-                f"of {_format_gib(usable_memory_budget)}."
+            _warn_runtime_block(
+                "Memory preflight warning:",
+                (
+                    "structural worst-case marginal row exceeds the preflight build budget",
+                    f"worst_case_per_worker_peak={_format_bytes_human(self.per_worker_peak_bytes)}",
+                    "continuing anyway because memory preflight checks are non-fatal",
+                ),
             )
         if exact_active_worker_peak_bytes > usable_memory_budget:
-            raise MemoryError(
-                "The exact active-worker bound is based on the top "
-                f"{active_worker_rows} row peak{'s' if active_worker_rows != 1 else ''} and requires "
-                f"{_format_gib(exact_active_worker_peak_bytes)}, which exceeds the usable build budget "
-                f"of {_format_gib(usable_memory_budget)} before workers are launched. "
-                "Reducing cpus-per-task lowers this exact active-worker bound."
+            _warn_runtime_block(
+                "Memory preflight warning:",
+                (
+                    "exact active-worker bound exceeds the preflight build budget",
+                    (
+                        "based on the top "
+                        f"{active_worker_rows} row peak{'s' if active_worker_rows != 1 else ''}"
+                    ),
+                    f"exact_active_peak={_format_bytes_human(exact_active_worker_peak_bytes)}",
+                    "continuing anyway because memory preflight checks are non-fatal",
+                ),
             )
 
         state = self._row_archive_worker_state(scratch_dir)
@@ -2445,13 +2631,8 @@ class PrepLP:
             return row_archive_paths
 
         in_flight_limit = max_workers
-        ctx = _row_archive_pool_context()
-        with ProcessPoolExecutor(
-            max_workers=max_workers,
-            mp_context=ctx,
-            initializer=_init_row_archive_worker,
-            initargs=(state,),
-        ) as executor:
+        _init_row_archive_worker(state)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             pending = {}
             next_row = 0
             while next_row < self.nof_marginals and len(pending) < in_flight_limit:
@@ -2529,11 +2710,11 @@ class PrepLP:
                 "Finalizing direct LP payload...",
                 enabled=self.show_progress,
                 end_message=lambda elapsed: (
-                    "Direct LP payload finalized: "
-                    f"rows={self.nof_marginals}, "
-                    f"cols={nof_caonical_global_events}, "
-                    f"nnz={total_nnz}, "
-                    f"exact payload ~{_format_gib(exact_payload_bytes)} "
+                    "Direct LP payload finalized:\n"
+                    f"  rows={self.nof_marginals}\n"
+                    f"  cols={nof_caonical_global_events}\n"
+                    f"  nnz={total_nnz}\n"
+                    f"  exact_payload~{_format_bytes_human(exact_payload_bytes)} "
                     f"in {elapsed:.2f}s"
                 ),
             ):
@@ -2556,18 +2737,23 @@ class PrepLP:
                     total_nnz,
                 )
                 del row_nnz
-                _log_progress_line(
-                    "Exact final payload: "
-                    f"cols={nof_caonical_global_events}, "
-                    f"nnz={total_nnz}, "
-                    f"payload={_format_gib(exact_payload_bytes)}",
+                _log_progress_block(
+                    "Exact final payload:",
+                    (
+                        f"cols={nof_caonical_global_events}",
+                        f"nnz={total_nnz}",
+                        f"payload={_format_bytes_human(exact_payload_bytes)}",
+                    ),
                     enabled=self.show_progress,
                 )
                 if exact_payload_bytes > usable_memory_budget:
-                    raise MemoryError(
-                        "Exact final LP payload requires "
-                        f"{_format_gib(exact_payload_bytes)}, which exceeds the usable build budget "
-                        f"of {_format_gib(usable_memory_budget)}."
+                    _warn_runtime_block(
+                        "Memory preflight warning:",
+                        (
+                            "exact final LP payload exceeds the preflight build budget",
+                            f"exact_payload={_format_bytes_human(exact_payload_bytes)}",
+                            "continuing anyway because memory preflight checks are non-fatal",
+                        ),
                     )
 
                 column_counts = np.zeros(nof_caonical_global_events, dtype=np.int64)

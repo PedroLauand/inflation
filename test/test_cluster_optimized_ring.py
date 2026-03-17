@@ -3,7 +3,8 @@ import uuid
 import unittest
 import io
 import os
-from itertools import combinations, product
+import warnings
+from itertools import combinations
 from pathlib import Path
 from contextlib import redirect_stdout
 from unittest import mock
@@ -23,6 +24,7 @@ from inflation.applications.Final_algo_numba import (
     _detect_total_memory_budget_bytes,
     _cycles_from_J,
     _estimate_active_worker_peak_bytes,
+    _format_bytes_human,
     _format_exact_row_memory_tally_lines,
     _estimate_per_worker_peak_bytes,
     keep_loops_of_length,
@@ -32,6 +34,7 @@ from inflation.applications.Final_algo_numba import (
     _perm_from_marginal,
     read_prep_lp_solution,
     _offdiag_slot_index,
+    _prune_dominated_support_keys,
     _iter_reduced_base_supports,
     _union_sorted_unique_uint64,
 )
@@ -168,55 +171,6 @@ def _reference_global_keys_and_matrix(prep: PrepLP) -> tuple[np.ndarray, np.ndar
     return sorted_keys, sorted_dense
 
 
-def _reference_base_support_keys(
-    prep: PrepLP,
-    *,
-    filter_fn=None,
-    filter_on_raw: bool = False,
-) -> list[tuple[int, ...]]:
-    seen: set[tuple[int, ...]] = set()
-    support_keys: list[tuple[int, ...]] = []
-    base_outcomes = tuple(range(prep.outcomes))
-    copy_labels = tuple(range(1, prep.n + 1))
-    for subset_size in range(2, prep.n + 1):
-        for subset in combinations(copy_labels, subset_size):
-            for image in final_algo_numba._derangements(subset):
-                for pat in product(base_outcomes, repeat=subset_size):
-                    support = final_algo_numba._marginal_support_from_cycle_cover(
-                        subset,
-                        image,
-                        pat,
-                        prep.n,
-                        prep.outcomes,
-                    )
-                    if filter_fn is not None and filter_on_raw:
-                        raw_marginal = final_algo_numba._marginal_from_support_key(
-                            support,
-                            prep.n,
-                            prep.outcomes,
-                        )
-                        if not filter_fn(raw_marginal):
-                            continue
-                    canonical = canonical_leximin_support_indices(
-                        support,
-                        prep.N,
-                        prep.core_group_perms,
-                    )
-                    key = tuple(int(x) for x in canonical.tolist())
-                    if filter_fn is not None and not filter_on_raw:
-                        marginal = final_algo_numba._marginal_from_support_key(
-                            key,
-                            prep.n,
-                            prep.outcomes,
-                        )
-                        if not filter_fn(marginal):
-                            continue
-                    if key not in seen:
-                        seen.add(key)
-                        support_keys.append(key)
-    return support_keys
-
-
 def _reference_reduced_base_support_keys(
     prep: PrepLP,
     *,
@@ -234,6 +188,46 @@ def _reference_reduced_base_support_keys(
                 continue
         support_keys.append(support)
     return support_keys
+
+
+def _reference_pruned_base_support_keys(
+    prep: PrepLP,
+    support_keys: list[np.ndarray],
+) -> list[np.ndarray]:
+    retained: list[np.ndarray] = []
+    sorted_supports = sorted(
+        (np.asarray(support, dtype=np.int64) for support in support_keys),
+        key=lambda support: (-int(support.size), _support_key_bytes(support)),
+    )
+    for support in sorted_supports:
+        support_key = _support_key_bytes(support)
+        dominated = False
+        for kept in retained:
+            if kept.size <= support.size:
+                continue
+            for subset_size in range(int(kept.size) - 1, int(support.size) - 1, -1):
+                for subset_indices in combinations(range(int(kept.size)), subset_size):
+                    subset = np.asarray(kept[list(subset_indices)], dtype=np.int64)
+                    canonical_subset = canonical_leximin_support_indices(
+                        subset,
+                        prep.N,
+                        prep.core_group_perms,
+                    )
+                    if _support_key_bytes(canonical_subset) == support_key:
+                        dominated = True
+                        break
+                if dominated:
+                    break
+            if dominated:
+                break
+        if not dominated:
+            retained.append(support)
+    retained_keys = _support_key_bytes_set(retained)
+    return [
+        np.asarray(support, dtype=np.int64)
+        for support in support_keys
+        if _support_key_bytes(support) in retained_keys
+    ]
 
 
 def _support_key_bytes(key) -> bytes:
@@ -497,12 +491,12 @@ class TestClusterOptimizedRing(unittest.TestCase):
         custom_prep = self._make_prep(4, marginal_filter_fn=lambda _m: True)
         self.assertEqual(custom_prep.smallest_marginal_size, 2)
 
-    def test_base_support_keys_match_reference_on_unfiltered_nsi_small(self):
+    def test_filtered_reduced_base_supports_match_reference_on_unfiltered_nsi_small(self):
         for n in (3, 4):
             with self.subTest(n=n):
                 prep = self._shared_prep(n, distribution=NSIPRDistribution())
-                self.assertEqual(_support_key_bytes_set(prep.base_support_keys), _support_key_bytes_set(_reference_base_support_keys(prep)))
-                self.assertEqual(len(prep.base_support_keys), len(_reference_base_support_keys(prep)))
+                expected = _reference_reduced_base_support_keys(prep)
+                self.assertEqual(_support_key_bytes_list(prep._filtered_reduced_base_supports), _support_key_bytes_list(expected))
 
     def test_base_nof_marginals_does_not_force_base_marginal_materialization(self):
         prep = self._make_prep(4, distribution=NSIPRDistribution())
@@ -522,13 +516,19 @@ class TestClusterOptimizedRing(unittest.TestCase):
             distribution=GHZDistribution(),
             marginal_filter_fn=keep_loops_of_length([2, 4]),
         )
-        expected = _reference_base_support_keys(
+        expected_filtered = _reference_reduced_base_support_keys(
             prep,
             filter_fn=keep_loops_of_length([2, 4]),
-            filter_on_raw=False,
         )
-        self.assertEqual(_support_key_bytes_set(prep.base_support_keys), _support_key_bytes_set(expected))
-        self.assertEqual(len(prep.base_support_keys), len(expected))
+        expected_pruned = _reference_pruned_base_support_keys(prep, expected_filtered)
+        self.assertEqual(
+            _support_key_bytes_list(prep._filtered_reduced_base_supports),
+            _support_key_bytes_list(expected_filtered),
+        )
+        self.assertEqual(
+            _support_key_bytes_list(prep.base_support_keys),
+            _support_key_bytes_list(expected_pruned),
+        )
 
     def test_reduced_base_candidates_match_bruteforce_and_are_fewer(self):
         for n, outcomes in ((4, 2), (5, 2), (4, 4)):
@@ -569,8 +569,57 @@ class TestClusterOptimizedRing(unittest.TestCase):
             prep,
             filter_fn=_noninvariant_row_shape_filter,
         )
-        self.assertEqual(_support_key_bytes_list(prep.base_support_keys), _support_key_bytes_list(raw_keys))
+        self.assertEqual(_support_key_bytes_list(prep._filtered_reduced_base_supports), _support_key_bytes_list(raw_keys))
         self.assertGreater(len(raw_keys), 0)
+
+    def test_base_support_keys_match_reference_pruning_on_unfiltered_nsi_small(self):
+        for n in (3, 4):
+            with self.subTest(n=n):
+                prep = self._shared_prep(n, distribution=NSIPRDistribution())
+                expected = _reference_pruned_base_support_keys(prep, prep._filtered_reduced_base_supports)
+                self.assertEqual(_support_key_bytes_list(prep.base_support_keys), _support_key_bytes_list(expected))
+
+    def test_dominance_pruning_drops_two_cycles_covered_by_double_two_cycles(self):
+        prep = self._shared_prep(4, distribution=NSIPRDistribution())
+        self.assertTrue(any(len(support) == 2 for support in prep._filtered_reduced_base_supports))
+        self.assertFalse(any(len(support) == 2 for support in prep.base_support_keys))
+
+    def test_dominance_pruning_is_outcome_aware(self):
+        smaller = final_algo_numba._marginal_support_from_cycle_cover(
+            (1, 2),
+            (2, 1),
+            (0, 1),
+            4,
+            2,
+        )
+        larger_mismatch = final_algo_numba._marginal_support_from_cycle_cover(
+            (1, 2, 3, 4),
+            (2, 1, 4, 3),
+            (0, 0, 0, 0),
+            4,
+            2,
+        )
+        larger_match = final_algo_numba._marginal_support_from_cycle_cover(
+            (1, 2, 3, 4),
+            (2, 1, 4, 3),
+            (0, 1, 0, 0),
+            4,
+            2,
+        )
+        prep = self._shared_prep(4, distribution=NSIPRDistribution())
+        kept_after_mismatch = _prune_dominated_support_keys(
+            [smaller, larger_mismatch],
+            prep.N,
+            prep.core_group_perms,
+        )
+        self.assertEqual(_support_key_bytes_list(kept_after_mismatch), _support_key_bytes_list([smaller, larger_mismatch]))
+
+        kept_after_match = _prune_dominated_support_keys(
+            [smaller, larger_match],
+            prep.N,
+            prep.core_group_perms,
+        )
+        self.assertEqual(_support_key_bytes_list(kept_after_match), _support_key_bytes_list([larger_match]))
 
     def test_one_pass_peak_estimators_match_worker_model(self):
         self.assertEqual(_estimate_per_worker_peak_bytes(12), 24 * 12)
@@ -592,10 +641,20 @@ class TestClusterOptimizedRing(unittest.TestCase):
         self.assertEqual(
             lines,
             [
-                "2 rows at 6.0 GiB each (marginal size 6; types: 1x loop of 6; 2x loop of 3)",
-                "1 row at 3.0 GiB each (marginal size 6; type: 1x loop of 4 + 1x loop of 2)",
+                "2 rows at 6.0 GiB each",
+                "marginal size 6; types: 1x loop of 6; 2x loop of 3",
+                "1 row at 3.0 GiB each",
+                "marginal size 6; type: 1x loop of 4 + 1x loop of 2",
             ],
         )
+
+    def test_format_bytes_human_uses_adaptive_units(self):
+        self.assertEqual(_format_bytes_human(1), "1 byte")
+        self.assertEqual(_format_bytes_human(512), "512 bytes")
+        self.assertEqual(_format_bytes_human(1536), "1.5 KiB")
+        self.assertEqual(_format_bytes_human(2 * 1024 ** 2), "2.0 MiB")
+        self.assertEqual(_format_bytes_human(3 * 1024 ** 3), "3.0 GiB")
+        self.assertEqual(_format_bytes_human(4 * 1024 ** 4), "4.0 TiB")
 
     def test_one_pass_row_kernel_emits_exact_sorted_unique_counts(self):
         prep = self._shared_prep(4, distribution=NSIPRDistribution())
@@ -663,21 +722,55 @@ class TestClusterOptimizedRing(unittest.TestCase):
         )
         np.testing.assert_array_equal(union, np.asarray([1, 3, 4, 8, 10], dtype=np.uint64))
 
-    def test_largest_row_buffer_budget_violation_fails_fast(self):
+    def test_largest_row_buffer_budget_violation_warns_and_continues(self):
         with mock.patch.object(final_algo_numba, "_detect_total_memory_budget_bytes", return_value=1):
             prep = self._make_prep(3)
-            with self.assertRaisesRegex(MemoryError, "structural worst-case marginal row requires a one-pass worker peak"):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
                 _ = prep.global_keys
+            self.assertTrue(
+                any(
+                    "structural worst-case marginal row exceeds the preflight build budget"
+                    in str(warning.message)
+                    for warning in caught
+                )
+            )
 
-    def test_active_worker_budget_violation_fails_fast(self):
+    def test_active_worker_budget_violation_warns_and_continues(self):
         prep = self._make_prep(3)
         with mock.patch.object(
             final_algo_numba,
             "_estimate_active_worker_peak_bytes",
             return_value=prep.usable_memory_budget_bytes + 1,
         ):
-            with self.assertRaisesRegex(MemoryError, "exact active-worker bound is based on the top"):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
                 _ = prep.global_keys
+            self.assertTrue(
+                any(
+                    "exact active-worker bound exceeds the preflight build budget"
+                    in str(warning.message)
+                    for warning in caught
+                )
+            )
+
+    def test_final_payload_budget_violation_warns_and_continues(self):
+        prep = self._make_prep(3)
+        with mock.patch.object(
+            final_algo_numba,
+            "_estimate_exact_solver_payload_bytes",
+            return_value=prep.usable_memory_budget_bytes + 1,
+        ):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                _ = prep.global_keys
+            self.assertTrue(
+                any(
+                    "exact final LP payload exceeds the preflight build budget"
+                    in str(warning.message)
+                    for warning in caught
+                )
+            )
 
     def test_structural_active_worker_overestimate_is_informational_only(self):
         prep = self._make_prep(3)
@@ -688,6 +781,38 @@ class TestClusterOptimizedRing(unittest.TestCase):
             return_value=prep.usable_memory_budget_bytes + 1,
         ):
             _ = prep.global_keys
+
+    def test_order_only_new_symmetry_flag_and_compression_gate(self):
+        prep = self._make_prep(
+            4,
+            distribution=GHZDistribution(),
+            auto_discover_symmetries=False,
+            compress_rows_under_discovered_group=True,
+        )
+        self.assertEqual(prep.core_group_order, prep.discovered_group_order)
+        self.assertFalse(prep.has_new_discovered_symmetries)
+        self.assertEqual(prep.nof_marginals, prep.base_nof_marginals)
+        self.assertTrue(all(len(members) == 1 for members in prep.row_orbit_members))
+
+    def test_row_compression_skips_discovered_orbits_when_no_new_symmetries(self):
+        prep = self._make_prep(
+            4,
+            distribution=GHZDistribution(),
+            compress_rows_under_discovered_group=True,
+        )
+        with mock.patch.object(
+            PrepLP,
+            "has_new_discovered_symmetries",
+            new_callable=mock.PropertyMock,
+            return_value=False,
+        ):
+            with mock.patch.object(
+                PrepLP,
+                "_discovered_row_orbits",
+                new_callable=mock.PropertyMock,
+                side_effect=AssertionError("row orbits should be skipped"),
+            ):
+                self.assertEqual(prep.nof_marginals, prep.base_nof_marginals)
 
     def test_discovered_row_orbit_validation_is_opt_in(self):
         with mock.patch.object(

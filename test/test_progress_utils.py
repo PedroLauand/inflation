@@ -144,29 +144,38 @@ class TestProgressUtils(unittest.TestCase):
             stdout_output = stdout_stream.getvalue()
             stderr_output = stderr_stream.getvalue()
 
-            self.assertIn("Structural memory estimate", stdout_output)
-            self.assertIn("conservative worst-case", stdout_output)
-            self.assertIn("smallest_marginal_size=", stdout_output)
-            self.assertIn("worst_case_row_entries=", stdout_output)
-            self.assertIn("worst_case_per_worker_raw_buffer=", stdout_output)
-            self.assertIn("worst_case_per_worker_peak=", stdout_output)
-            self.assertIn("worst_case_active_peak_if_all_workers_hit_max=", stdout_output)
+            self.assertIn("Build resources:", stdout_output)
+            self.assertIn("workers=", stdout_output)
             self.assertIn("usable_memory=", stdout_output)
+            self.assertNotIn("Structural memory estimate", stdout_output)
             self.assertLess(
-                stdout_output.index("Structural memory estimate"),
+                stdout_output.index("Build resources:"),
+                stdout_output.index("Core group order:"),
+            )
+            self.assertLess(
+                stdout_output.index("Core group order:"),
                 stdout_output.index("Enumerating base marginals"),
             )
+            self.assertIn("Core group order:", stdout_output)
             self.assertIn("Enumerating base marginals", stdout_output)
+            self.assertIn("Base marginal type summary", stdout_output)
+            self.assertIn("rows of type", stdout_output)
+            self.assertIn("1x loop of 3", stdout_output)
             self.assertIn("Computing marginal values...", stdout_output)
+            self.assertIn("Discovered group order:", stdout_output)
+            self.assertIn("Final marginal type summary after discovered symmetry compression", stdout_output)
             self.assertIn("Global extension workload:", stdout_output)
+            self.assertIn("rows=", stdout_output)
+            self.assertIn("total_entries=", stdout_output)
             self.assertIn("exact_per_worker_raw_buffer=", stdout_output)
             self.assertIn("exact_per_worker_peak=", stdout_output)
-            self.assertIn("exact_active_workers=", stdout_output)
+            self.assertIn("exact_active_peak=", stdout_output)
             self.assertIn("Exact row memory tally:", stdout_output)
             self.assertIn("bytes per raw row entry", stdout_output)
             self.assertIn("marginal size", stdout_output)
             self.assertIn("loop of", stdout_output)
-            self.assertIn("Exact active-worker bound uses the top", stdout_output)
+            self.assertIn("Exact active-worker bound:", stdout_output)
+            self.assertIn("uses the top", stdout_output)
             self.assertIn("Finding global extensions...", stdout_output)
             self.assertIn("Global extensions task complete:", stdout_output)
             self.assertIn("rows_done=", stdout_output)
@@ -174,6 +183,7 @@ class TestProgressUtils(unittest.TestCase):
             self.assertIn("Finalizing direct LP payload...", stdout_output)
             self.assertIn("Exact final payload:", stdout_output)
             self.assertIn("Direct LP payload finalized:", stdout_output)
+            self.assertIn("payload=", stdout_output)
             self.assertIn("Saving LP input cache to", stdout_output)
             self.assertIn("Saved LP constraints cache to", stdout_output)
             self.assertNotIn("work_units=", stdout_output)
@@ -195,13 +205,17 @@ class TestProgressUtils(unittest.TestCase):
                     _UniformBinaryDistribution(),
                     problem_name=cache_name,
                     show_progress=True,
+                    early_memory_estimate=True,
                     auto_discover_symmetries=True,
                     compress_rows_under_discovered_group=True,
                     verbose_cache=True,
                 )
 
             cached_stdout = cached_stdout_stream.getvalue()
+            self.assertIn("Build resources:", cached_stdout)
+            self.assertIn("Core group order:", cached_stdout)
             self.assertIn("Structural memory estimate", cached_stdout)
+            self.assertIn("smallest_marginal_size=", cached_stdout)
             self.assertIn("Checking LP input cache at", cached_stdout)
             self.assertIn("Loaded cached LP constraints from", cached_stdout)
             self.assertNotIn("\r", cached_stdout)
@@ -243,6 +257,33 @@ class TestProgressUtils(unittest.TestCase):
         finally:
             if prep is not None and prep.cache_path is not None and prep.cache_path.exists():
                 prep.cache_path.unlink()
+
+    def test_no_auto_discovery_skips_discovered_group_order_and_second_type_summary(self):
+        stdout_stream = _NonTtyStringIO()
+        stderr_stream = _NonTtyStringIO()
+
+        with mock.patch.dict("inflation.applications.Final_algo_numba.os.environ", {"SLURM_CPUS_PER_TASK": "2"}, clear=False):
+            with mock.patch("inflation.applications.Final_algo_numba.set_num_threads"):
+                with redirect_stdout(stdout_stream), redirect_stderr(stderr_stream):
+                    prep = PrepLP(
+                        3,
+                        _UniformBinaryDistribution(),
+                        problem_name=None,
+                        show_progress=True,
+                        auto_discover_symmetries=False,
+                        compress_rows_under_discovered_group=True,
+                        verbose_cache=False,
+                    )
+                    _ = prep.global_keys
+                    _ = prep.known_values
+                    _ = prep.inflation_matrix
+
+        stdout_output = stdout_stream.getvalue()
+        self.assertIn("Core group order:", stdout_output)
+        self.assertIn("Enumerating base marginals", stdout_output)
+        self.assertIn("Base marginal type summary", stdout_output)
+        self.assertNotIn("Discovered group order:", stdout_output)
+        self.assertNotIn("Final marginal type summary after discovered symmetry compression", stdout_output)
 
     def test_ejm_entrypoint_materializes_inputs_before_solver_setup(self):
         stdout_stream = _NonTtyStringIO()

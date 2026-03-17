@@ -3,7 +3,7 @@
 #SBATCH --partition=amdq
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=64
+#SBATCH --cpus-per-task=1
 #SBATCH --mem=250G
 #SBATCH --time=24:00:00
 #SBATCH --output=%x-%j.out
