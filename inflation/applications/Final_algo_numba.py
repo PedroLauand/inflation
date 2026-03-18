@@ -1622,6 +1622,8 @@ class PrepLP:
         early_memory_estimate: bool = False,
         auto_discover_symmetries: bool = True,
         compress_rows_under_discovered_group: bool = True,
+        validate_base_marginals: bool = False,
+        validate_global_keys: bool = False,
         validate_discovered_row_orbits: bool = False,
         verbose_cache: bool | None = None,
     ) -> None:
@@ -1633,6 +1635,8 @@ class PrepLP:
         self.early_memory_estimate = bool(early_memory_estimate)
         self.auto_discover_symmetries = auto_discover_symmetries
         self.compress_rows_under_discovered_group = compress_rows_under_discovered_group
+        self.validate_base_marginals = validate_base_marginals
+        self.validate_global_keys = validate_global_keys
         self.validate_discovered_row_orbits = validate_discovered_row_orbits
         self.verbose_cache = self.show_progress if verbose_cache is None else bool(verbose_cache)
         self.prob = ring_problem(self._requested_n, distribution)
@@ -2150,7 +2154,8 @@ class PrepLP:
     @cached_property
     def discovered_symmetries(self) -> np.ndarray:
         """Largest discovered stabilizing subgroup used for final canonicalization."""
-        _ = self._validated_base_support_keys
+        if self.validate_base_marginals:
+            _ = self._validated_base_support_keys
         if not self.auto_discover_symmetries:
             return self.core_symmetries
         support_to_idx = self._base_support_index
@@ -2191,7 +2196,8 @@ class PrepLP:
     @cached_property
     def _discovered_row_orbits(self) -> List[Tuple[int, ...]]:
         """Exact base-row orbits induced by the discovered symmetry group."""
-        _ = self._validated_base_support_keys
+        if self.validate_base_marginals:
+            _ = self._validated_base_support_keys
         support_to_idx = self._base_support_index
         visited = np.zeros(self.base_nof_marginals, dtype=bool)
         orbit_members: List[Tuple[int, ...]] = []
@@ -2338,7 +2344,8 @@ class PrepLP:
                 member_labels,
             )
 
-        _ = self._validated_base_support_keys
+        if self.validate_base_marginals:
+            _ = self._validated_base_support_keys
         if self.validate_discovered_row_orbits:
             _ = self._validated_discovered_row_orbits
         orbit_order = self._discovered_row_orbits
@@ -2727,7 +2734,8 @@ class PrepLP:
                     global_keys = _union_sorted_unique_uint64(global_keys, row_keys)
 
                 nof_caonical_global_events = int(global_keys.size)
-                self._assert_global_keys_canonical(global_keys)
+                if self.validate_global_keys:
+                    self._assert_global_keys_canonical(global_keys)
                 if nof_caonical_global_events > np.iinfo(np.int32).max:
                     raise ValueError("Ring LP exceeds the current MOSEK Python binding variable limit.")
 
