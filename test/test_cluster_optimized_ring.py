@@ -230,6 +230,46 @@ def _reference_pruned_base_support_keys(
     ]
 
 
+def _reference_discovered_row_orbits(prep: PrepLP) -> list[tuple[int, ...]]:
+    support_to_idx = prep._base_support_index
+    visited = np.zeros(prep.base_nof_marginals, dtype=bool)
+    orbit_members: list[tuple[int, ...]] = []
+
+    for start_idx in range(prep.base_nof_marginals):
+        if visited[start_idx]:
+            continue
+        orbit: set[int] = set()
+        frontier = [start_idx]
+        while frontier:
+            idx = frontier.pop()
+            if idx in orbit:
+                continue
+            orbit.add(idx)
+            visited[idx] = True
+            support = np.ascontiguousarray(prep.base_support_keys[idx], dtype=np.int64)
+            for perm in prep.discovered_symmetries:
+                mapped_support = np.asarray(perm[support], dtype=np.int64)
+                mapped_canonical = canonical_leximin_support_indices(
+                    mapped_support,
+                    prep.N,
+                    prep.core_group_perms,
+                )
+                mapped_idx = support_to_idx.get(_support_key_bytes(mapped_canonical))
+                if mapped_idx is None:
+                    raise AssertionError(
+                        "Reference orbit builder found support outside base canonical set: "
+                        f"source={tuple(int(x) for x in support)}, "
+                        f"mapped={tuple(int(x) for x in mapped_canonical)}."
+                    )
+                if mapped_idx not in orbit:
+                    frontier.append(mapped_idx)
+        members = tuple(sorted(orbit))
+        for idx in members:
+            visited[idx] = True
+        orbit_members.append(members)
+    return orbit_members
+
+
 def _support_key_bytes(key) -> bytes:
     return final_algo_numba.ndarray_bytes_key(np.asarray(key, dtype=np.int64), dtype=np.int64)
 
@@ -833,6 +873,31 @@ class TestClusterOptimizedRing(unittest.TestCase):
             prep = self._make_prep(4, validate_discovered_row_orbits=True)
             with self.assertRaisesRegex(AssertionError, "validation enabled"):
                 _ = prep.row_labels
+
+    def test_discovered_row_orbits_match_reference_on_nsi_n4(self):
+        prep = self._make_prep(
+            4,
+            distribution=NSIPRDistribution(),
+            compress_rows_under_discovered_group=True,
+        )
+        expected_orbits = _reference_discovered_row_orbits(prep)
+        self.assertEqual(prep._discovered_row_orbits, expected_orbits)
+
+    def test_raw_support_to_base_idx_is_core_image_consistent(self):
+        prep = self._make_prep(
+            4,
+            distribution=NSIPRDistribution(),
+        )
+        lookup = prep._raw_support_to_base_idx
+        core_group_perms = np.asarray(prep.core_group_perms, dtype=np.int64)
+        for base_idx, support in enumerate(prep.base_support_keys):
+            support_arr = np.asarray(support, dtype=np.int64)
+            mapped_supports = np.asarray(core_group_perms[:, support_arr], dtype=np.int64)
+            mapped_supports.sort(axis=1)
+            for mapped_support in mapped_supports:
+                key = _support_key_bytes(mapped_support)
+                self.assertIn(key, lookup)
+                self.assertEqual(lookup[key], base_idx)
 
     def test_direct_matrix_public_api_shape(self):
         prep = self._shared_prep(3)

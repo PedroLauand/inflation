@@ -2060,6 +2060,28 @@ class PrepLP:
             for idx, key in enumerate(self.base_support_keys)
         }
 
+    @cached_property
+    def _raw_support_to_base_idx(self) -> Dict[bytes, int]:
+        """Lookup from raw core-image support keys to canonical base-row index."""
+        raw_to_base: Dict[bytes, int] = {}
+        core_group_perms = np.asarray(self.core_group_perms, dtype=np.int64)
+        for base_idx, support in enumerate(self.base_support_keys):
+            support_arr = np.asarray(support, dtype=np.int64)
+            mapped_supports = np.asarray(core_group_perms[:, support_arr], dtype=np.int64)
+            mapped_supports.sort(axis=1)
+            for mapped_support in mapped_supports:
+                raw_key = ndarray_bytes_key(mapped_support, dtype=np.int64)
+                previous = raw_to_base.get(raw_key)
+                if previous is None:
+                    raw_to_base[raw_key] = base_idx
+                elif previous != base_idx:
+                    raise AssertionError(
+                        "Core-image support lookup collision maps to different base rows: "
+                        f"key={tuple(int(x) for x in mapped_support)}, "
+                        f"first={previous}, second={base_idx}."
+                    )
+        return raw_to_base
+
     @property
     def base_nof_marginals(self) -> int:
         """Number of base canonical marginals."""
@@ -2198,38 +2220,31 @@ class PrepLP:
         """Exact base-row orbits induced by the discovered symmetry group."""
         if self.validate_base_marginals:
             _ = self._validated_base_support_keys
-        support_to_idx = self._base_support_index
+        raw_support_to_idx = self._raw_support_to_base_idx
+        discovered_symmetries = np.asarray(self.discovered_symmetries, dtype=np.int64)
         visited = np.zeros(self.base_nof_marginals, dtype=bool)
         orbit_members: List[Tuple[int, ...]] = []
 
         for start_idx in range(self.base_nof_marginals):
             if visited[start_idx]:
                 continue
+            support = np.asarray(self.base_support_keys[start_idx], dtype=np.int64)
+            mapped_supports = np.asarray(discovered_symmetries[:, support], dtype=np.int64)
+            mapped_supports.sort(axis=1)
             orbit: set[int] = set()
-            frontier = [start_idx]
-            while frontier:
-                idx = frontier.pop()
-                if idx in orbit:
-                    continue
-                orbit.add(idx)
-                visited[idx] = True
-                support = np.ascontiguousarray(self.base_support_keys[idx], dtype=np.int64)
-                for perm in self.discovered_symmetries:
-                    mapped_support = np.asarray(perm[support], dtype=np.int64)
-                    mapped_canonical = canonical_leximin_support_indices(
-                        mapped_support,
-                        self.N,
-                        self.core_group_perms,
+            for mapped_support in mapped_supports:
+                mapped_idx = raw_support_to_idx.get(ndarray_bytes_key(mapped_support, dtype=np.int64))
+                if mapped_idx is None:
+                    raise AssertionError(
+                        "Discovered symmetry moved a base support outside the core-image row set: "
+                        f"source={tuple(int(x) for x in support)}, "
+                        f"mapped={tuple(int(x) for x in mapped_support)}."
                     )
-                    mapped_idx = support_to_idx.get(ndarray_bytes_key(mapped_canonical, dtype=np.int64))
-                    if mapped_idx is None:
-                        raise AssertionError(
-                            "Discovered symmetry moved a base support outside the core-canonical row set: "
-                            f"source={tuple(int(x) for x in support)}, "
-                            f"mapped={tuple(int(x) for x in mapped_canonical)}."
-                        )
-                    if mapped_idx not in orbit:
-                        frontier.append(mapped_idx)
+                orbit.add(mapped_idx)
+            if start_idx not in orbit:
+                raise AssertionError(
+                    "Discovered row orbit missing its seed row; expected identity image in orbit."
+                )
             members = tuple(sorted(orbit))
             for idx in members:
                 visited[idx] = True
