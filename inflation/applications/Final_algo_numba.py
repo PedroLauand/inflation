@@ -25,7 +25,7 @@ import warnings
 
 import numpy as np
 import sympy as sp
-from numba import get_num_threads, njit, prange, set_num_threads
+from numba import get_num_threads, njit, set_num_threads
 from scipy.sparse import coo_array, csr_array
 from inflation.progress_utils import make_tqdm as tqdm, progress_stage
 
@@ -597,6 +597,32 @@ def _slot_index_dtype(nof_slots: int):
     return np.uint64
 
 
+def _unsigned_count_dtype_for_max(max_value: int):
+    """Choose the smallest unsigned integer dtype that can store `max_value`."""
+    value = max(0, int(max_value))
+    if value <= np.iinfo(np.uint8).max:
+        return np.uint8
+    if value <= np.iinfo(np.uint16).max:
+        return np.uint16
+    if value <= np.iinfo(np.uint32).max:
+        return np.uint32
+    return np.uint64
+
+
+def _downcast_unsigned_counts(counts: np.ndarray, *, max_value: int) -> np.ndarray:
+    """Downcast nonnegative count arrays to the smallest safe unsigned dtype."""
+    target_dtype = _unsigned_count_dtype_for_max(max_value)
+    as_unsigned = np.asarray(counts, dtype=np.uint64)
+    if as_unsigned.size:
+        observed_max = int(as_unsigned.max())
+        if observed_max > np.iinfo(target_dtype).max:
+            raise AssertionError(
+                "Observed row multiplicity exceeded selected compact count dtype bound: "
+                f"observed={observed_max}, max_allowed={np.iinfo(target_dtype).max}."
+            )
+    return as_unsigned.astype(target_dtype, copy=False)
+
+
 @njit(cache=True, fastmath=True)
 def _fill_sorted_global_extension_keys_for_row(
     raw_keys: np.ndarray,
@@ -896,64 +922,6 @@ def _decode_uint64_event_key(key: np.uint64, slot_count: int, outcomes: int) -> 
     return evt
 
 
-@njit(cache=True, parallel=True, fastmath=True)
-def _sort_rows_and_count_unique(
-    sparse_matrix_cols: np.ndarray,
-    row_entry_ptr: np.ndarray,
-) -> np.ndarray:
-    """Sort each row slice in place and count unique columns per row."""
-    nof_rows = row_entry_ptr.size - 1
-    row_nnz = np.empty(nof_rows, dtype=np.int64)
-    for row_num in prange(nof_rows):
-        start = int(row_entry_ptr[row_num])
-        end = int(row_entry_ptr[row_num + 1])
-        if end > start:
-            row_slice = sparse_matrix_cols[start:end]
-            row_slice.sort()
-            unique_cols = 1
-            prev = row_slice[0]
-            for pos in range(start + 1, end):
-                col = sparse_matrix_cols[pos]
-                if col != prev:
-                    unique_cols += 1
-                    prev = col
-        else:
-            unique_cols = 0
-        row_nnz[row_num] = unique_cols
-    return row_nnz
-
-
-@njit(cache=True, parallel=True, fastmath=True)
-def _fill_direct_csr_from_sorted_rows(
-    sparse_matrix_cols: np.ndarray,
-    row_entry_ptr: np.ndarray,
-    indptr: np.ndarray,
-    indices: np.ndarray,
-    data: np.ndarray,
-) -> None:
-    """Fill the direct marginal-form CSR matrix from sorted per-row column ids."""
-    nof_marginals = row_entry_ptr.size - 1
-    for row_num in prange(nof_marginals):
-        write_pos = int(indptr[row_num])
-        start = int(row_entry_ptr[row_num])
-        end = int(row_entry_ptr[row_num + 1])
-        if end > start:
-            current = sparse_matrix_cols[start]
-            multiplicity = 1
-            for pos in range(start + 1, end):
-                col = sparse_matrix_cols[pos]
-                if col == current:
-                    multiplicity += 1
-                else:
-                    indices[write_pos] = current
-                    data[write_pos] = float(multiplicity)
-                    write_pos += 1
-                    current = col
-                    multiplicity = 1
-            indices[write_pos] = current
-            data[write_pos] = float(multiplicity)
-
-
 @njit(cache=True, fastmath=True)
 def _csr_to_column_payload(
     indptr: np.ndarray,
@@ -1241,16 +1209,25 @@ def _write_row_counts_archive(path: Path, keys: np.ndarray, counts: np.ndarray) 
     np.savez(
         path,
         keys=np.asarray(keys, dtype=np.uint64),
-        counts=np.asarray(counts, dtype=np.uint64),
+        counts=np.asarray(counts),
     )
 
 
 def _read_row_counts_archive(path: Path) -> Tuple[np.ndarray, np.ndarray]:
     """Read one row's sorted `(key, multiplicity)` stream from scratch."""
     with np.load(path, allow_pickle=False) as z:
+        counts = np.asarray(z["counts"])
+        if counts.dtype.kind not in {"u", "i"}:
+            raise ValueError("Row archive counts must use an integer dtype.")
+        if counts.dtype.kind == "i":
+            if counts.size and int(counts.min()) < 0:
+                raise ValueError("Row archive counts cannot be negative.")
+            counts = counts.astype(np.uint64, copy=False)
+        else:
+            counts = np.ascontiguousarray(counts)
         return (
             np.asarray(z["keys"], dtype=np.uint64),
-            np.asarray(z["counts"], dtype=np.uint64),
+            counts,
         )
 
 
@@ -1282,6 +1259,11 @@ def _build_row_archive_worker(row_num: int) -> Tuple[int, str, int, int]:
         state["slot_sources"],
         state["outcome_maps"],
     )
+    max_count_bound = min(
+        int(state["row_extension_counts"][row_idx]),
+        int(state["group_order"]),
+    )
+    unique_counts = _downcast_unsigned_counts(unique_counts, max_value=max_count_bound)
     row_path = Path(state["scratch_dir"]) / f"row_{row_idx:06d}.npz"
     _write_row_counts_archive(row_path, unique_keys, unique_counts)
     return row_idx, str(row_path), int(state["row_extension_counts"][row_idx]), int(unique_keys.size)
@@ -1527,7 +1509,34 @@ def factorized_marginal_value(
     return val
 
 
-def _build_row_extension_descriptors(
+def _build_single_row_extension_descriptor(
+    marginal: List[List[int]],
+    *,
+    n: int,
+    outcomes: int,
+) -> Tuple[np.int64, np.ndarray, np.ndarray, np.ndarray]:
+    """Build fixed/remaining slot metadata for a single marginal row."""
+    nof_slots = n * (n - 1)
+    slot_dtype = _slot_index_dtype(nof_slots)
+    fixed_slots = np.empty(len(marginal), dtype=slot_dtype)
+    fixed_vals = np.empty(len(marginal), dtype=np.uint8)
+    seen_slots: set[int] = set()
+    for idx, (_one, i, j, _zero, a) in enumerate(marginal):
+        slot = _offdiag_slot_index(int(i), int(j), n)
+        if slot in seen_slots:
+            raise ValueError("Invalid marginal: duplicate fixed off-diagonal slot.")
+        seen_slots.add(slot)
+        fixed_slots[idx] = slot
+        fixed_vals[idx] = np.uint8(a)
+    mask = np.ones(nof_slots, dtype=bool)
+    if fixed_slots.size:
+        mask[fixed_slots] = False
+    remaining_slots = np.nonzero(mask)[0].astype(slot_dtype, copy=False)
+    row_extension_count = np.int64(pow(outcomes, int(remaining_slots.size)))
+    return row_extension_count, fixed_slots, fixed_vals, remaining_slots
+
+
+def _build_row_extension_tables(
     marginals: List[List[List[int]]],
     *,
     n: int,
@@ -1535,13 +1544,10 @@ def _build_row_extension_descriptors(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Flatten per-row fixed/remaining slot metadata for Numba parallel kernels."""
     nof_rows = len(marginals)
-    nof_slots = n * (n - 1)
-    slot_dtype = _slot_index_dtype(nof_slots)
-
-    row_entry_ptr = np.empty(nof_rows + 1, dtype=np.int64)
+    slot_dtype = _slot_index_dtype(n * (n - 1))
+    row_extension_counts = np.empty(nof_rows, dtype=np.int64)
     row_fixed_ptr = np.empty(nof_rows + 1, dtype=np.int64)
     row_remaining_ptr = np.empty(nof_rows + 1, dtype=np.int64)
-    row_entry_ptr[0] = 0
     row_fixed_ptr[0] = 0
     row_remaining_ptr[0] = 0
 
@@ -1550,22 +1556,12 @@ def _build_row_extension_descriptors(
     remaining_slots_chunks: List[np.ndarray] = []
 
     for row_num, marginal in enumerate(marginals):
-        fixed_slots = np.empty(len(marginal), dtype=slot_dtype)
-        fixed_vals = np.empty(len(marginal), dtype=np.uint8)
-        seen_slots: set[int] = set()
-        for idx, (_one, i, j, _zero, a) in enumerate(marginal):
-            slot = _offdiag_slot_index(int(i), int(j), n)
-            if slot in seen_slots:
-                raise ValueError("Invalid marginal: duplicate fixed off-diagonal slot.")
-            seen_slots.add(slot)
-            fixed_slots[idx] = slot
-            fixed_vals[idx] = np.uint8(a)
-        mask = np.ones(nof_slots, dtype=bool)
-        if fixed_slots.size:
-            mask[fixed_slots] = False
-        remaining_slots = np.nonzero(mask)[0].astype(slot_dtype, copy=False)
-        total = pow(outcomes, int(remaining_slots.size))
-        row_entry_ptr[row_num + 1] = row_entry_ptr[row_num] + np.int64(total)
+        row_count, fixed_slots, fixed_vals, remaining_slots = _build_single_row_extension_descriptor(
+            marginal,
+            n=n,
+            outcomes=outcomes,
+        )
+        row_extension_counts[row_num] = row_count
         row_fixed_ptr[row_num + 1] = row_fixed_ptr[row_num] + np.int64(fixed_slots.size)
         row_remaining_ptr[row_num + 1] = row_remaining_ptr[row_num] + np.int64(remaining_slots.size)
         fixed_slots_chunks.append(fixed_slots)
@@ -1588,7 +1584,7 @@ def _build_row_extension_descriptors(
         else np.empty(0, dtype=slot_dtype)
     )
     return (
-        row_entry_ptr,
+        row_extension_counts,
         row_fixed_ptr,
         fixed_slots_flat,
         fixed_vals_flat,
@@ -2256,26 +2252,22 @@ class PrepLP:
         marginal: List[List[int]],
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Enumerate the exact discovered-group-quotiented signature of one base row."""
-        (
-            _row_entry_ptr,
-            row_fixed_ptr,
-            fixed_slots_flat,
-            fixed_vals_flat,
-            row_remaining_ptr,
-            remaining_slots_flat,
-        ) = _build_row_extension_descriptors([marginal], n=self.n, outcomes=self.outcomes)
-        row_extension_counts = np.asarray(
-            [int(pow(self.outcomes, self.nof_off_diagonal_slots - len(marginal)))],
-            dtype=np.int64,
+        row_extension_count, fixed_slots, fixed_vals, remaining_slots = _build_single_row_extension_descriptor(
+            marginal,
+            n=self.n,
+            outcomes=self.outcomes,
         )
+        row_extension_counts = np.asarray([row_extension_count], dtype=np.int64)
+        row_fixed_ptr = np.asarray([0, int(fixed_slots.size)], dtype=np.int64)
+        row_remaining_ptr = np.asarray([0, int(remaining_slots.size)], dtype=np.int64)
         unique_keys, unique_counts = _compute_unique_global_extension_keys_for_row(
             0,
             row_extension_counts,
             row_fixed_ptr,
-            fixed_slots_flat,
-            fixed_vals_flat,
+            fixed_slots,
+            fixed_vals,
             row_remaining_ptr,
-            remaining_slots_flat,
+            remaining_slots,
             self.nof_off_diagonal_slots,
             self.outcomes,
             self.slot_sources,
@@ -2483,20 +2475,14 @@ class PrepLP:
     @cached_property
     def row_extension_counts(self) -> np.ndarray:
         """Number of compatible global extensions for each final marginal row."""
-        counts = np.empty(self.nof_marginals, dtype=np.int64)
-        for row_num, marginal in enumerate(self.marginals):
-            free_slots = self.nof_off_diagonal_slots - len(marginal)
-            if free_slots < 0:
-                raise ValueError("Marginal fixes more slots than the off-diagonal ring supports.")
-            counts[row_num] = pow(self.outcomes, free_slots)
-        return counts
+        return self._row_extension_tables[0]
 
     @cached_property
-    def _row_extension_descriptor_payload(
+    def _row_extension_tables(
         self,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Flat per-row metadata for the parallel global-extension kernel."""
-        return _build_row_extension_descriptors(
+        return _build_row_extension_tables(
             self.marginals,
             n=self.n,
             outcomes=self.outcomes,
@@ -2522,16 +2508,17 @@ class PrepLP:
     def _row_archive_worker_state(self, scratch_dir: Path) -> dict:
         """Shared read-only state installed once for threaded row workers."""
         (
-            _row_entry_ptr,
+            row_extension_counts,
             row_fixed_ptr,
             fixed_slots_flat,
             fixed_vals_flat,
             row_remaining_ptr,
             remaining_slots_flat,
-        ) = self._row_extension_descriptor_payload
+        ) = self._row_extension_tables
         return {
             "scratch_dir": str(scratch_dir),
-            "row_extension_counts": self.row_extension_counts.astype(np.int64, copy=False),
+            "row_extension_counts": row_extension_counts.astype(np.int64, copy=False),
+            "group_order": np.int64(self.discovered_group_order),
             "row_fixed_ptr": row_fixed_ptr,
             "fixed_slots_flat": fixed_slots_flat,
             "fixed_vals_flat": fixed_vals_flat,

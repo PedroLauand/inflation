@@ -699,13 +699,13 @@ class TestClusterOptimizedRing(unittest.TestCase):
     def test_one_pass_row_kernel_emits_exact_sorted_unique_counts(self):
         prep = self._shared_prep(4, distribution=NSIPRDistribution())
         (
-            _row_entry_ptr,
+            _row_extension_counts,
             row_fixed_ptr,
             fixed_slots_flat,
             fixed_vals_flat,
             row_remaining_ptr,
             remaining_slots_flat,
-        ) = prep._row_extension_descriptor_payload
+        ) = prep._row_extension_tables
         wave_rows = np.arange(min(4, prep.nof_marginals), dtype=np.int64)
         for row_num in wave_rows.tolist():
             row_keys, row_counts = _compute_unique_global_extension_keys_for_row(
@@ -726,19 +726,55 @@ class TestClusterOptimizedRing(unittest.TestCase):
                 self.assertTrue(np.all(row_keys[1:] > row_keys[:-1]))
             self.assertEqual(int(row_counts.sum()), int(prep.row_extension_counts[row_num]))
 
+    def test_single_row_descriptor_matches_bulk_tables(self):
+        prep = self._shared_prep(4, distribution=NSIPRDistribution())
+        (
+            row_extension_counts,
+            row_fixed_ptr,
+            fixed_slots_flat,
+            fixed_vals_flat,
+            row_remaining_ptr,
+            remaining_slots_flat,
+        ) = prep._row_extension_tables
+        for row_num in range(min(6, prep.nof_marginals)):
+            row_count, fixed_slots, fixed_vals, remaining_slots = (
+                final_algo_numba._build_single_row_extension_descriptor(
+                    prep.marginals[row_num],
+                    n=prep.n,
+                    outcomes=prep.outcomes,
+                )
+            )
+            self.assertEqual(int(row_count), int(row_extension_counts[row_num]))
+            np.testing.assert_array_equal(
+                fixed_slots,
+                fixed_slots_flat[int(row_fixed_ptr[row_num]) : int(row_fixed_ptr[row_num + 1])],
+            )
+            np.testing.assert_array_equal(
+                fixed_vals,
+                fixed_vals_flat[int(row_fixed_ptr[row_num]) : int(row_fixed_ptr[row_num + 1])],
+            )
+            np.testing.assert_array_equal(
+                remaining_slots,
+                remaining_slots_flat[
+                    int(row_remaining_ptr[row_num]) : int(row_remaining_ptr[row_num + 1])
+                ],
+            )
+
     def test_row_archives_are_written_once_per_row_and_preserve_row_totals(self):
         with mock.patch.object(final_algo_numba, "_detect_worker_count", return_value=1):
             prep = self._make_prep(4, distribution=NSIPRDistribution())
-            archived_rows: list[tuple[int, np.ndarray, np.ndarray]] = []
+            archived_rows: list[tuple[int, np.ndarray, np.ndarray, np.dtype]] = []
             original_write = final_algo_numba._write_row_counts_archive
 
             def capture_write(path, keys, counts):
                 row_num = int(Path(path).stem.split("_")[1])
+                counts_array = np.asarray(counts)
                 archived_rows.append(
                     (
                         row_num,
                         np.asarray(keys, dtype=np.uint64).copy(),
-                        np.asarray(counts, dtype=np.uint64).copy(),
+                        counts_array.copy(),
+                        counts_array.dtype,
                     )
                 )
                 return original_write(path, keys, counts)
@@ -747,13 +783,18 @@ class TestClusterOptimizedRing(unittest.TestCase):
                 _ = prep.global_keys
 
         self.assertEqual(len(archived_rows), prep.nof_marginals)
-        self.assertEqual(sorted(row_num for row_num, _keys, _counts in archived_rows), list(range(prep.nof_marginals)))
-        for row_num, keys, counts in archived_rows:
+        self.assertEqual(
+            sorted(row_num for row_num, _keys, _counts, _dtype in archived_rows),
+            list(range(prep.nof_marginals)),
+        )
+        for row_num, keys, counts, counts_dtype in archived_rows:
             self.assertEqual(keys.size, counts.size)
             self.assertTrue(np.all(counts > 0))
             if keys.size > 1:
                 self.assertTrue(np.all(keys[1:] > keys[:-1]))
             self.assertEqual(int(counts.sum()), int(prep.row_extension_counts[row_num]))
+            self.assertEqual(np.dtype(counts_dtype).kind, "u")
+            self.assertLess(np.dtype(counts_dtype).itemsize, np.dtype(np.uint64).itemsize)
 
     def test_sorted_key_union_helper(self):
         union = _union_sorted_unique_uint64(
