@@ -564,26 +564,114 @@ def _estimate_per_worker_raw_buffer_bytes(max_row_entries: int) -> int:
     """Bytes required for one worker's raw uint64 key buffer for the worst structural row."""
     return 8 * max(0, int(max_row_entries))
 
+
+_OPEN_ADDRESS_PILOT_SIZE = 4096
+_OPEN_ADDRESS_PILOT_GAMMA = 1.0
+_OPEN_ADDRESS_TARGET_LOAD = 0.70
+_OPEN_ADDRESS_MAX_LOAD = 0.85
+
+
+def _open_address_capacity_from_estimated_unique(estimated_unique: int) -> int:
+    """Power-of-two open-address capacity from an estimated unique-key count."""
+    unique = max(1, int(estimated_unique))
+    required = max(16, int(np.ceil(float(unique) / _OPEN_ADDRESS_TARGET_LOAD)))
+    capacity = 1
+    while capacity < required:
+        capacity <<= 1
+    return capacity
+
+
+def _estimate_unique_from_pilot(
+    total_entries: int,
+    pilot_size: int,
+    pilot_unique: int,
+) -> int:
+    """Pilot-based unique-count estimate used for initial open-address sizing."""
+    total = max(0, int(total_entries))
+    used = max(0, int(pilot_size))
+    unique = max(0, int(pilot_unique))
+    if total == 0:
+        return 0
+    if used == 0 or unique == 0:
+        return 1
+    projected = int(np.ceil(float(total) * (float(unique) / float(used)) * _OPEN_ADDRESS_PILOT_GAMMA))
+    projected = max(unique, projected)
+    return min(total, max(1, projected))
+
+
+def _estimate_open_address_row_peak_bytes(
+    total_entries: int,
+    estimated_unique: int,
+    count_itemsize: int,
+    *,
+    pilot_size: int = _OPEN_ADDRESS_PILOT_SIZE,
+) -> int:
+    """Estimated one-row peak for open addressing (table + outputs + sort workspace + pilot cache)."""
+    total = max(0, int(total_entries))
+    uniques = min(total, max(0, int(estimated_unique)))
+    count_bytes = max(1, int(count_itemsize))
+    capacity = _open_address_capacity_from_estimated_unique(max(1, uniques))
+    pilot_used = min(total, int(pilot_size))
+    table_bytes = capacity * (8 + count_bytes + 1)
+    output_bytes = uniques * (8 + count_bytes)
+    sort_workspace_bytes = uniques * 8
+    pilot_bytes = pilot_used * 8
+    return int(table_bytes + output_bytes + sort_workspace_bytes + pilot_bytes)
+
+
 def _estimate_per_worker_peak_bytes(max_row_entries: int) -> int:
-    """One-pass worker peak bytes: raw keys plus exact unique keys and counts."""
-    return 24 * max(0, int(max_row_entries))
+    """Conservative structural worker peak under open addressing (`U=T`, uint64 counts)."""
+    total = max(0, int(max_row_entries))
+    return _estimate_open_address_row_peak_bytes(
+        total,
+        total,
+        np.dtype(np.uint64).itemsize,
+    )
 
 
 def _estimate_active_worker_peak_bytes(
     row_extension_counts: np.ndarray,
     worker_count: int,
 ) -> int:
-    """Upper bound on concurrent one-pass worker memory from the largest active rows."""
+    """Conservative structural active-worker peak under open addressing."""
     counts = np.asarray(row_extension_counts, dtype=np.int64)
     if counts.size == 0 or worker_count <= 0:
         return 0
+    row_peaks = np.asarray(
+        [
+            _estimate_open_address_row_peak_bytes(
+                int(row_count),
+                int(row_count),
+                np.dtype(np.uint64).itemsize,
+            )
+            for row_count in counts.tolist()
+        ],
+        dtype=np.int64,
+    )
     active_workers = min(int(worker_count), int(counts.size))
-    if active_workers == counts.size:
-        selected = counts
+    if active_workers == row_peaks.size:
+        selected = row_peaks
     else:
-        partition_idx = counts.size - active_workers
-        selected = np.partition(counts, partition_idx)[partition_idx:]
-    return 24 * int(selected.sum())
+        partition_idx = row_peaks.size - active_workers
+        selected = np.partition(row_peaks, partition_idx)[partition_idx:]
+    return int(selected.sum())
+
+
+def _estimate_active_worker_peak_from_row_peaks(
+    row_peak_bytes: np.ndarray,
+    worker_count: int,
+) -> int:
+    """Exact active-worker estimate from per-row estimated peaks."""
+    peaks = np.asarray(row_peak_bytes, dtype=np.int64)
+    if peaks.size == 0 or worker_count <= 0:
+        return 0
+    active_workers = min(int(worker_count), int(peaks.size))
+    if active_workers == peaks.size:
+        selected = peaks
+    else:
+        partition_idx = peaks.size - active_workers
+        selected = np.partition(peaks, partition_idx)[partition_idx:]
+    return int(selected.sum())
 
 
 def _slot_index_dtype(nof_slots: int):
@@ -609,57 +697,125 @@ def _unsigned_count_dtype_for_max(max_value: int):
     return np.uint64
 
 
-def _downcast_unsigned_counts(counts: np.ndarray, *, max_value: int) -> np.ndarray:
-    """Downcast nonnegative count arrays to the smallest safe unsigned dtype."""
-    target_dtype = _unsigned_count_dtype_for_max(max_value)
-    as_unsigned = np.asarray(counts, dtype=np.uint64)
-    if as_unsigned.size:
-        observed_max = int(as_unsigned.max())
-        if observed_max > np.iinfo(target_dtype).max:
-            raise AssertionError(
-                "Observed row multiplicity exceeded selected compact count dtype bound: "
-                f"observed={observed_max}, max_allowed={np.iinfo(target_dtype).max}."
-            )
-    return as_unsigned.astype(target_dtype, copy=False)
+@njit(cache=True, inline="always")
+def _mix_u64(key: np.uint64) -> np.uint64:
+    """Stable 64-bit integer mix for open-address hash indexing."""
+    z = np.uint64(key) + np.uint64(0x9E3779B97F4A7C15)
+    z = (z ^ (z >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+    z = (z ^ (z >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+    return z ^ (z >> np.uint64(31))
 
 
-@njit(cache=True, fastmath=True)
-def _fill_sorted_global_extension_keys_for_row(
-    raw_keys: np.ndarray,
-    row_num: int,
-    row_fixed_ptr: np.ndarray,
-    fixed_slots_flat: np.ndarray,
-    fixed_vals_flat: np.ndarray,
-    row_remaining_ptr: np.ndarray,
+@njit(cache=True, inline="always")
+def _open_address_capacity_from_estimated_unique_numba(estimated_unique: int) -> int:
+    unique = max(1, int(estimated_unique))
+    required = int(np.ceil(float(unique) / _OPEN_ADDRESS_TARGET_LOAD))
+    if required < 16:
+        required = 16
+    capacity = 1
+    while capacity < required:
+        capacity *= 2
+    return capacity
+
+
+@njit(cache=True, inline="always")
+def _open_address_max_load(capacity: int) -> int:
+    max_load = int(float(capacity) * _OPEN_ADDRESS_MAX_LOAD)
+    if max_load < 1:
+        return 1
+    if max_load >= capacity:
+        return capacity - 1
+    return max_load
+
+
+@njit(cache=True, inline="always")
+def _estimate_unique_from_pilot_numba(total_entries: int, pilot_size: int, pilot_unique: int) -> int:
+    total = max(0, int(total_entries))
+    used = max(0, int(pilot_size))
+    unique = max(0, int(pilot_unique))
+    if total == 0:
+        return 0
+    if used == 0 or unique == 0:
+        return 1
+    projected = int(np.ceil(float(total) * (float(unique) / float(used)) * _OPEN_ADDRESS_PILOT_GAMMA))
+    if projected < unique:
+        projected = unique
+    if projected < 1:
+        projected = 1
+    if projected > total:
+        projected = total
+    return projected
+
+
+@njit(cache=True, inline="always")
+def _canonical_key_for_row_position(
+    evt: np.ndarray,
+    pos: int,
+    remaining_start: int,
+    remaining_size: int,
     remaining_slots_flat: np.ndarray,
-    nof_off_diagonal_slots: int,
     outcomes: int,
     slot_sources: np.ndarray,
     outcome_maps: np.ndarray,
-) -> None:
-    """Enumerate and sort one row's canonical uint64 global-extension keys."""
-    evt = np.zeros(nof_off_diagonal_slots, dtype=np.uint8)
-    fixed_start = int(row_fixed_ptr[row_num])
-    fixed_end = int(row_fixed_ptr[row_num + 1])
-    for pos in range(fixed_start, fixed_end):
-        evt[int(fixed_slots_flat[pos])] = fixed_vals_flat[pos]
-    remaining_start = int(row_remaining_ptr[row_num])
-    remaining_end = int(row_remaining_ptr[row_num + 1])
-    remaining_size = remaining_end - remaining_start
-    total = raw_keys.size
-    for pos in range(total):
-        tmp = pos
-        for rem_pos in range(remaining_size - 1, -1, -1):
-            idx = int(remaining_slots_flat[remaining_start + rem_pos])
-            evt[idx] = tmp % outcomes
-            tmp //= outcomes
-        raw_keys[pos] = canonical_leximin_coset_chain_uint64(
-            evt,
-            outcomes,
-            slot_sources,
-            outcome_maps,
-        )
-    raw_keys.sort()
+) -> np.uint64:
+    tmp = pos
+    for rem_pos in range(remaining_size - 1, -1, -1):
+        idx = int(remaining_slots_flat[remaining_start + rem_pos])
+        evt[idx] = tmp % outcomes
+        tmp //= outcomes
+    return canonical_leximin_coset_chain_uint64(
+        evt,
+        outcomes,
+        slot_sources,
+        outcome_maps,
+    )
+
+
+@njit(cache=True, inline="always")
+def _open_address_insert_or_increment(
+    table_keys: np.ndarray,
+    table_counts: np.ndarray,
+    occupied_mask: np.ndarray,
+    key: np.uint64,
+) -> int:
+    capacity = table_keys.size
+    pos = int(_mix_u64(key)) % capacity
+    while occupied_mask[pos] != 0:
+        if table_keys[pos] == key:
+            table_counts[pos] = table_counts[pos] + 1
+            return 0
+        pos += 1
+        if pos == capacity:
+            pos = 0
+    occupied_mask[pos] = np.uint8(1)
+    table_keys[pos] = key
+    table_counts[pos] = 1
+    return 1
+
+
+@njit(cache=True)
+def _open_address_rehash(
+    old_keys: np.ndarray,
+    old_counts: np.ndarray,
+    old_occupied: np.ndarray,
+    new_capacity: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    new_keys = np.empty(new_capacity, dtype=np.uint64)
+    new_counts = np.zeros(new_capacity, dtype=old_counts.dtype)
+    new_occupied = np.zeros(new_capacity, dtype=np.uint8)
+    for idx in range(old_keys.size):
+        if old_occupied[idx] == 0:
+            continue
+        key = old_keys[idx]
+        pos = int(_mix_u64(key)) % new_capacity
+        while new_occupied[pos] != 0:
+            pos += 1
+            if pos == new_capacity:
+                pos = 0
+        new_occupied[pos] = np.uint8(1)
+        new_keys[pos] = key
+        new_counts[pos] = old_counts[idx]
+    return new_keys, new_counts, new_occupied
 
 
 @njit(cache=True, fastmath=True)
@@ -677,36 +833,166 @@ def _count_unique_sorted_uint64(sorted_keys: np.ndarray) -> np.int64:
     return np.int64(unique_count)
 
 
-@njit(cache=True, fastmath=True)
-def _write_rle_sorted_uint64_to_flat(
-    sorted_keys: np.ndarray,
-    out_keys: np.ndarray,
-    out_counts: np.ndarray,
-    write_start: int,
-) -> np.int64:
-    """Write the RLE of a sorted uint64 array into flat output buffers."""
-    if sorted_keys.size == 0:
-        return np.int64(write_start)
-    write_pos = int(write_start)
-    current_key = sorted_keys[0]
-    current_count = np.uint64(1)
-    for idx in range(1, sorted_keys.size):
-        key = sorted_keys[idx]
-        if key == current_key:
-            current_count += np.uint64(1)
-        else:
-            out_keys[write_pos] = current_key
-            out_counts[write_pos] = current_count
-            write_pos += 1
-            current_key = key
-            current_count = np.uint64(1)
-    out_keys[write_pos] = current_key
-    out_counts[write_pos] = current_count
-    return np.int64(write_pos + 1)
+@njit(cache=True, nogil=True, fastmath=True)
+def _pilot_unique_count_for_row(
+    row_num: int,
+    row_extension_counts: np.ndarray,
+    row_fixed_ptr: np.ndarray,
+    fixed_slots_flat: np.ndarray,
+    fixed_vals_flat: np.ndarray,
+    row_remaining_ptr: np.ndarray,
+    remaining_slots_flat: np.ndarray,
+    nof_off_diagonal_slots: int,
+    outcomes: int,
+    slot_sources: np.ndarray,
+    outcome_maps: np.ndarray,
+) -> Tuple[np.int64, np.int64]:
+    """Pilot unique count on the first fixed prefix of row global extensions."""
+    total = int(row_extension_counts[row_num])
+    if total <= 0:
+        return np.int64(0), np.int64(0)
+    evt = np.zeros(nof_off_diagonal_slots, dtype=np.uint8)
+    fixed_start = int(row_fixed_ptr[row_num])
+    fixed_end = int(row_fixed_ptr[row_num + 1])
+    for pos in range(fixed_start, fixed_end):
+        evt[int(fixed_slots_flat[pos])] = fixed_vals_flat[pos]
+    remaining_start = int(row_remaining_ptr[row_num])
+    remaining_end = int(row_remaining_ptr[row_num + 1])
+    remaining_size = remaining_end - remaining_start
+    pilot_size = min(total, _OPEN_ADDRESS_PILOT_SIZE)
+    pilot_keys = np.empty(pilot_size, dtype=np.uint64)
+    for pos in range(pilot_size):
+        pilot_keys[pos] = _canonical_key_for_row_position(
+            evt,
+            pos,
+            remaining_start,
+            remaining_size,
+            remaining_slots_flat,
+            outcomes,
+            slot_sources,
+            outcome_maps,
+        )
+    pilot_sorted = pilot_keys.copy()
+    pilot_sorted.sort()
+    pilot_unique = int(_count_unique_sorted_uint64(pilot_sorted))
+    return np.int64(pilot_size), np.int64(pilot_unique)
 
 
 @njit(cache=True, nogil=True, fastmath=True)
-def _compute_unique_global_extension_keys_for_row(
+def _compute_unique_global_extension_keys_for_row_with_dtype(
+    row_num: int,
+    row_extension_counts: np.ndarray,
+    row_fixed_ptr: np.ndarray,
+    fixed_slots_flat: np.ndarray,
+    fixed_vals_flat: np.ndarray,
+    row_remaining_ptr: np.ndarray,
+    remaining_slots_flat: np.ndarray,
+    nof_off_diagonal_slots: int,
+    outcomes: int,
+    slot_sources: np.ndarray,
+    outcome_maps: np.ndarray,
+    count_dtype_prototype: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Enumerate one row via pilot-seeded open addressing and return sorted unique pairs."""
+    total = int(row_extension_counts[row_num])
+    if total == 0:
+        return np.empty(0, dtype=np.uint64), np.empty(0, dtype=count_dtype_prototype.dtype)
+
+    evt = np.zeros(nof_off_diagonal_slots, dtype=np.uint8)
+    fixed_start = int(row_fixed_ptr[row_num])
+    fixed_end = int(row_fixed_ptr[row_num + 1])
+    for pos in range(fixed_start, fixed_end):
+        evt[int(fixed_slots_flat[pos])] = fixed_vals_flat[pos]
+    remaining_start = int(row_remaining_ptr[row_num])
+    remaining_end = int(row_remaining_ptr[row_num + 1])
+    remaining_size = remaining_end - remaining_start
+
+    pilot_size = min(total, _OPEN_ADDRESS_PILOT_SIZE)
+    pilot_keys = np.empty(pilot_size, dtype=np.uint64)
+    for pos in range(pilot_size):
+        pilot_keys[pos] = _canonical_key_for_row_position(
+            evt,
+            pos,
+            remaining_start,
+            remaining_size,
+            remaining_slots_flat,
+            outcomes,
+            slot_sources,
+            outcome_maps,
+        )
+    pilot_sorted = pilot_keys.copy()
+    pilot_sorted.sort()
+    pilot_unique = int(_count_unique_sorted_uint64(pilot_sorted))
+    estimated_unique = _estimate_unique_from_pilot_numba(total, pilot_size, pilot_unique)
+
+    capacity = _open_address_capacity_from_estimated_unique_numba(estimated_unique)
+    table_keys = np.empty(capacity, dtype=np.uint64)
+    table_counts = np.zeros(capacity, dtype=count_dtype_prototype.dtype)
+    occupied_mask = np.zeros(capacity, dtype=np.uint8)
+    unique_count = 0
+    max_load = _open_address_max_load(capacity)
+
+    for idx in range(pilot_size):
+        if unique_count >= max_load:
+            new_capacity = int(capacity * 2)
+            table_keys, table_counts, occupied_mask = _open_address_rehash(
+                table_keys,
+                table_counts,
+                occupied_mask,
+                new_capacity,
+            )
+            capacity = new_capacity
+            max_load = _open_address_max_load(capacity)
+        unique_count += _open_address_insert_or_increment(
+            table_keys,
+            table_counts,
+            occupied_mask,
+            pilot_keys[idx],
+        )
+
+    for pos in range(pilot_size, total):
+        key = _canonical_key_for_row_position(
+            evt,
+            pos,
+            remaining_start,
+            remaining_size,
+            remaining_slots_flat,
+            outcomes,
+            slot_sources,
+            outcome_maps,
+        )
+        if unique_count >= max_load:
+            new_capacity = int(capacity * 2)
+            table_keys, table_counts, occupied_mask = _open_address_rehash(
+                table_keys,
+                table_counts,
+                occupied_mask,
+                new_capacity,
+            )
+            capacity = new_capacity
+            max_load = _open_address_max_load(capacity)
+        unique_count += _open_address_insert_or_increment(
+            table_keys,
+            table_counts,
+            occupied_mask,
+            key,
+        )
+
+    unique_keys = np.empty(unique_count, dtype=np.uint64)
+    unique_counts = np.empty(unique_count, dtype=table_counts.dtype)
+    write_pos = 0
+    for idx in range(capacity):
+        if occupied_mask[idx] == 0:
+            continue
+        unique_keys[write_pos] = table_keys[idx]
+        unique_counts[write_pos] = table_counts[idx]
+        write_pos += 1
+    order = np.argsort(unique_keys)
+    return unique_keys[order], unique_counts[order]
+
+
+@njit(cache=True, nogil=True, fastmath=True)
+def _compute_unique_global_extension_keys_for_row_u8(
     row_num: int,
     row_extension_counts: np.ndarray,
     row_fixed_ptr: np.ndarray,
@@ -719,14 +1005,174 @@ def _compute_unique_global_extension_keys_for_row(
     slot_sources: np.ndarray,
     outcome_maps: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Enumerate, sort, and RLE one row into exact-sized unique-key/count arrays."""
-    total = int(row_extension_counts[row_num])
-    if total == 0:
-        return np.empty(0, dtype=np.uint64), np.empty(0, dtype=np.uint64)
-    raw_keys = np.empty(total, dtype=np.uint64)
-    _fill_sorted_global_extension_keys_for_row(
-        raw_keys,
+    return _compute_unique_global_extension_keys_for_row_with_dtype(
         row_num,
+        row_extension_counts,
+        row_fixed_ptr,
+        fixed_slots_flat,
+        fixed_vals_flat,
+        row_remaining_ptr,
+        remaining_slots_flat,
+        nof_off_diagonal_slots,
+        outcomes,
+        slot_sources,
+        outcome_maps,
+        np.empty(0, dtype=np.uint8),
+    )
+
+
+@njit(cache=True, nogil=True, fastmath=True)
+def _compute_unique_global_extension_keys_for_row_u16(
+    row_num: int,
+    row_extension_counts: np.ndarray,
+    row_fixed_ptr: np.ndarray,
+    fixed_slots_flat: np.ndarray,
+    fixed_vals_flat: np.ndarray,
+    row_remaining_ptr: np.ndarray,
+    remaining_slots_flat: np.ndarray,
+    nof_off_diagonal_slots: int,
+    outcomes: int,
+    slot_sources: np.ndarray,
+    outcome_maps: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    return _compute_unique_global_extension_keys_for_row_with_dtype(
+        row_num,
+        row_extension_counts,
+        row_fixed_ptr,
+        fixed_slots_flat,
+        fixed_vals_flat,
+        row_remaining_ptr,
+        remaining_slots_flat,
+        nof_off_diagonal_slots,
+        outcomes,
+        slot_sources,
+        outcome_maps,
+        np.empty(0, dtype=np.uint16),
+    )
+
+
+@njit(cache=True, nogil=True, fastmath=True)
+def _compute_unique_global_extension_keys_for_row_u32(
+    row_num: int,
+    row_extension_counts: np.ndarray,
+    row_fixed_ptr: np.ndarray,
+    fixed_slots_flat: np.ndarray,
+    fixed_vals_flat: np.ndarray,
+    row_remaining_ptr: np.ndarray,
+    remaining_slots_flat: np.ndarray,
+    nof_off_diagonal_slots: int,
+    outcomes: int,
+    slot_sources: np.ndarray,
+    outcome_maps: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    return _compute_unique_global_extension_keys_for_row_with_dtype(
+        row_num,
+        row_extension_counts,
+        row_fixed_ptr,
+        fixed_slots_flat,
+        fixed_vals_flat,
+        row_remaining_ptr,
+        remaining_slots_flat,
+        nof_off_diagonal_slots,
+        outcomes,
+        slot_sources,
+        outcome_maps,
+        np.empty(0, dtype=np.uint32),
+    )
+
+
+@njit(cache=True, nogil=True, fastmath=True)
+def _compute_unique_global_extension_keys_for_row_u64(
+    row_num: int,
+    row_extension_counts: np.ndarray,
+    row_fixed_ptr: np.ndarray,
+    fixed_slots_flat: np.ndarray,
+    fixed_vals_flat: np.ndarray,
+    row_remaining_ptr: np.ndarray,
+    remaining_slots_flat: np.ndarray,
+    nof_off_diagonal_slots: int,
+    outcomes: int,
+    slot_sources: np.ndarray,
+    outcome_maps: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    return _compute_unique_global_extension_keys_for_row_with_dtype(
+        row_num,
+        row_extension_counts,
+        row_fixed_ptr,
+        fixed_slots_flat,
+        fixed_vals_flat,
+        row_remaining_ptr,
+        remaining_slots_flat,
+        nof_off_diagonal_slots,
+        outcomes,
+        slot_sources,
+        outcome_maps,
+        np.empty(0, dtype=np.uint64),
+    )
+
+
+def _compute_unique_global_extension_keys_for_row(
+    row_num: int,
+    row_extension_counts: np.ndarray,
+    row_fixed_ptr: np.ndarray,
+    fixed_slots_flat: np.ndarray,
+    fixed_vals_flat: np.ndarray,
+    row_remaining_ptr: np.ndarray,
+    remaining_slots_flat: np.ndarray,
+    nof_off_diagonal_slots: int,
+    outcomes: int,
+    slot_sources: np.ndarray,
+    outcome_maps: np.ndarray,
+    *,
+    count_dtype: np.dtype | type = np.uint64,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Dispatch to the dtype-specialized open-address row kernel."""
+    dtype = np.dtype(count_dtype)
+    if dtype == np.dtype(np.uint8):
+        return _compute_unique_global_extension_keys_for_row_u8(
+            row_num,
+            row_extension_counts,
+            row_fixed_ptr,
+            fixed_slots_flat,
+            fixed_vals_flat,
+            row_remaining_ptr,
+            remaining_slots_flat,
+            nof_off_diagonal_slots,
+            outcomes,
+            slot_sources,
+            outcome_maps,
+        )
+    if dtype == np.dtype(np.uint16):
+        return _compute_unique_global_extension_keys_for_row_u16(
+            row_num,
+            row_extension_counts,
+            row_fixed_ptr,
+            fixed_slots_flat,
+            fixed_vals_flat,
+            row_remaining_ptr,
+            remaining_slots_flat,
+            nof_off_diagonal_slots,
+            outcomes,
+            slot_sources,
+            outcome_maps,
+        )
+    if dtype == np.dtype(np.uint32):
+        return _compute_unique_global_extension_keys_for_row_u32(
+            row_num,
+            row_extension_counts,
+            row_fixed_ptr,
+            fixed_slots_flat,
+            fixed_vals_flat,
+            row_remaining_ptr,
+            remaining_slots_flat,
+            nof_off_diagonal_slots,
+            outcomes,
+            slot_sources,
+            outcome_maps,
+        )
+    return _compute_unique_global_extension_keys_for_row_u64(
+        row_num,
+        row_extension_counts,
         row_fixed_ptr,
         fixed_slots_flat,
         fixed_vals_flat,
@@ -737,11 +1183,6 @@ def _compute_unique_global_extension_keys_for_row(
         slot_sources,
         outcome_maps,
     )
-    unique_count = int(_count_unique_sorted_uint64(raw_keys))
-    unique_keys = np.empty(unique_count, dtype=np.uint64)
-    unique_counts = np.empty(unique_count, dtype=np.uint64)
-    _write_rle_sorted_uint64_to_flat(raw_keys, unique_keys, unique_counts, 0)
-    return unique_keys, unique_counts
 
 
 @njit(cache=True)
@@ -847,21 +1288,20 @@ def _format_marginal_type_summary_lines(
 
 
 def _format_exact_row_memory_tally_lines(
-    row_extension_counts: np.ndarray,
+    row_peak_bytes: np.ndarray,
     marginals: Sequence[List[List[int]]],
 ) -> list[str]:
-    """Format grouped exact one-pass per-row peaks with marginal-size/type annotations."""
-    counts = np.asarray(row_extension_counts, dtype=np.int64)
-    if counts.size == 0:
+    """Format grouped pilot-estimated open-address row peaks with type annotations."""
+    peaks = np.asarray(row_peak_bytes, dtype=np.int64)
+    if peaks.size == 0:
         return []
-    if len(marginals) != int(counts.size):
-        raise ValueError("Exact row memory tally requires one marginal per row-extension count.")
+    if len(marginals) != int(peaks.size):
+        raise ValueError("Row memory tally requires one marginal per peak estimate.")
 
     buckets: dict[int, dict[str, object]] = {}
-    for marginal, row_count in zip(marginals, counts.tolist()):
-        peak_bytes = 24 * int(row_count)
+    for marginal, peak_bytes in zip(marginals, peaks.tolist()):
         bucket = buckets.setdefault(
-            peak_bytes,
+            int(peak_bytes),
             {
                 "count": 0,
                 "marginal_size": len(marginal),
@@ -887,6 +1327,38 @@ def _format_exact_row_memory_tally_lines(
             f"marginal size {marginal_size}; {type_word}: {signature_text}"
         )
     return lines
+
+
+def _estimate_row_open_address_peak_payload(
+    row_extension_counts: np.ndarray,
+    row_pilot_sizes: np.ndarray,
+    row_pilot_uniques: np.ndarray,
+    row_count_itemsizes: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return `(estimated_unique_counts, estimated_row_peak_bytes)` from per-row pilots."""
+    counts = np.asarray(row_extension_counts, dtype=np.int64)
+    pilot_sizes = np.asarray(row_pilot_sizes, dtype=np.int64)
+    pilot_uniques = np.asarray(row_pilot_uniques, dtype=np.int64)
+    count_itemsizes = np.asarray(row_count_itemsizes, dtype=np.int64)
+    if not (counts.size == pilot_sizes.size == pilot_uniques.size == count_itemsizes.size):
+        raise ValueError("Pilot payload arrays must have matching lengths.")
+
+    estimated_uniques = np.empty(counts.size, dtype=np.int64)
+    row_peak_bytes = np.empty(counts.size, dtype=np.int64)
+    for idx in range(int(counts.size)):
+        total = int(counts[idx])
+        pilot_size = int(pilot_sizes[idx])
+        pilot_unique = int(pilot_uniques[idx])
+        count_itemsize = int(count_itemsizes[idx])
+        estimated_unique = _estimate_unique_from_pilot(total, pilot_size, pilot_unique)
+        estimated_uniques[idx] = estimated_unique
+        row_peak_bytes[idx] = _estimate_open_address_row_peak_bytes(
+            total,
+            estimated_unique,
+            count_itemsize,
+            pilot_size=pilot_size,
+        )
+    return estimated_uniques, row_peak_bytes
 
 
 def _log_progress_line(message: str, *, enabled: bool) -> None:
@@ -1246,6 +1718,12 @@ def _build_row_archive_worker(row_num: int) -> Tuple[int, str, int, int]:
     if state is None:
         raise RuntimeError("Row-archive worker state was not initialized.")
     row_idx = int(row_num)
+    row_total = int(state["row_extension_counts"][row_idx])
+    max_count_bound = min(
+        row_total,
+        int(state["group_order"]),
+    )
+    count_dtype = _unsigned_count_dtype_for_max(max_count_bound)
     unique_keys, unique_counts = _compute_unique_global_extension_keys_for_row(
         row_idx,
         state["row_extension_counts"],
@@ -1258,15 +1736,11 @@ def _build_row_archive_worker(row_num: int) -> Tuple[int, str, int, int]:
         int(state["outcomes"]),
         state["slot_sources"],
         state["outcome_maps"],
+        count_dtype=count_dtype,
     )
-    max_count_bound = min(
-        int(state["row_extension_counts"][row_idx]),
-        int(state["group_order"]),
-    )
-    unique_counts = _downcast_unsigned_counts(unique_counts, max_value=max_count_bound)
     row_path = Path(state["scratch_dir"]) / f"row_{row_idx:06d}.npz"
     _write_row_counts_archive(row_path, unique_keys, unique_counts)
-    return row_idx, str(row_path), int(state["row_extension_counts"][row_idx]), int(unique_keys.size)
+    return row_idx, str(row_path), row_total, int(unique_keys.size)
 
 
 def _reconstruct_csr_from_column_payload(
@@ -1722,17 +2196,17 @@ class PrepLP:
 
     @cached_property
     def per_worker_raw_buffer_bytes(self) -> int:
-        """Worst-case per-worker raw key buffer bytes from the structural estimate."""
+        """Worst-case per-worker key-array bytes from the structural estimate (`8*T`)."""
         return _estimate_per_worker_raw_buffer_bytes(self.estimated_max_row_entries)
 
     @cached_property
     def per_worker_peak_bytes(self) -> int:
-        """One-pass worst-case per-worker peak, including exact unique keys and counts."""
+        """Worst-case per-worker open-address peak (`U=T`, uint64 counts)."""
         return _estimate_per_worker_peak_bytes(self.estimated_max_row_entries)
 
     @cached_property
     def worst_case_active_worker_peak_bytes(self) -> int:
-        """Worst-case one-pass active-worker peak if every worker hits the structural maximum."""
+        """Worst-case active-worker open-address peak if every worker hits the structural maximum."""
         return max(1, int(self.worker_count)) * self.per_worker_peak_bytes
 
     def _log_startup_resources(self) -> None:
@@ -1752,7 +2226,7 @@ class PrepLP:
         lines = [
             f"smallest_marginal_size={self.smallest_marginal_size}",
             f"worst_case_row_entries={self.estimated_max_row_entries}",
-            f"worst_case_per_worker_raw_buffer={_format_bytes_human(self.per_worker_raw_buffer_bytes)}",
+            f"worst_case_per_worker_key_array={_format_bytes_human(self.per_worker_raw_buffer_bytes)}",
             f"worst_case_per_worker_peak={_format_bytes_human(self.per_worker_peak_bytes)}",
             (
                 "worst_case_active_peak_if_all_workers_hit_max="
@@ -2540,11 +3014,50 @@ class PrepLP:
         total_entries = int(row_extension_counts.sum())
         max_workers = max(1, int(self.worker_count))
         exact_max_row_entries = int(row_extension_counts.max()) if row_extension_counts.size else 0
-        exact_per_worker_raw_buffer_bytes = _estimate_per_worker_raw_buffer_bytes(exact_max_row_entries)
-        exact_per_worker_peak_bytes = _estimate_per_worker_peak_bytes(exact_max_row_entries)
-        exact_active_worker_peak_bytes = _estimate_active_worker_peak_bytes(row_extension_counts, max_workers)
         active_worker_rows = min(max_workers, int(row_extension_counts.size))
         usable_memory_budget = self.usable_memory_budget_bytes
+        (
+            _,
+            row_fixed_ptr,
+            fixed_slots_flat,
+            fixed_vals_flat,
+            row_remaining_ptr,
+            remaining_slots_flat,
+        ) = self._row_extension_tables
+        row_count_itemsizes = np.asarray(
+            [
+                np.dtype(_unsigned_count_dtype_for_max(min(int(row_count), self.discovered_group_order))).itemsize
+                for row_count in row_extension_counts.tolist()
+            ],
+            dtype=np.int64,
+        )
+        row_pilot_sizes = np.empty(self.nof_marginals, dtype=np.int64)
+        row_pilot_uniques = np.empty(self.nof_marginals, dtype=np.int64)
+        for row_num in range(self.nof_marginals):
+            pilot_size, pilot_unique = _pilot_unique_count_for_row(
+                int(row_num),
+                row_extension_counts,
+                row_fixed_ptr,
+                fixed_slots_flat,
+                fixed_vals_flat,
+                row_remaining_ptr,
+                remaining_slots_flat,
+                self.nof_off_diagonal_slots,
+                self.outcomes,
+                self.slot_sources,
+                self.outcome_maps,
+            )
+            row_pilot_sizes[row_num] = int(pilot_size)
+            row_pilot_uniques[row_num] = int(pilot_unique)
+        estimated_unique_counts, row_peak_bytes = _estimate_row_open_address_peak_payload(
+            row_extension_counts,
+            row_pilot_sizes,
+            row_pilot_uniques,
+            row_count_itemsizes,
+        )
+        exact_max_estimated_unique = int(estimated_unique_counts.max()) if estimated_unique_counts.size else 0
+        exact_per_worker_peak_bytes = int(row_peak_bytes.max()) if row_peak_bytes.size else 0
+        exact_active_worker_peak_bytes = _estimate_active_worker_peak_from_row_peaks(row_peak_bytes, max_workers)
 
         if exact_max_row_entries > self.estimated_max_row_entries:
             raise AssertionError(
@@ -2557,7 +3070,9 @@ class PrepLP:
                 f"rows={self.nof_marginals}",
                 f"total_entries={total_entries}",
                 f"exact_max_row_entries={exact_max_row_entries}",
-                f"exact_per_worker_raw_buffer={_format_bytes_human(exact_per_worker_raw_buffer_bytes)}",
+                f"exact_max_estimated_unique={exact_max_estimated_unique}",
+                f"pilot_size={_OPEN_ADDRESS_PILOT_SIZE}",
+                f"pilot_gamma={_OPEN_ADDRESS_PILOT_GAMMA:.1f}",
                 f"exact_per_worker_peak={_format_bytes_human(exact_per_worker_peak_bytes)}",
                 f"exact_active_peak={_format_bytes_human(exact_active_worker_peak_bytes)}",
                 f"scratch={scratch_dir}",
@@ -2567,12 +3082,15 @@ class PrepLP:
         _log_progress_block(
             "Exact row memory tally:",
             (
-                "one-pass worker peak = raw keys + unique keys + counts",
-                "24 bytes per raw row entry",
+                "estimated row peak = open-address table + outputs + sort workspace + pilot cache",
+                (
+                    "table capacity seeded from each row's first "
+                    f"{_OPEN_ADDRESS_PILOT_SIZE} canonicalized extensions"
+                ),
             ),
             enabled=self.show_progress,
         )
-        for tally_line in _format_exact_row_memory_tally_lines(row_extension_counts, self.marginals):
+        for tally_line in _format_exact_row_memory_tally_lines(row_peak_bytes, self.marginals):
             _log_progress_line(f"  {tally_line}", enabled=self.show_progress)
         _log_progress_block(
             "Exact active-worker bound:",
@@ -2591,6 +3109,10 @@ class PrepLP:
                 "Memory preflight warning:",
                 (
                     "structural worst-case marginal row exceeds the preflight build budget",
+                    (
+                        "worst-case assumes all row extensions are unique and uses open-address "
+                        "capacity with uint64 counts"
+                    ),
                     f"worst_case_per_worker_peak={_format_bytes_human(self.per_worker_peak_bytes)}",
                     "continuing anyway because memory preflight checks are non-fatal",
                 ),

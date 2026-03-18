@@ -23,10 +23,15 @@ from inflation.applications.Final_algo_numba import (
     _detect_worker_count,
     _detect_total_memory_budget_bytes,
     _cycles_from_J,
+    _estimate_active_worker_peak_from_row_peaks,
     _estimate_active_worker_peak_bytes,
+    _estimate_open_address_row_peak_bytes,
+    _estimate_unique_from_pilot,
     _format_bytes_human,
     _format_exact_row_memory_tally_lines,
     _estimate_per_worker_peak_bytes,
+    _OPEN_ADDRESS_PILOT_SIZE,
+    _pilot_unique_count_for_row,
     keep_loops_of_length,
     keep_loops_up_to_three,
     _relaxed_mass_gap,
@@ -661,17 +666,27 @@ class TestClusterOptimizedRing(unittest.TestCase):
         )
         self.assertEqual(_support_key_bytes_list(kept_after_match), _support_key_bytes_list([larger_match]))
 
-    def test_one_pass_peak_estimators_match_worker_model(self):
-        self.assertEqual(_estimate_per_worker_peak_bytes(12), 24 * 12)
+    def test_open_address_peak_estimators_match_worker_model(self):
+        self.assertGreater(_estimate_per_worker_peak_bytes(12), 0)
+        self.assertGreater(_estimate_per_worker_peak_bytes(13), _estimate_per_worker_peak_bytes(12))
         peak = _estimate_active_worker_peak_bytes(
             np.asarray([4, 8, 3, 10], dtype=np.int64),
             worker_count=2,
         )
-        self.assertEqual(peak, 24 * (10 + 8))
+        expected = sum(
+            sorted((_estimate_per_worker_peak_bytes(v) for v in (4, 8, 3, 10)), reverse=True)[:2]
+        )
+        self.assertEqual(peak, expected)
+
+        custom_peak = _estimate_active_worker_peak_from_row_peaks(
+            np.asarray([9, 1, 7, 4], dtype=np.int64),
+            worker_count=3,
+        )
+        self.assertEqual(custom_peak, 9 + 7 + 4)
 
     def test_exact_row_memory_tally_lines_group_and_sort_descending(self):
         lines = _format_exact_row_memory_tally_lines(
-            np.asarray([1 << 28, 1 << 28, 1 << 27], dtype=np.int64),
+            np.asarray([6 * 1024 ** 3, 6 * 1024 ** 3, 3 * 1024 ** 3], dtype=np.int64),
             [
                 [[1, 1, 2, 0, 0], [1, 2, 3, 0, 0], [1, 3, 4, 0, 0], [1, 4, 5, 0, 0], [1, 5, 6, 0, 0], [1, 6, 1, 0, 0]],
                 [[1, 1, 2, 0, 0], [1, 2, 3, 0, 0], [1, 3, 1, 0, 0], [1, 4, 5, 0, 0], [1, 5, 6, 0, 0], [1, 6, 4, 0, 0]],
@@ -695,6 +710,43 @@ class TestClusterOptimizedRing(unittest.TestCase):
         self.assertEqual(_format_bytes_human(2 * 1024 ** 2), "2.0 MiB")
         self.assertEqual(_format_bytes_human(3 * 1024 ** 3), "3.0 GiB")
         self.assertEqual(_format_bytes_human(4 * 1024 ** 4), "4.0 TiB")
+
+    def test_estimate_unique_from_pilot_uses_gamma_one(self):
+        estimate = _estimate_unique_from_pilot(total_entries=10000, pilot_size=100, pilot_unique=42)
+        self.assertEqual(estimate, 4200)
+
+    def test_pilot_unique_count_uses_fixed_prefix_size(self):
+        prep = self._shared_prep(3, distribution=NSIPRDistribution())
+        (
+            _row_extension_counts,
+            row_fixed_ptr,
+            fixed_slots_flat,
+            fixed_vals_flat,
+            row_remaining_ptr,
+            remaining_slots_flat,
+        ) = prep._row_extension_tables
+        fake_counts = prep.row_extension_counts.astype(np.int64, copy=True)
+        fake_counts[0] = _OPEN_ADDRESS_PILOT_SIZE + 123
+        pilot_size, pilot_unique = _pilot_unique_count_for_row(
+            0,
+            fake_counts,
+            row_fixed_ptr,
+            fixed_slots_flat,
+            fixed_vals_flat,
+            row_remaining_ptr,
+            remaining_slots_flat,
+            prep.nof_off_diagonal_slots,
+            prep.outcomes,
+            prep.slot_sources,
+            prep.outcome_maps,
+        )
+        self.assertEqual(int(pilot_size), _OPEN_ADDRESS_PILOT_SIZE)
+        self.assertGreaterEqual(int(pilot_unique), 1)
+
+    def test_open_address_row_peak_estimate_increases_with_unique_fraction(self):
+        low = _estimate_open_address_row_peak_bytes(10_000, 2_000, np.dtype(np.uint16).itemsize)
+        high = _estimate_open_address_row_peak_bytes(10_000, 6_000, np.dtype(np.uint16).itemsize)
+        self.assertGreater(high, low)
 
     def test_one_pass_row_kernel_emits_exact_sorted_unique_counts(self):
         prep = self._shared_prep(4, distribution=NSIPRDistribution())
@@ -794,7 +846,10 @@ class TestClusterOptimizedRing(unittest.TestCase):
                 self.assertTrue(np.all(keys[1:] > keys[:-1]))
             self.assertEqual(int(counts.sum()), int(prep.row_extension_counts[row_num]))
             self.assertEqual(np.dtype(counts_dtype).kind, "u")
-            self.assertLess(np.dtype(counts_dtype).itemsize, np.dtype(np.uint64).itemsize)
+            self.assertLessEqual(np.dtype(counts_dtype).itemsize, np.dtype(np.uint64).itemsize)
+            if counts.size:
+                bound = min(int(prep.row_extension_counts[row_num]), int(prep.discovered_group_order))
+                self.assertLessEqual(int(np.asarray(counts, dtype=np.uint64).max()), bound)
 
     def test_sorted_key_union_helper(self):
         union = _union_sorted_unique_uint64(
@@ -821,7 +876,7 @@ class TestClusterOptimizedRing(unittest.TestCase):
         prep = self._make_prep(3)
         with mock.patch.object(
             final_algo_numba,
-            "_estimate_active_worker_peak_bytes",
+            "_estimate_active_worker_peak_from_row_peaks",
             return_value=prep.usable_memory_budget_bytes + 1,
         ):
             with warnings.catch_warnings(record=True) as caught:
