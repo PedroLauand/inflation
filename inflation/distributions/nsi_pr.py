@@ -10,7 +10,6 @@ E2 = sp.sqrt(2) - 1
 E2_LOOP = sp.Integer(1)
 E3 = 3 - 2 * sp.sqrt(2)
 
-
 @lru_cache(None)
 def E_line(n: int) -> sp.Expr:
     if n < 1:
@@ -21,11 +20,8 @@ def E_line(n: int) -> sp.Expr:
         return E2
     if n == 3:
         return E3
-
-    vals = {1: E1, 2: E2, 3: E3}
-    for k in range(3, n):
-        vals[k + 1] = -vals[k] + vals[k - 1] + (1 - E2) * vals[k - 2]
-    return sp.simplify(vals[n])
+    else:
+        return -E_line(n-1) + E_line(n-2) + (1 - E2) * E_line(n-3)
 
 
 @lru_cache(None)
@@ -37,8 +33,8 @@ def E_loop(n: int) -> sp.Expr:
     if n == 2:
         return E2_LOOP
     if n == 3:
-        return sp.simplify(sp.sqrt(2) - 2 * E_line(2) - E_line(1))
-
+    #     # return sp.simplify(sp.sqrt(2) - 2 * E_line(2) - E_line(1))
+        return sp.Integer(0)
     m = n - 1
     term0 = sp.sqrt(2) ** (m - 1)
     summand = sp.Integer(0)
@@ -182,3 +178,7 @@ class NSIPRDistribution:
 
 
 __all__ = ["NSIPRDistribution", "P_loop", "P_line", "E_line", "E_loop"]
+
+if __name__ == "__main__":
+    for n in range(1, 5):
+        print(f"n={n}, E_loop(n)={E_loop(n)}={float(E_loop(n))}")

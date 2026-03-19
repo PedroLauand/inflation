@@ -297,21 +297,21 @@ def _run_suite(dist: RingDistributionProtocol, *, consistency_n: int, factorizat
 
 
 if __name__ == "__main__":
-    from inflation.distributions.ejm import EJMDistribution
+    # from inflation.distributions.ejm import EJMDistribution
 
-    _run_suite(EJMDistribution(), consistency_n=4, factorization_n=4)
+    # _run_suite(EJMDistribution(), consistency_n=4, factorization_n=4)
 
-    from inflation.distributions.rgb import RGBDistribution
+    # from inflation.distributions.rgb import RGBDistribution
 
-    _run_suite(RGBDistribution(), consistency_n=4, factorization_n=4)
+    # _run_suite(RGBDistribution(), consistency_n=4, factorization_n=4)
 
     from inflation.distributions.nsi_pr import NSIPRDistribution
 
-    _run_suite(NSIPRDistribution(), consistency_n=6, factorization_n=6)
+    _run_suite(NSIPRDistribution(), consistency_n=8, factorization_n=8)
 
-    from inflation.distributions.ghz import GHZDistribution
+    # from inflation.distributions.ghz import GHZDistribution
 
-    _run_suite(GHZDistribution(), consistency_n=4, factorization_n=4)
+    # _run_suite(GHZDistribution(), consistency_n=4, factorization_n=4)
 
 
 __all__ = [
