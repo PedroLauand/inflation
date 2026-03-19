@@ -566,9 +566,13 @@ def _estimate_per_worker_raw_buffer_bytes(max_row_entries: int) -> int:
 
 
 _OPEN_ADDRESS_PILOT_SIZE = 4096
-_OPEN_ADDRESS_PILOT_GAMMA = 1.0
 _OPEN_ADDRESS_TARGET_LOAD = 0.70
 _OPEN_ADDRESS_MAX_LOAD = 0.85
+
+
+_PILOT_GAMMA_QUAD_A = 1.027523
+_PILOT_GAMMA_QUAD_B = -2.435372
+_PILOT_GAMMA_QUAD_C = 2.416697
 
 
 def _open_address_capacity_from_estimated_unique(estimated_unique: int) -> int:
@@ -586,17 +590,8 @@ def _estimate_unique_from_pilot(
     pilot_size: int,
     pilot_unique: int,
 ) -> int:
-    """Pilot-based unique-count estimate used for initial open-address sizing."""
-    total = max(0, int(total_entries))
-    used = max(0, int(pilot_size))
-    unique = max(0, int(pilot_unique))
-    if total == 0:
-        return 0
-    if used == 0 or unique == 0:
-        return 1
-    projected = int(np.ceil(float(total) * (float(unique) / float(used)) * _OPEN_ADDRESS_PILOT_GAMMA))
-    projected = max(unique, projected)
-    return min(total, max(1, projected))
+    """Python wrapper around the Numba estimator for testability and logging paths."""
+    return int(_estimate_unique_from_pilot_numba(total_entries, pilot_size, pilot_unique))
 
 
 def _estimate_open_address_row_peak_bytes(
@@ -729,7 +724,11 @@ def _open_address_max_load(capacity: int) -> int:
 
 
 @njit(cache=True, inline="always")
-def _estimate_unique_from_pilot_numba(total_entries: int, pilot_size: int, pilot_unique: int) -> int:
+def _estimate_unique_from_pilot_numba(
+    total_entries: int,
+    pilot_size: int,
+    pilot_unique: int,
+) -> int:
     total = max(0, int(total_entries))
     used = max(0, int(pilot_size))
     unique = max(0, int(pilot_unique))
@@ -737,7 +736,17 @@ def _estimate_unique_from_pilot_numba(total_entries: int, pilot_size: int, pilot
         return 0
     if used == 0 or unique == 0:
         return 1
-    projected = int(np.ceil(float(total) * (float(unique) / float(used)) * _OPEN_ADDRESS_PILOT_GAMMA))
+    rho = float(unique) / float(used)
+    estimator_scale = (
+        _PILOT_GAMMA_QUAD_A
+        + _PILOT_GAMMA_QUAD_B * rho
+        + _PILOT_GAMMA_QUAD_C * rho * rho
+    )
+    if estimator_scale < 0.01:
+        estimator_scale = 0.01
+    elif estimator_scale > 1.0:
+        estimator_scale = 1.0
+    projected = int(np.ceil(float(total) * rho * estimator_scale))
     if projected < unique:
         projected = unique
     if projected < 1:
@@ -892,11 +901,11 @@ def _compute_unique_global_extension_keys_for_row_with_dtype(
     slot_sources: np.ndarray,
     outcome_maps: np.ndarray,
     count_dtype_prototype: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.int64]:
     """Enumerate one row via pilot-seeded open addressing and return sorted unique pairs."""
     total = int(row_extension_counts[row_num])
     if total == 0:
-        return np.empty(0, dtype=np.uint64), np.empty(0, dtype=count_dtype_prototype.dtype)
+        return np.empty(0, dtype=np.uint64), np.empty(0, dtype=count_dtype_prototype.dtype), np.int64(0)
 
     evt = np.zeros(nof_off_diagonal_slots, dtype=np.uint8)
     fixed_start = int(row_fixed_ptr[row_num])
@@ -988,7 +997,7 @@ def _compute_unique_global_extension_keys_for_row_with_dtype(
         unique_counts[write_pos] = table_counts[idx]
         write_pos += 1
     order = np.argsort(unique_keys)
-    return unique_keys[order], unique_counts[order]
+    return unique_keys[order], unique_counts[order], np.int64(estimated_unique)
 
 
 @njit(cache=True, nogil=True, fastmath=True)
@@ -1004,7 +1013,7 @@ def _compute_unique_global_extension_keys_for_row_u8(
     outcomes: int,
     slot_sources: np.ndarray,
     outcome_maps: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.int64]:
     return _compute_unique_global_extension_keys_for_row_with_dtype(
         row_num,
         row_extension_counts,
@@ -1034,7 +1043,7 @@ def _compute_unique_global_extension_keys_for_row_u16(
     outcomes: int,
     slot_sources: np.ndarray,
     outcome_maps: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.int64]:
     return _compute_unique_global_extension_keys_for_row_with_dtype(
         row_num,
         row_extension_counts,
@@ -1064,7 +1073,7 @@ def _compute_unique_global_extension_keys_for_row_u32(
     outcomes: int,
     slot_sources: np.ndarray,
     outcome_maps: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.int64]:
     return _compute_unique_global_extension_keys_for_row_with_dtype(
         row_num,
         row_extension_counts,
@@ -1094,7 +1103,7 @@ def _compute_unique_global_extension_keys_for_row_u64(
     outcomes: int,
     slot_sources: np.ndarray,
     outcome_maps: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.int64]:
     return _compute_unique_global_extension_keys_for_row_with_dtype(
         row_num,
         row_extension_counts,
@@ -1127,50 +1136,7 @@ def _compute_unique_global_extension_keys_for_row(
     count_dtype: np.dtype | type = np.uint64,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Dispatch to the dtype-specialized open-address row kernel."""
-    dtype = np.dtype(count_dtype)
-    if dtype == np.dtype(np.uint8):
-        return _compute_unique_global_extension_keys_for_row_u8(
-            row_num,
-            row_extension_counts,
-            row_fixed_ptr,
-            fixed_slots_flat,
-            fixed_vals_flat,
-            row_remaining_ptr,
-            remaining_slots_flat,
-            nof_off_diagonal_slots,
-            outcomes,
-            slot_sources,
-            outcome_maps,
-        )
-    if dtype == np.dtype(np.uint16):
-        return _compute_unique_global_extension_keys_for_row_u16(
-            row_num,
-            row_extension_counts,
-            row_fixed_ptr,
-            fixed_slots_flat,
-            fixed_vals_flat,
-            row_remaining_ptr,
-            remaining_slots_flat,
-            nof_off_diagonal_slots,
-            outcomes,
-            slot_sources,
-            outcome_maps,
-        )
-    if dtype == np.dtype(np.uint32):
-        return _compute_unique_global_extension_keys_for_row_u32(
-            row_num,
-            row_extension_counts,
-            row_fixed_ptr,
-            fixed_slots_flat,
-            fixed_vals_flat,
-            row_remaining_ptr,
-            remaining_slots_flat,
-            nof_off_diagonal_slots,
-            outcomes,
-            slot_sources,
-            outcome_maps,
-        )
-    return _compute_unique_global_extension_keys_for_row_u64(
+    unique_keys, unique_counts, _estimated_unique = _compute_unique_global_extension_keys_for_row_with_stats(
         row_num,
         row_extension_counts,
         row_fixed_ptr,
@@ -1182,7 +1148,85 @@ def _compute_unique_global_extension_keys_for_row(
         outcomes,
         slot_sources,
         outcome_maps,
+        count_dtype=count_dtype,
     )
+    return unique_keys, unique_counts
+
+
+def _compute_unique_global_extension_keys_for_row_with_stats(
+    row_num: int,
+    row_extension_counts: np.ndarray,
+    row_fixed_ptr: np.ndarray,
+    fixed_slots_flat: np.ndarray,
+    fixed_vals_flat: np.ndarray,
+    row_remaining_ptr: np.ndarray,
+    remaining_slots_flat: np.ndarray,
+    nof_off_diagonal_slots: int,
+    outcomes: int,
+    slot_sources: np.ndarray,
+    outcome_maps: np.ndarray,
+    *,
+    count_dtype: np.dtype | type = np.uint64,
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Dispatch dtype-specialized row kernel and include pilot-estimated unique count."""
+    dtype = np.dtype(count_dtype)
+    if dtype == np.dtype(np.uint8):
+        unique_keys, unique_counts, estimated_unique = _compute_unique_global_extension_keys_for_row_u8(
+            row_num,
+            row_extension_counts,
+            row_fixed_ptr,
+            fixed_slots_flat,
+            fixed_vals_flat,
+            row_remaining_ptr,
+            remaining_slots_flat,
+            nof_off_diagonal_slots,
+            outcomes,
+            slot_sources,
+            outcome_maps,
+        )
+    elif dtype == np.dtype(np.uint16):
+        unique_keys, unique_counts, estimated_unique = _compute_unique_global_extension_keys_for_row_u16(
+            row_num,
+            row_extension_counts,
+            row_fixed_ptr,
+            fixed_slots_flat,
+            fixed_vals_flat,
+            row_remaining_ptr,
+            remaining_slots_flat,
+            nof_off_diagonal_slots,
+            outcomes,
+            slot_sources,
+            outcome_maps,
+        )
+    elif dtype == np.dtype(np.uint32):
+        unique_keys, unique_counts, estimated_unique = _compute_unique_global_extension_keys_for_row_u32(
+            row_num,
+            row_extension_counts,
+            row_fixed_ptr,
+            fixed_slots_flat,
+            fixed_vals_flat,
+            row_remaining_ptr,
+            remaining_slots_flat,
+            nof_off_diagonal_slots,
+            outcomes,
+            slot_sources,
+            outcome_maps,
+        )
+    else:
+        unique_keys, unique_counts, estimated_unique = _compute_unique_global_extension_keys_for_row_u64(
+            row_num,
+            row_extension_counts,
+            row_fixed_ptr,
+            fixed_slots_flat,
+            fixed_vals_flat,
+            row_remaining_ptr,
+            remaining_slots_flat,
+            nof_off_diagonal_slots,
+            outcomes,
+            slot_sources,
+            outcome_maps,
+        )
+    return unique_keys, unique_counts, int(estimated_unique)
 
 
 @njit(cache=True)
@@ -1359,6 +1403,13 @@ def _estimate_row_open_address_peak_payload(
             pilot_size=pilot_size,
         )
     return estimated_uniques, row_peak_bytes
+
+
+def _format_compression_ratio(raw_entries: int, unique_entries: int) -> str:
+    """Format compression as `raw/unique` with `x` suffix."""
+    raw = max(0, int(raw_entries))
+    unique = max(1, int(unique_entries))
+    return f"{(float(raw) / float(unique)):.2f}x"
 
 
 def _log_progress_line(message: str, *, enabled: bool) -> None:
@@ -1712,7 +1763,7 @@ def _init_row_archive_worker(state: dict) -> None:
     _ROW_ARCHIVE_WORKER_STATE = state
 
 
-def _build_row_archive_worker(row_num: int) -> Tuple[int, str, int, int]:
+def _build_row_archive_worker(row_num: int) -> Tuple[int, str, int, int, int]:
     """Build one row archive in a worker thread and return lightweight metadata."""
     state = _ROW_ARCHIVE_WORKER_STATE
     if state is None:
@@ -1724,7 +1775,7 @@ def _build_row_archive_worker(row_num: int) -> Tuple[int, str, int, int]:
         int(state["group_order"]),
     )
     count_dtype = _unsigned_count_dtype_for_max(max_count_bound)
-    unique_keys, unique_counts = _compute_unique_global_extension_keys_for_row(
+    unique_keys, unique_counts, estimated_unique = _compute_unique_global_extension_keys_for_row_with_stats(
         row_idx,
         state["row_extension_counts"],
         state["row_fixed_ptr"],
@@ -1740,7 +1791,7 @@ def _build_row_archive_worker(row_num: int) -> Tuple[int, str, int, int]:
     )
     row_path = Path(state["scratch_dir"]) / f"row_{row_idx:06d}.npz"
     _write_row_counts_archive(row_path, unique_keys, unique_counts)
-    return row_idx, str(row_path), row_total, int(unique_keys.size)
+    return row_idx, str(row_path), row_total, int(unique_keys.size), int(estimated_unique)
 
 
 def _reconstruct_csr_from_column_payload(
@@ -3016,14 +3067,6 @@ class PrepLP:
         exact_max_row_entries = int(row_extension_counts.max()) if row_extension_counts.size else 0
         active_worker_rows = min(max_workers, int(row_extension_counts.size))
         usable_memory_budget = self.usable_memory_budget_bytes
-        (
-            _,
-            row_fixed_ptr,
-            fixed_slots_flat,
-            fixed_vals_flat,
-            row_remaining_ptr,
-            remaining_slots_flat,
-        ) = self._row_extension_tables
         row_count_itemsizes = np.asarray(
             [
                 np.dtype(_unsigned_count_dtype_for_max(min(int(row_count), self.discovered_group_order))).itemsize
@@ -3031,34 +3074,20 @@ class PrepLP:
             ],
             dtype=np.int64,
         )
-        row_pilot_sizes = np.empty(self.nof_marginals, dtype=np.int64)
-        row_pilot_uniques = np.empty(self.nof_marginals, dtype=np.int64)
-        for row_num in range(self.nof_marginals):
-            pilot_size, pilot_unique = _pilot_unique_count_for_row(
-                int(row_num),
-                row_extension_counts,
-                row_fixed_ptr,
-                fixed_slots_flat,
-                fixed_vals_flat,
-                row_remaining_ptr,
-                remaining_slots_flat,
-                self.nof_off_diagonal_slots,
-                self.outcomes,
-                self.slot_sources,
-                self.outcome_maps,
-            )
-            row_pilot_sizes[row_num] = int(pilot_size)
-            row_pilot_uniques[row_num] = int(pilot_unique)
-        estimated_unique_counts, row_peak_bytes = _estimate_row_open_address_peak_payload(
-            row_extension_counts,
-            row_pilot_sizes,
-            row_pilot_uniques,
-            row_count_itemsizes,
+        row_peak_upper_bytes = np.asarray(
+            [
+                _estimate_open_address_row_peak_bytes(
+                    int(row_count),
+                    int(row_count),
+                    int(row_count_itemsize),
+                    pilot_size=min(int(row_count), _OPEN_ADDRESS_PILOT_SIZE),
+                )
+                for row_count, row_count_itemsize in zip(row_extension_counts.tolist(), row_count_itemsizes.tolist())
+            ],
+            dtype=np.int64,
         )
-        exact_max_estimated_unique = int(estimated_unique_counts.max()) if estimated_unique_counts.size else 0
-        exact_per_worker_peak_bytes = int(row_peak_bytes.max()) if row_peak_bytes.size else 0
-        exact_active_worker_peak_bytes = _estimate_active_worker_peak_from_row_peaks(row_peak_bytes, max_workers)
-
+        initial_per_worker_peak_upper_bytes = int(row_peak_upper_bytes.max()) if row_peak_upper_bytes.size else 0
+        initial_active_peak_upper_bytes = _estimate_active_worker_peak_from_row_peaks(row_peak_upper_bytes, max_workers)
         if exact_max_row_entries > self.estimated_max_row_entries:
             raise AssertionError(
                 "Exact row-extension count exceeded the structural max-row estimate: "
@@ -3070,36 +3099,35 @@ class PrepLP:
                 f"rows={self.nof_marginals}",
                 f"total_entries={total_entries}",
                 f"exact_max_row_entries={exact_max_row_entries}",
-                f"exact_max_estimated_unique={exact_max_estimated_unique}",
                 f"pilot_size={_OPEN_ADDRESS_PILOT_SIZE}",
-                f"pilot_gamma={_OPEN_ADDRESS_PILOT_GAMMA:.1f}",
-                f"exact_per_worker_peak={_format_bytes_human(exact_per_worker_peak_bytes)}",
-                f"exact_active_peak={_format_bytes_human(exact_active_worker_peak_bytes)}",
+                "pilot_estimator_scale=clip(1.027523 - 2.435372*rho + 2.416697*rho^2, 0.01, 1.0)",
+                f"initial_per_worker_peak_upper={_format_bytes_human(initial_per_worker_peak_upper_bytes)}",
+                f"initial_active_peak_upper={_format_bytes_human(initial_active_peak_upper_bytes)}",
                 f"scratch={scratch_dir}",
             ),
             enabled=self.show_progress,
         )
         _log_progress_block(
-            "Exact row memory tally:",
+            "Initial row memory upper-bound tally:",
             (
-                "estimated row peak = open-address table + outputs + sort workspace + pilot cache",
+                "upper-bound row peak assumes no compression (`estimated_unique=row_entries`)",
                 (
-                    "table capacity seeded from each row's first "
-                    f"{_OPEN_ADDRESS_PILOT_SIZE} canonicalized extensions"
+                    "pilot estimation now runs inside each worker task, and per-row estimated/final "
+                    "compression is logged on completion"
                 ),
             ),
             enabled=self.show_progress,
         )
-        for tally_line in _format_exact_row_memory_tally_lines(row_peak_bytes, self.marginals):
+        for tally_line in _format_exact_row_memory_tally_lines(row_peak_upper_bytes, self.marginals):
             _log_progress_line(f"  {tally_line}", enabled=self.show_progress)
         _log_progress_block(
-            "Exact active-worker bound:",
+            "Initial active-worker upper bound:",
             (
                 (
                     "uses the top "
                     f"{active_worker_rows} row peak{'s' if active_worker_rows != 1 else ''}"
                 ),
-                f"exact_active_peak={_format_bytes_human(exact_active_worker_peak_bytes)}",
+                f"initial_active_peak_upper={_format_bytes_human(initial_active_peak_upper_bytes)}",
             ),
             enabled=self.show_progress,
         )
@@ -3117,16 +3145,16 @@ class PrepLP:
                     "continuing anyway because memory preflight checks are non-fatal",
                 ),
             )
-        if exact_active_worker_peak_bytes > usable_memory_budget:
+        if initial_active_peak_upper_bytes > usable_memory_budget:
             _warn_runtime_block(
                 "Memory preflight warning:",
                 (
-                    "exact active-worker bound exceeds the preflight build budget",
+                    "initial active-worker upper bound exceeds the preflight build budget",
                     (
                         "based on the top "
                         f"{active_worker_rows} row peak{'s' if active_worker_rows != 1 else ''}"
                     ),
-                    f"exact_active_peak={_format_bytes_human(exact_active_worker_peak_bytes)}",
+                    f"initial_active_peak_upper={_format_bytes_human(initial_active_peak_upper_bytes)}",
                     "continuing anyway because memory preflight checks are non-fatal",
                 ),
             )
@@ -3136,9 +3164,9 @@ class PrepLP:
         entries_done = 0
         progress_start_time = perf_counter()
 
-        def _handle_completed_result(result: Tuple[int, str, int, int], pending_count: int) -> None:
+        def _handle_completed_result(result: Tuple[int, str, int, int, int], pending_count: int) -> None:
             nonlocal rows_done, entries_done
-            row_num, row_path_str, row_entries, _row_unique_nnz = result
+            row_num, row_path_str, row_entries, row_unique_nnz, row_estimated_unique = result
             row_archive_paths[int(row_num)] = Path(row_path_str)
             rows_done += 1
             entries_done += int(row_entries)
@@ -3149,6 +3177,8 @@ class PrepLP:
                 f"rows_done={rows_done}/{self.nof_marginals}, "
                 f"entries_done={entries_done}/{total_entries} "
                 f"({percent:.1f}%), "
+                f"estimated_compression={_format_compression_ratio(row_entries, row_estimated_unique)}, "
+                f"final_compression={_format_compression_ratio(row_entries, row_unique_nnz)}, "
                 f"active={pending_count}, "
                 f"elapsed={perf_counter() - progress_start_time:.2f}s",
                 enabled=self.show_progress,

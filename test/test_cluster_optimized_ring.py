@@ -711,9 +711,9 @@ class TestClusterOptimizedRing(unittest.TestCase):
         self.assertEqual(_format_bytes_human(3 * 1024 ** 3), "3.0 GiB")
         self.assertEqual(_format_bytes_human(4 * 1024 ** 4), "4.0 TiB")
 
-    def test_estimate_unique_from_pilot_uses_gamma_one(self):
+    def test_estimate_unique_from_pilot_uses_quadratic_scale(self):
         estimate = _estimate_unique_from_pilot(total_entries=10000, pilot_size=100, pilot_unique=42)
-        self.assertEqual(estimate, 4200)
+        self.assertEqual(estimate, 1811)
 
     def test_pilot_unique_count_uses_fixed_prefix_size(self):
         prep = self._shared_prep(3, distribution=NSIPRDistribution())
@@ -884,7 +884,7 @@ class TestClusterOptimizedRing(unittest.TestCase):
                 _ = prep.global_keys
             self.assertTrue(
                 any(
-                    "exact active-worker bound exceeds the preflight build budget"
+                    "initial active-worker upper bound exceeds the preflight build budget"
                     in str(warning.message)
                     for warning in caught
                 )
