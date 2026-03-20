@@ -16,7 +16,14 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from inflation.distributions import NSIPRDistribution
-from inflation.applications.Final_algo_numba import PrepLP
+from inflation.applications.Final_algo_numba import PrepLP, _cycles_from_J, _perm_from_marginal
+
+
+
+def keep_only_3cycle_pairs(marginal) -> bool:
+    cycles = _cycles_from_J(_perm_from_marginal(marginal))
+    lengths = tuple(len(cycle) for cycle in cycles)
+    return lengths == (3, 3)
 
 
 def main(*, n: int = 6) -> None:
@@ -26,6 +33,7 @@ def main(*, n: int = 6) -> None:
         n,
         distribution,
         problem_name=f"NSI_n={n}",
+        marginal_filter_fn=keep_only_3cycle_pairs,
         auto_discover_symmetries=True,
         compress_rows_under_discovered_group=True,
     )
