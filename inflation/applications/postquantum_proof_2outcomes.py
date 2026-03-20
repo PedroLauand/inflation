@@ -6,17 +6,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from inflation import InflationProblem, InflationSDP
-from inflation.applications.ring_utils import build_off_diagonal_ring_problem
+from inflation import InflationSDP
+from inflation.applications.ring_utils import ring_problem
 from inflation.distributions import NSIPRDistribution
-
-
-def ring_problem(inflation_level: int, nof_outcomes: int = 2) -> InflationProblem:
-    return build_off_diagonal_ring_problem(
-        inflation_level,
-        nof_outcomes,
-        classical_sources="all",
-    )
 
 
 def main() -> None:

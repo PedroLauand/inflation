@@ -19,28 +19,18 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from inflation.applications.Final_algo_numba import PrepLP, _cycles_from_J, _perm_from_marginal
+from inflation.applications.Final_algo_numba import PrepLP, keep_cycle_signatures
 from inflation.distributions import EJMDistribution
-
-
-def keep_34_or_exactly_two_2cycles(marginal) -> bool:
-    cycles = _cycles_from_J(_perm_from_marginal(marginal))
-    lengths = sorted(len(cycle) for cycle in cycles)
-    return lengths in ([3], [4], [2, 2])
-
-def keep_234_no_factorization(marginal) -> bool:
-    cycles = _cycles_from_J(_perm_from_marginal(marginal))
-    return len(cycles)==1
-
 
 def main(*, n: int = 4) -> None:
     distribution = EJMDistribution()
+    allowed_signatures = [(length,) for length in range(2, n + 1)]
     prep = PrepLP(
         n,
         distribution,
         # problem_name=f"EJM_n={n}_loops34_plus_2x2",
         problem_name=f"EJM_n={n}_no_factorization",
-        marginal_filter_fn=keep_234_no_factorization,
+        marginal_filter_fn=keep_cycle_signatures(allowed_signatures),
         auto_discover_symmetries=True,
         compress_rows_under_discovered_group=True,
     )

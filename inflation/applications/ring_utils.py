@@ -146,7 +146,7 @@ def strip_ring_self_loops(prob: InflationProblem) -> InflationProblem:
     return prob
 
 
-def build_off_diagonal_ring_problem(
+def ring_problem(
     inflation_level: int,
     nof_outcomes: int,
     *,

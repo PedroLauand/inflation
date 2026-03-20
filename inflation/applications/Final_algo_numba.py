@@ -41,20 +41,12 @@ from inflation.applications.Group_utils import (
     canonical_leximin_support_indices,
     prepare_group_chain,
 )
-from inflation.applications.ring_utils import build_off_diagonal_ring_problem
+from inflation.applications.ring_utils import ring_problem
 from inflation.distributions.protocols import RingDistributionProtocol
 from inflation.symmetry_utils import discovery_symmetries_from_predicate
 from inflation.utils import ndarray_bytes_key
 
 CACHE_FORMAT_VERSION = np.int64(10)
-
-
-def ring_problem(inflation_level: int, distribution: RingDistributionProtocol) -> InflationProblem:
-    return build_off_diagonal_ring_problem(
-        inflation_level,
-        int(distribution.nof_outcomes),
-        classical_sources="all",
-    )
 
 
 def _prepare_group_chain(
@@ -1282,6 +1274,21 @@ def _format_bytes_human(num_bytes: int) -> str:
     raise AssertionError("Unreachable byte-formatting branch.")
 
 
+def _format_elapsed_natural(seconds: float) -> str:
+    """Format elapsed time with natural units for quick reading."""
+    total_seconds = max(0.0, float(seconds))
+    if total_seconds < 60.0:
+        return f"{total_seconds:.2f} seconds"
+    total_minutes = total_seconds / 60.0
+    if total_minutes < 60.0:
+        return f"{total_minutes:.2f} minutes"
+    total_hours = total_minutes / 60.0
+    if total_hours < 24.0:
+        return f"{total_hours:.2f} hours"
+    total_days = total_hours / 24.0
+    return f"{total_days:.2f} days"
+
+
 def _format_cycle_length_signature(cycle_lengths: Sequence[int]) -> str:
     """Format a cycle-length multiset like `(3, 2)` as `1x loop of 3 + 1x loop of 2`."""
     counts = Counter(int(length) for length in cycle_lengths)
@@ -2015,6 +2022,34 @@ def keep_loops_of_length(loop_lengths):
     return _filter
 
 
+def keep_cycle_signatures(cycle_signatures):
+    """Return a marginal filter that admits only exact cycle-length signatures."""
+    normalized_signatures = {
+        tuple(sorted((int(length) for length in signature), reverse=True))
+        for signature in cycle_signatures
+    }
+    if not normalized_signatures:
+        raise ValueError("Cycle-signature filter requires at least one allowed signature.")
+    if any(len(signature) == 0 for signature in normalized_signatures):
+        raise ValueError("Cycle-signature filter does not accept empty signatures.")
+    if any(any(length < 1 for length in signature) for signature in normalized_signatures):
+        raise ValueError("Cycle-signature filter requires positive cycle lengths.")
+
+    canonical_signatures = tuple(sorted(normalized_signatures))
+
+    def _filter(marginal: List[List[int]]) -> bool:
+        cycles = _cycles_from_J(_perm_from_marginal(marginal))
+        signature = tuple(sorted((len(cycle) for cycle in cycles), reverse=True))
+        return signature in normalized_signatures
+
+    signature_suffix = "_or_".join("-".join(str(length) for length in signature) for signature in canonical_signatures)
+    _filter.__name__ = f"keep_cycle_signatures_{signature_suffix}"
+    _filter.allowed_cycle_signatures = canonical_signatures
+    _filter.smallest_marginal_size = min(sum(signature) for signature in normalized_signatures)
+    _filter.memory_estimate_name = _filter.__name__
+    return _filter
+
+
 keep_loops_up_to_three = keep_loops_of_length([1, 2, 3])
 
 
@@ -2160,7 +2195,11 @@ class PrepLP:
         self.validate_global_keys = validate_global_keys
         self.validate_discovered_row_orbits = validate_discovered_row_orbits
         self.verbose_cache = self.show_progress if verbose_cache is None else bool(verbose_cache)
-        self.prob = ring_problem(self._requested_n, distribution)
+        self.prob = ring_problem(
+            self._requested_n,
+            int(distribution.nof_outcomes),
+            classical_sources="all",
+        )
         self._cached_inflation_matrix: csr_array | None = None
         self._cached_global_keys: np.ndarray | None = None
         self._cached_nof_caonical_global_events: int | None = None
@@ -3245,7 +3284,7 @@ class PrepLP:
                 "Finding global extensions...",
                 enabled=self.show_progress,
                 end_message=lambda elapsed: (
-                    f"Enumerated {total_entries} canonicalized extensions in {elapsed:.2f}s"
+                    f"Enumerated {total_entries} canonicalized extensions in {_format_elapsed_natural(elapsed)}"
                 ),
             ):
                 row_archive_paths = self._build_row_archives(scratch_dir)
