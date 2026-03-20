@@ -2265,8 +2265,8 @@ class PrepLP:
         _log_progress_block(
             "Build resources:",
             (
-                f"workers={self.worker_count}",
-                f"usable_memory={_format_bytes_human(self.usable_memory_budget_bytes)}",
+                f"threads={self.worker_count}",
+                f"usable memory={_format_bytes_human(self.usable_memory_budget_bytes)}",
             ),
             enabled=self.show_progress,
         )
@@ -3088,6 +3088,8 @@ class PrepLP:
         )
         initial_per_worker_peak_upper_bytes = int(row_peak_upper_bytes.max()) if row_peak_upper_bytes.size else 0
         initial_active_peak_upper_bytes = _estimate_active_worker_peak_from_row_peaks(row_peak_upper_bytes, max_workers)
+        total_entries_log2 = np.log2(float(total_entries)) if total_entries > 0 else float("-inf")
+        max_row_entries_log2 = np.log2(float(exact_max_row_entries)) if exact_max_row_entries > 0 else float("-inf")
         if exact_max_row_entries > self.estimated_max_row_entries:
             raise AssertionError(
                 "Exact row-extension count exceeded the structural max-row estimate: "
@@ -3097,40 +3099,21 @@ class PrepLP:
             "Global extension workload:",
             (
                 f"rows={self.nof_marginals}",
-                f"total_entries={total_entries}",
-                f"exact_max_row_entries={exact_max_row_entries}",
-                f"pilot_size={_OPEN_ADDRESS_PILOT_SIZE}",
-                "pilot_estimator_scale=clip(1.027523 - 2.435372*rho + 2.416697*rho^2, 0.01, 1.0)",
-                f"initial_per_worker_peak_upper={_format_bytes_human(initial_per_worker_peak_upper_bytes)}",
-                f"initial_active_peak_upper={_format_bytes_human(initial_active_peak_upper_bytes)}",
+                f"log2 total entries={total_entries_log2:.3f}",
+                f"log2 max row entries={max_row_entries_log2:.3f}",
+                f"initial per-thread peak upper={_format_bytes_human(initial_per_worker_peak_upper_bytes)}",
+                f"using {active_worker_rows} concurrent {'thread' if active_worker_rows == 1 else 'threads'}",
+                f"peak memory accross all threads={_format_bytes_human(initial_active_peak_upper_bytes)}",
                 f"scratch={scratch_dir}",
             ),
             enabled=self.show_progress,
         )
-        _log_progress_block(
-            "Initial row memory upper-bound tally:",
-            (
-                "upper-bound row peak assumes no compression (`estimated_unique=row_entries`)",
-                (
-                    "pilot estimation now runs inside each worker task, and per-row estimated/final "
-                    "compression is logged on completion"
-                ),
-            ),
+        _log_progress_line(
+            "Initial row memory upper-bound tally (assumes no compression):",
             enabled=self.show_progress,
         )
         for tally_line in _format_exact_row_memory_tally_lines(row_peak_upper_bytes, self.marginals):
             _log_progress_line(f"  {tally_line}", enabled=self.show_progress)
-        _log_progress_block(
-            "Initial active-worker upper bound:",
-            (
-                (
-                    "uses the top "
-                    f"{active_worker_rows} row peak{'s' if active_worker_rows != 1 else ''}"
-                ),
-                f"initial_active_peak_upper={_format_bytes_human(initial_active_peak_upper_bytes)}",
-            ),
-            enabled=self.show_progress,
-        )
 
         if self.per_worker_peak_bytes > usable_memory_budget:
             _warn_runtime_block(
@@ -3174,11 +3157,11 @@ class PrepLP:
             _log_progress_line(
                 "Global extensions task complete: "
                 f"row={row_num}, "
-                f"rows_done={rows_done}/{self.nof_marginals}, "
-                f"entries_done={entries_done}/{total_entries} "
+                f"rows done={rows_done}/{self.nof_marginals}, "
+                f"entries done={entries_done}/{total_entries} "
                 f"({percent:.1f}%), "
-                f"estimated_compression={_format_compression_ratio(row_entries, row_estimated_unique)}, "
-                f"final_compression={_format_compression_ratio(row_entries, row_unique_nnz)}, "
+                f"estimated compression={_format_compression_ratio(row_entries, row_estimated_unique)}, "
+                f"final compression={_format_compression_ratio(row_entries, row_unique_nnz)}, "
                 f"active={pending_count}, "
                 f"elapsed={perf_counter() - progress_start_time:.2f}s",
                 enabled=self.show_progress,
