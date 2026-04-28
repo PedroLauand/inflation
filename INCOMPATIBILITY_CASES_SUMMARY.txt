@@ -1,0 +1,123 @@
+Confirmed ring-inflation incompatibility cases
+=============================================
+
+This note records the compact context needed for the NSI-PR and EJM
+ring-inflation examples.  The emphasis is on cases that actually detect
+incompatibility in the current code.
+
+
+Core code path
+--------------
+
+- Main builder/solver:
+  inflation/applications/Final_algo_numba.py
+  class: PrepLP
+
+- Compact runner:
+  inflation/applications/minimal_ring_cases.py
+
+- Distributions:
+  NSI-PR: inflation/distributions/nsi_pr.py, NSIPRDistribution
+  EJM:    inflation/distributions/ejm.py, EJMDistribution
+
+- Basic solve logic:
+  PrepLP(n, distribution, ...) builds a ring-inflation LP.
+  prep.solve(mode="incompatible_fraction") solves the relaxed compatibility
+  problem.
+
+- Interpretation:
+  success=True means compatible within numerical tolerance.
+  success=False with incompatible_fraction > 0 means incompatibility is
+  detected by the relaxation.
+
+
+NSI-PR incompatibility
+----------------------
+
+Distribution:
+  NSIPRDistribution()
+
+Confirmed incompatible case:
+  n = 5
+  marginal family = full unfiltered n=5 relaxation
+
+Command:
+  python3 inflation/applications/minimal_ring_cases.py nsi-n5
+
+Confirmed result:
+  base_rows = 32
+  final_rows = 32
+  columns = 5158
+  solver status = optimal
+  solver_success = True
+  success = False
+  incompatible_fraction = 0.221534318138
+  known_mass = 2.43198051534
+  optimized_mass = 1.89321337015
+
+Control result:
+  n = 4 is feasible in this relaxation.
+  incompatible_fraction = 0
+
+Conceptual description:
+  The tested NSI-PR distribution is binary.  Its probabilities are generated
+  from exact symbolic correlator formulas in nsi_pr.py.  At n=5, the
+  ring-inflation LP cannot reproduce the target marginals, so the relaxation
+  gives an incompatibility witness.
+
+
+EJM incompatibility
+-------------------
+
+Distribution:
+  EJMDistribution()
+
+Confirmed incompatible case:
+  n = 4
+  marginal family = single loops of lengths 2, 3, and 4
+  cycle signatures = (2,), (3,), (4,)
+
+Command:
+  python3 inflation/applications/minimal_ring_cases.py ejm-n4-single-loops
+
+Confirmed result:
+  base_rows = 104
+  compressed_rows = 12
+  columns = 15418
+  solver status = optimal
+  solver_success = True
+  success = False
+  incompatible_fraction = 0.090284592738
+  known_mass = 1.990234375
+  optimized_mass = 1.810546875
+
+Smaller EJM subsets checked:
+  (2,) alone: feasible
+  (3,) alone: feasible
+  (4,) alone: feasible
+  (2,2) alone: feasible
+  all pairs among (2,), (3,), (4,), (2,2): feasible
+
+Additional incompatible EJM families checked:
+  (2,) + (3,) + (4,): incompatible
+  (3,) + (4,) + (2,2): incompatible, but larger
+  (2,) + (3,) + (4,) + (2,2): incompatible, but not smaller
+
+Conceptual description:
+  The EJM distribution has four native outcomes.  Loop probabilities are
+  computed from exact transfer-matrix formulas in ejm.py, and line
+  probabilities are obtained by summing one-site loop extensions.  The compact
+  witness does not require the factorized (2,2) marginal family: single loops
+  of lengths 2, 3, and 4 at n=4 already detect incompatibility.
+
+
+Minimal context to carry into notes
+-----------------------------------
+
+- Describe NSI-PR and EJM separately.
+- For NSI-PR, state that incompatibility is detected at n=5 in the full
+  unfiltered relaxation; n=4 remains feasible in this relaxation.
+- For EJM, state that incompatibility is detected at n=4 using only
+  single-loop marginals of lengths 2, 3, and 4.
+- Avoid presenting these as a comparison table for now; each is its own
+  example of the same ring-inflation LP logic.
