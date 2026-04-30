@@ -180,5 +180,12 @@ class NSIPRDistribution:
 __all__ = ["NSIPRDistribution", "P_loop", "P_line", "E_line", "E_loop"]
 
 if __name__ == "__main__":
+    rule = NSIPRDistribution()
     for n in range(1, 5):
-        print(f"n={n}, E_loop(n)={E_loop(n)}={float(E_loop(n))}")
+        print("\n")
+        print(f"E_loop({n}) = {E_loop(n)} = {float(E_loop(n))}")
+        print(f"E_line({n}) = {E_line(n)} = {float(E_line(n))}")
+        print(f"prob_event_loop({n} zeros) = {rule.prob_event_loop([0] * n)} = {float(rule.prob_event_loop([0] * n))}")
+        print(f"prob_event_line({n} zeros) = {rule.prob_event_line([0] * n)} = {float(rule.prob_event_line([0] * n))}")
+        
+
