@@ -5,23 +5,26 @@ from typing import Iterable, List
 
 import sympy as sp
 
-E1 = sp.Integer(0)
-E2 = sp.sqrt(2) - 1
+E1_LINE = sp.Integer(0)
+E2_LINE = sp.sqrt(2) - 1
+E3_LINE = 3 - 2 * sp.sqrt(2)
+
+E1_LOOP = sp.Integer(0)
 E2_LOOP = sp.Integer(1)
-E3 = 3 - 2 * sp.sqrt(2)
+E3_LOOP = sp.Integer(0)
 
 @lru_cache(None)
 def E_line(n: int) -> sp.Expr:
     if n < 1:
         raise ValueError("E_line(n) requires n >= 1.")
     if n == 1:
-        return E1
+        return E1_LINE
     if n == 2:
-        return E2
+        return E2_LINE
     if n == 3:
-        return E3
+        return E3_LINE
     else:
-        return -E_line(n-1) + E_line(n-2) + (1 - E2) * E_line(n-3)
+        return -E_line(n-1) + E_line(n-2) + (1 - E_line(2)) * E_line(n-3)
 
 
 @lru_cache(None)
@@ -29,12 +32,11 @@ def E_loop(n: int) -> sp.Expr:
     if n < 1:
         raise ValueError("E_loop(n) requires n >= 1.")
     if n == 1:
-        return sp.Integer(0)
+        return E1_LOOP
     if n == 2:
         return E2_LOOP
     if n == 3:
-    #     # return sp.simplify(sp.sqrt(2) - 2 * E_line(2) - E_line(1))
-        return sp.Integer(0)
+        return E3_LOOP
     m = n - 1
     term0 = sp.sqrt(2) ** (m - 1)
     summand = sp.Integer(0)
