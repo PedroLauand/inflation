@@ -10,11 +10,23 @@ import numpy as np
 from typing import List
 
 try:
-    from numba import jit
+    from numba import jit as numba_jit
     from numba.types import bool_, void
     from numba.types import uint8 as uint8_
     from numba.types import intc as int_
     nopython = True
+    def jit(*args, **kwargs):
+        """Use Numba JIT, but fall back to non-cached compilation when needed."""
+        def decorator(func):
+            try:
+                return numba_jit(*args, **kwargs)(func)
+            except RuntimeError as exc:
+                if kwargs.get("cache") and "no locator available" in str(exc):
+                    fallback_kwargs = dict(kwargs)
+                    fallback_kwargs["cache"] = False
+                    return numba_jit(*args, **fallback_kwargs)(func)
+                raise
+        return decorator
 except ImportError:
     print("Warning: NOT using Numba for JIT compilation.")
     def jit(*args, **kwargs):
