@@ -149,3 +149,7 @@ inflation/applications/outputs/
 
 #Visual Studio IDE
 .vs/
+
+# OS
+.DS_Store
+**/.DS_Store
