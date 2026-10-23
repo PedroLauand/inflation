@@ -21,7 +21,7 @@ from inflation.distributions import EJMDistribution
 
 
 def main(*, n: int = 4) -> None:
-    distribution = EJMDistribution()
+    distribution = EJMDistribution(coarsen=[[0,1],[2],[3]])
     prep = PrepLP(
         n,
         distribution,

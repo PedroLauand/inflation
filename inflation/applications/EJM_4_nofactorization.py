@@ -1,11 +1,9 @@
 """
-EJM_4_loops34_plus_2x2.py
+EJM_4_nofactorization.py
 --------------------------------------------------------------------
-Explore the EJM ring pipeline at n=4 with a filter that keeps:
-  - single loops of length 3,
-  - single loops of length 4,
-  - disjoint unions of exactly two loops of length 2,
-while excluding marginals consisting of only one 2-cycle.
+Explore the EJM ring pipeline at n=4 while keeping only connected
+marginals, i.e. those whose permutation decomposition has a single cycle.
+This excludes disconnected product marginals.
 --------------------------------------------------------------------
 """
 
@@ -23,28 +21,23 @@ from inflation.applications.Final_algo_numba import PrepLP, keep_cycle_signature
 from inflation.distributions import EJMDistribution
 
 def main(*, n: int = 4) -> None:
-    distribution = EJMDistribution()
+    distribution = EJMDistribution(coarsen=[[0,1],[2],[3]])
     allowed_signatures = [(length,) for length in range(2, n + 1)]
     prep = PrepLP(
         n,
         distribution,
-        # problem_name=f"EJM_n={n}_loops34_plus_2x2",
-        problem_name=f"EJM_n={n}_no_factorization",
+        problem_name=f"EJM_n={n}_no_factorization_v2",
         marginal_filter_fn=keep_cycle_signatures(allowed_signatures),
         auto_discover_symmetries=True,
         compress_rows_under_discovered_group=True,
     )
-    # print(
-    #     "This filtered run keeps single loops of length 3 or 4, plus marginals "
-    #     "consisting of exactly two 2-cycles, while excluding isolated 2-cycles."
-    # )
     print(
-        f"PrepLP initialized for EJM loops34+2x2 n={n}; "
+        f"PrepLP initialized for EJM no-factorization n={n}; "
         "materializing LP inputs before Mosek."
     )
     _ = prep.global_keys
     print(
-        f"Filtered LP inputs ready for EJM loops34+2x2 n={n}: "
+        f"Filtered LP inputs ready for EJM no-factorization n={n}: "
         f"base_rows={prep.base_nof_marginals}, rows={prep.nof_lp_constraints}, cols={prep.nof_lp_vars}. "
         "Starting relaxed incompatibility solve."
     )
@@ -53,9 +46,9 @@ def main(*, n: int = 4) -> None:
         optimizer="free_simplex",
         verbose=2,
     )
-    print(f"Relaxed LP status for EJM loops34+2x2 n={n}: {relaxed_solution['status']}")
+    print(f"Relaxed LP status for EJM no-factorization n={n}: {relaxed_solution['status']}")
     print(
-        f"Feasible within tolerance for EJM loops34+2x2 n={n}: {relaxed_solution['success']}. "
+        f"Feasible within tolerance for EJM no-factorization n={n}: {relaxed_solution['success']}. "
         f"Incompatible fraction: {relaxed_solution['incompatible_fraction']:.12g}"
     )
     print(
@@ -63,9 +56,9 @@ def main(*, n: int = 4) -> None:
         f"Optimized compatible mass: {relaxed_solution['optimized_mass']:.12g}"
     )
     if relaxed_solution["success"]:
-        print("The filtered EJM n=4 problem is COMPATIBLE.")
+        print("The EJM no-factorization n=4 problem is COMPATIBLE.")
     else:
-        print("The filtered EJM n=4 problem is detected as INCOMPATIBLE.")
+        print("The EJM no-factorization n=4 problem is detected as INCOMPATIBLE.")
         print("Dual certificate from the relaxed LP:")
         prep.print_certificate(relaxed_solution)
     if prep.output_path is not None:
